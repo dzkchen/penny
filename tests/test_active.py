@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 from penny.active import (
     discover_firebase_databases,
+    discover_params,
     discover_query_endpoints,
     parse_endpoint_specs,
     probe_cache_controls,
@@ -13,6 +15,7 @@ from penny.active import (
     probe_directory_listing,
     probe_exposed_paths,
     probe_http_methods,
+    probe_reflected_xss,
     probe_security_headers,
     probe_sql_injection,
     probe_verbose_errors,
@@ -65,6 +68,81 @@ def test_sql_injection_probe_ignores_endpoints_that_always_error() -> None:
     gate = FakeGate(lambda method, path: SafeResponse(500, SQL_ERROR_BODY, {}))
 
     assert probe_sql_injection(gate, [("/api/items", "id")]) == []
+
+
+def test_sql_injection_probe_confirms_boolean_blind() -> None:
+    # No DB error and no error signature anywhere: detection must come from the
+    # boolean differential (TRUE clause mirrors baseline, FALSE clause diverges).
+    def handler(method, path):
+        decoded = unquote(path)
+        if "'1'='2" in decoded or "1=2" in decoded:  # logically FALSE clause
+            return SafeResponse(200, "RESULTS: (none)", {})
+        return SafeResponse(200, "RESULTS: alice bob carol", {})  # baseline + TRUE clause
+
+    findings = probe_sql_injection(FakeGate(handler), [("/api/items", "id")])
+
+    assert len(findings) == 1
+    assert findings[0].detector_id == "A001"
+    assert findings[0].evidence["dynamic_probe"]["method"] == "boolean-based blind"
+
+
+def test_sql_injection_probe_confirms_time_based_blind() -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.t = 0.0
+
+        def now(self) -> float:
+            return self.t
+
+    clock = FakeClock()
+
+    def handler(method, path):
+        # A SLEEP() clause makes the DB wait: advance the clock to simulate it.
+        if "SLEEP" in unquote(path).upper():
+            clock.t += 2.3
+        return SafeResponse(200, "identical body", {})  # no error, no boolean differential
+
+    findings = probe_sql_injection(FakeGate(handler), [("/api/items", "id")], now=clock.now)
+
+    assert len(findings) == 1
+    assert findings[0].evidence["dynamic_probe"]["method"] == "time-based blind"
+
+
+def test_reflected_xss_probe_flags_unescaped_reflection() -> None:
+    def handler(method, path):
+        value = (parse_qs(urlparse(path).query).get("q") or [""])[0]
+        return SafeResponse(200, f"<html><body>Search: {value}</body></html>", {"content-type": "text/html"})
+
+    findings = probe_reflected_xss(FakeGate(handler), [("/search", "q")])
+
+    assert len(findings) == 1
+    assert findings[0].detector_id == "A012"
+    assert findings[0].severity == "High"
+    assert findings[0].evidence["dynamic_probe"]["reflections"][0]["parameter"] == "q"
+
+
+def test_reflected_xss_probe_ignores_encoded_output() -> None:
+    import html
+
+    def handler(method, path):
+        value = (parse_qs(urlparse(path).query).get("q") or [""])[0]
+        # Properly escaped output: the marker echoes but its angle brackets do not.
+        return SafeResponse(200, f"<html>Search: {html.escape(value)}</html>", {"content-type": "text/html"})
+
+    assert probe_reflected_xss(FakeGate(handler), [("/search", "q")]) == []
+
+
+def test_discover_params_finds_live_parameter() -> None:
+    def handler(method, path):
+        query = parse_qs(urlparse(path).query)
+        if "q" in query:  # only `q` is a real sink; it reflects the marker
+            return SafeResponse(200, f"results for {query['q'][0]}", {})
+        return SafeResponse(200, "home page", {})
+
+    discovered = discover_params(FakeGate(handler), ["/search"])
+
+    assert ("/search", "q") in discovered
+    assert all(param != "id" for _, param in discovered)
 
 
 def test_firebase_probe_flags_open_database() -> None:

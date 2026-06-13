@@ -26,7 +26,7 @@ SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
 HELP = """\
 /audit <path> [--target <url>]    FULL audit: scan + AI + all probes + report
 /full  <path> [--target <url>]    alias for /audit
-/scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--static-only] [--target <url>]
+/scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--static-only] [--target <url>]
 /report                           write report.md to .penny/runs/
 /fix [--yes]                      fix flagged files with approval (Claude rewrites them)
 /findings                         list the current findings
@@ -38,7 +38,9 @@ HELP = """\
 /clear   /help   /exit
 
 scan/audit flags:  --target <url>  --active  --brute  --browser  --agentic
-                   --osv  --ai  --static-only  --i-own-this
+                   --netscan  --load-test  --i-accept  --osv  --ai  --static-only  --i-own-this
+  --load-test   bounded ramp-to-failure capacity test (owned targets; read-only, abortable)
+  --i-accept    safe write-path probe — POST-only marked test records (owned targets; no PUT/PATCH/DELETE)
 
 Natural language works too: "pentest this app", "audit ./planted-app", "fix the issues",
 or just ask a question. For a live site you own:  /target <url>   /own on   /audit ."""
@@ -219,7 +221,7 @@ class Session:
     def _scan(self, args: list[str], *, force: dict[str, bool] | None = None) -> None:
         path: str | None = None
         use_osv = use_ai = use_active = static_only = False
-        agentic = brute = browser = netscan = False
+        agentic = brute = browser = netscan = load_test = i_accept = False
         target = self.target
         i_own_this = self.i_own_this
         tokens = iter(args)
@@ -238,6 +240,10 @@ class Session:
                 browser = True
             elif token == "--netscan":
                 netscan = True
+            elif token == "--load-test":
+                load_test = True
+            elif token == "--i-accept":
+                i_accept = True
             elif token == "--i-own-this":
                 i_own_this = True
             elif token == "--static-only":
@@ -254,8 +260,10 @@ class Session:
             brute = force.get("brute", brute)
             browser = force.get("browser", browser)
             netscan = force.get("netscan", netscan)
+            load_test = force.get("load_test", load_test)
+            i_accept = force.get("i_accept", i_accept)
         if not path:
-            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--i-own-this] [--static-only] [--target <url>]")
+            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--i-own-this] [--static-only] [--target <url>]")
             return
 
         self.out(ui.dim(f"Scanning {path}…"))
@@ -272,6 +280,8 @@ class Session:
                     brute=brute,
                     browser=browser,
                     netscan=netscan,
+                    load_test=load_test,
+                    i_accept=i_accept,
                     feed=feed,
                     source_label=path,
                     use_osv=use_osv,
@@ -301,7 +311,12 @@ class Session:
         if not self.target:
             self.out(ui.dim("No target set — running static + code analysis only. Use --target <url> for live probes."))
         self.out(ui.style(f"🔎 Running FULL audit on {path}…", "bold", "magenta"))
-        forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True, "netscan": True}
+        # Read-only/bounded probes run automatically; write-path testing (--i-accept)
+        # creates records, so it stays opt-in even inside a full audit.
+        forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True, "netscan": True, "load_test": True}
+        if "--i-accept" in args:
+            forced["i_accept"] = True
+            self.out(ui.dim("--i-accept: including safe write-path probe (POST-only marked test records)."))
         self._scan([path], force=forced)
         if self.payload:
             self._report([])

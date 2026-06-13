@@ -33,6 +33,8 @@ def run_scan(
     brute: bool = False,
     browser: bool = False,
     netscan: bool = False,
+    load_test: bool = False,
+    i_accept: bool = False,
     wordlist: str | None = None,
     pages: int = 8,
     feed: EventFeed | None = None,
@@ -106,6 +108,14 @@ def run_scan(
         from .netscan import run_port_scan
 
         findings.extend(run_port_scan(target, i_own_this=i_own_this, feed=feed))
+    if target and not static_only and load_test:
+        from .loadtest import run_load_test
+
+        findings.extend(run_load_test(target, i_own_this=i_own_this, feed=feed))
+    if target and not static_only and i_accept:
+        from .writes import run_safe_write_probe
+
+        findings.extend(run_safe_write_probe(target, i_own_this=i_own_this, i_accept=i_accept, feed=feed, endpoints=endpoints))
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(
@@ -121,6 +131,8 @@ def run_scan(
                 "ai": use_ai,
                 "active": use_active,
                 "netscan": netscan,
+                "load_test": load_test,
+                "write_probe": i_accept,
                 "target": bool(target),
             },
         },

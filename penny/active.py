@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
@@ -42,6 +43,50 @@ from .repo import SourceFile
 # Benign, non-destructive payloads: they probe for error/condition handling,
 # never modify or drop data.
 SQLI_PAYLOADS = ("'", "' OR '1'='1", "1)) OR 1=1-- -", "' AND '1'='2")
+
+# Boolean-based blind SQLi: a TRUE clause should leave the result set looking like
+# the baseline; a logically-FALSE clause should change it. These are pure SELECT
+# conditions — they read, never write, and never drop data.
+SQLI_BOOLEAN_PAIRS = (
+    ("' OR '1'='1", "' OR '1'='2"),
+    ("' AND '1'='1", "' AND '1'='2"),
+    (" OR 1=1", " OR 1=2"),
+    (" AND 1=1", " AND 1=2"),
+)
+# Time-based blind SQLi: a TRUE branch that sleeps proves injection on targets
+# that show no error and no boolean differential. Read-only (the DB just waits).
+# We keep the sleep short and only trust it if the slow response is dramatically
+# slower than a no-op control to avoid flagging ordinary network jitter.
+SQLI_TIME_PAYLOADS = (
+    "' AND SLEEP(2)-- -",
+    "'; SELECT pg_sleep(2)-- -",
+    "' AND 1=(SELECT 1 FROM PG_SLEEP(2))-- -",
+    " AND SLEEP(2)",
+)
+_SQLI_TIME_DELAY_SECONDS = 2.0
+# A real time-based hit must be slower than the control by at least the injected
+# delay minus this slack, so a slow-but-not-injectable endpoint is not flagged.
+_SQLI_TIME_SLACK_SECONDS = 1.0
+
+# Reflected-XSS canary: a unique marker wrapped in the HTML-significant characters
+# an XSS payload needs. We never inject an executing script — if these characters
+# come back *unencoded* in an HTML response, the sink does not escape output and a
+# real payload would execute. Detection only.
+_XSS_MARKER = "penny7xq9zmark"
+_XSS_PROBE = f"<{_XSS_MARKER}>"
+_XSS_ATTR_PROBE = f'"{_XSS_MARKER}'
+_HTML_CONTENT_TYPE_RE = re.compile(r"text/html|application/xhtml", re.I)
+
+# Common query-parameter names to fan out across known endpoints so coverage does
+# not depend on finding a parameter already wired up in the source. Kept curated
+# (not a giant fuzzing list) so the request budget stays bounded.
+PARAM_WORDLIST = (
+    "id", "user", "user_id", "username", "name", "q", "query", "search", "s",
+    "page", "sort", "order", "filter", "category", "cat", "file", "path", "dir",
+    "url", "redirect", "next", "return", "callback", "lang", "email", "token",
+    "key", "code", "ref", "type", "action", "view", "item", "product", "post",
+    "comment", "message", "data", "value", "format", "limit", "offset", "sid",
+)
 
 _SQL_ERROR_SIGNATURES = [
     re.compile(pattern, re.I)
@@ -313,8 +358,155 @@ def discover_query_endpoints(files: Iterable[SourceFile]) -> list[tuple[str, str
     return list(endpoints)
 
 
-def probe_sql_injection(gate, endpoints: Iterable[tuple[str, str]], *, feed: EventFeed | None = None) -> list[Finding]:
+def _sqli_finding(
+    path: str,
+    param: str,
+    *,
+    method: str,
+    confidence: str,
+    snippet: str,
+    probe_evidence: dict[str, Any],
+) -> Finding:
+    evidence = {
+        "probe": "sql_injection",
+        "status": "confirmed",
+        "endpoint": path,
+        "parameter": param,
+        "method": method,
+        "stored_response": "status codes, timings, and matched signatures only",
+    }
+    evidence.update(probe_evidence)
+    return Finding(
+        title=f"SQL injection confirmed ({method})",
+        severity="Critical",
+        confidence=confidence,
+        status="confirmed",
+        source="dynamic",
+        detector_id="A001",
+        owasp=["A03:2021-Injection"],
+        location=Location(file=f"dynamic:{path}", line=1, column=1),
+        snippet=redact_text(snippet),
+        evidence={
+            "dynamic_probe": evidence,
+            "attack_path": f"Injecting SQL metacharacters into `{param}` reaches the database, so an attacker can read or modify data with crafted queries.",
+        },
+        impact="A reachable SQL injection lets an attacker read, modify, or destroy database contents.",
+        remediation="Use parameterized queries / prepared statements; never build SQL by interpolating request input.",
+    )
+
+
+def _detect_error_based_sqli(gate, path: str, param: str, baseline) -> Finding | None:
+    baseline_has_error = _sql_error_signature(baseline.text) is not None
+    if baseline_has_error:
+        return None
+    for payload in SQLI_PAYLOADS:
+        try:
+            response = gate.request("GET", _with_param(path, param, payload))
+        except Exception:  # noqa: BLE001
+            continue
+        signature = _sql_error_signature(response.text)
+        if signature:
+            return _sqli_finding(
+                path,
+                param,
+                method="error-based",
+                confidence="high",
+                snippet=f"GET {path}?{param}=<sql payload> triggered a database error",
+                probe_evidence={
+                    "payload": payload,
+                    "response_status": response.status_code,
+                    "error_signature": signature,
+                },
+            )
+    return None
+
+
+def _detect_boolean_based_sqli(gate, path: str, param: str, baseline) -> Finding | None:
+    """A TRUE clause should mirror the baseline; a FALSE clause should diverge."""
+    baseline_body = _normalized_body(baseline.text)
+    for true_payload, false_payload in SQLI_BOOLEAN_PAIRS:
+        try:
+            true_resp = gate.request("GET", _with_param(path, param, "1" + true_payload))
+            false_resp = gate.request("GET", _with_param(path, param, "1" + false_payload))
+        except Exception:  # noqa: BLE001
+            continue
+        if _sql_error_signature(true_resp.text) or _sql_error_signature(false_resp.text):
+            continue  # an error path is the error-based detector's job, not boolean inference
+        true_body = _normalized_body(true_resp.text)
+        false_body = _normalized_body(false_resp.text)
+        true_matches_baseline = true_resp.status_code == baseline.status_code and true_body == baseline_body
+        false_diverges = false_resp.status_code != baseline.status_code or false_body != baseline_body
+        if true_matches_baseline and false_diverges and true_body != false_body:
+            return _sqli_finding(
+                path,
+                param,
+                method="boolean-based blind",
+                confidence="medium",
+                snippet=f"GET {path}?{param} returned baseline content for a TRUE clause and different content for a FALSE clause",
+                probe_evidence={
+                    "true_payload": true_payload,
+                    "false_payload": false_payload,
+                    "true_status": true_resp.status_code,
+                    "false_status": false_resp.status_code,
+                    "differential": "TRUE clause matched baseline; FALSE clause diverged",
+                },
+            )
+    return None
+
+
+def _detect_time_based_sqli(gate, path: str, param: str, *, now) -> Finding | None:
+    """A TRUE branch that sleeps proves injection when nothing else differs."""
+    try:
+        control_start = now()
+        gate.request("GET", _with_param(path, param, "1"))
+        control_elapsed = now() - control_start
+    except Exception:  # noqa: BLE001
+        return None
+    for payload in SQLI_TIME_PAYLOADS:
+        try:
+            start = now()
+            response = gate.request("GET", _with_param(path, param, "1" + payload))
+            elapsed = now() - start
+        except Exception:  # noqa: BLE001
+            continue
+        delay = elapsed - control_elapsed
+        if delay >= _SQLI_TIME_DELAY_SECONDS - _SQLI_TIME_SLACK_SECONDS:
+            return _sqli_finding(
+                path,
+                param,
+                method="time-based blind",
+                confidence="medium",
+                snippet=f"GET {path}?{param} with a SLEEP() clause took {elapsed:.1f}s vs {control_elapsed:.1f}s control",
+                probe_evidence={
+                    "payload": payload,
+                    "response_status": response.status_code,
+                    "control_seconds": round(control_elapsed, 2),
+                    "injected_seconds": round(elapsed, 2),
+                    "injected_delay_seconds": _SQLI_TIME_DELAY_SECONDS,
+                },
+            )
+    return None
+
+
+def probe_sql_injection(
+    gate,
+    endpoints: Iterable[tuple[str, str]],
+    *,
+    feed: EventFeed | None = None,
+    enable_time_based: bool = True,
+    max_time_based_endpoints: int = 5,
+    now=None,
+) -> list[Finding]:
+    """Detect SQL injection via error-, boolean-, then time-based inference.
+
+    Every technique is read-only: it issues GET requests through the gate and only
+    *reads* the response (status, body shape, or latency). No payload modifies or
+    drops data — boolean clauses are SELECT conditions and time clauses just make
+    the database wait.
+    """
+    now = now or time.monotonic
     findings: list[Finding] = []
+    time_based_used = 0
     for path, param in endpoints:
         try:
             baseline = gate.request("GET", _with_param(path, param, "1"))
@@ -322,53 +514,138 @@ def probe_sql_injection(gate, endpoints: Iterable[tuple[str, str]], *, feed: Eve
             if feed:
                 feed.emit("red", f"SQLi probe skipped {path}?{param}: {error}")
             continue
-        baseline_has_error = _sql_error_signature(baseline.text) is not None
-        hit = None
-        for payload in SQLI_PAYLOADS:
-            try:
-                response = gate.request("GET", _with_param(path, param, payload))
-            except Exception:  # noqa: BLE001
-                continue
-            signature = _sql_error_signature(response.text)
-            if signature and not baseline_has_error:
-                hit = (payload, response, signature)
-                break
-        if not hit:
+        finding = _detect_error_based_sqli(gate, path, param, baseline)
+        if finding is None:
+            finding = _detect_boolean_based_sqli(gate, path, param, baseline)
+        if finding is None and enable_time_based and time_based_used < max_time_based_endpoints:
+            time_based_used += 1
+            finding = _detect_time_based_sqli(gate, path, param, now=now)
+        if finding is None:
             if feed:
                 feed.emit("red", f"No SQL injection at {path}?{param}")
             continue
-        payload, response, signature = hit
-        findings.append(
-            Finding(
-                title="SQL injection confirmed via database error response",
-                severity="Critical",
-                confidence="high",
-                status="confirmed",
-                source="dynamic",
-                detector_id="A001",
-                owasp=["A03:2021-Injection"],
-                location=Location(file=f"dynamic:{path}", line=1, column=1),
-                snippet=redact_text(f"GET {path}?{param}=<sql payload> triggered a database error"),
-                evidence={
-                    "dynamic_probe": {
-                        "probe": "sql_injection",
-                        "status": "confirmed",
+        findings.append(finding)
+        if feed:
+            method = finding.evidence["dynamic_probe"]["method"]
+            feed.emit("red", f"Confirmed SQL injection ({method}) at {path}?{param}")
+    return findings
+
+
+def probe_reflected_xss(gate, endpoints: Iterable[tuple[str, str]], *, feed: EventFeed | None = None) -> list[Finding]:
+    """Detect reflected XSS by checking whether HTML-significant characters survive.
+
+    Sends a unique marker wrapped in ``<`` / ``>`` / ``"`` (never an executing
+    script). If the marker comes back with those characters *unencoded* in an HTML
+    response — and the baseline value did not already contain it — the output sink
+    is not escaping, so a real payload would execute. Detection only.
+    """
+    findings: list[Finding] = []
+    reflected: list[dict[str, Any]] = []
+    for path, param in endpoints:
+        try:
+            baseline = gate.request("GET", _with_param(path, param, _XSS_MARKER))
+        except Exception:  # noqa: BLE001
+            continue
+        # If the bare marker is not even echoed, this parameter isn't a reflection sink.
+        if _XSS_MARKER not in baseline.text:
+            continue
+        # The marker echoes; now check whether the dangerous characters survive raw.
+        for context, probe in (("element", _XSS_PROBE), ("attribute", _XSS_ATTR_PROBE)):
+            try:
+                response = gate.request("GET", _with_param(path, param, probe))
+            except Exception:  # noqa: BLE001
+                continue
+            content_type = _header(response, "content-type")
+            html_response = bool(_HTML_CONTENT_TYPE_RE.search(content_type)) or "<html" in response.text.lower()
+            if probe in response.text and html_response:
+                reflected.append(
+                    {
                         "endpoint": path,
                         "parameter": param,
-                        "payload": payload,
+                        "context": context,
                         "response_status": response.status_code,
-                        "error_signature": signature,
-                        "stored_response": "status code and error signature only",
-                    },
-                    "attack_path": f"Injecting SQL metacharacters into `{param}` reaches the database, so an attacker can read or modify data with crafted queries.",
+                        "content_type": redact_text(content_type),
+                    }
+                )
+                if feed:
+                    feed.emit("red", f"Reflected XSS at {path}?{param} ({context} context)")
+                break
+        else:
+            if feed:
+                feed.emit("red", f"No reflected XSS at {path}?{param}")
+    if not reflected:
+        return findings
+    findings.append(
+        Finding(
+            title="Reflected cross-site scripting (unescaped input reflected into HTML)",
+            severity="High",
+            confidence="high",
+            status="confirmed",
+            source="dynamic",
+            detector_id="A012",
+            owasp=["A03:2021-Injection", "WSTG-INPV-01"],
+            location=Location(file=f"dynamic:{reflected[0]['endpoint']}", line=1, column=1),
+            snippet=f"{len(reflected)} parameter(s) reflected HTML-significant characters unescaped.",
+            evidence={
+                "dynamic_probe": {
+                    "probe": "reflected_xss",
+                    "status": "confirmed",
+                    "reflections": reflected,
+                    "marker": _XSS_MARKER,
+                    "stored_response": "endpoint, parameter, reflection context, and status only",
                 },
-                impact="A reachable SQL injection lets an attacker read, modify, or destroy database contents.",
-                remediation="Use parameterized queries / prepared statements; never build SQL by interpolating request input.",
-            )
+                "attack_path": "Input is reflected into the HTML response without encoding, so an attacker-supplied script in this parameter would run in the victim's browser.",
+            },
+            impact="Reflected XSS lets an attacker run script in a victim's session: steal cookies/tokens, perform actions as the user, or deface the page.",
+            remediation="Context-encode all user input on output (HTML/attribute/JS), prefer framework auto-escaping, and add a restrictive Content-Security-Policy.",
         )
-        if feed:
-            feed.emit("red", f"Confirmed SQL injection at {path}?{param}")
+    )
     return findings
+
+
+def discover_params(
+    gate,
+    paths: Iterable[str],
+    *,
+    feed: EventFeed | None = None,
+    wordlist: Iterable[str] = PARAM_WORDLIST,
+    max_paths: int = 6,
+) -> list[tuple[str, str]]:
+    """Fan a parameter wordlist across known paths to find live input sinks.
+
+    SPAs and minified bundles rarely reveal their query parameters in source, so
+    coverage otherwise depends on what the user happened to pass via ``--endpoint``.
+    For each path we send a unique marker as each candidate parameter (read-only
+    GET) and keep the parameter when the response either reflects the marker or
+    differs from a no-parameter baseline — i.e. the server actually consumed it.
+    Returns ``(path, param)`` pairs to feed the injection detectors.
+    """
+    discovered: dict[tuple[str, str], None] = {}
+    marker = _XSS_MARKER
+    for path in _dedupe(list(paths))[:max_paths]:
+        try:
+            baseline = gate.request("GET", path)
+        except Exception:  # noqa: BLE001
+            continue
+        baseline_body = _normalized_body(baseline.text)
+        for param in wordlist:
+            try:
+                response = gate.request("GET", _with_param(path, param, marker))
+            except GuardrailError:
+                # Hit the request cap — stop discovery, keep what we have.
+                if feed:
+                    feed.emit("red", "Parameter discovery stopped at request cap")
+                return list(discovered)
+            except Exception:  # noqa: BLE001
+                continue
+            consumed = marker in response.text or (
+                response.status_code != baseline.status_code or _normalized_body(response.text) != baseline_body
+            )
+            if consumed:
+                discovered[(path, param)] = None
+    if feed and discovered:
+        feed.emit("attack", f"Parameter discovery found {len(discovered)} live (path, param) pair(s)")
+    return list(discovered)
 
 
 def probe_security_headers(gate, target: str, *, feed: EventFeed | None = None) -> list[Finding]:
@@ -878,7 +1155,12 @@ def run_active_probes(
             feed.emit("attack", f"Added {len(user_supplied)} endpoint(s) from --endpoint")
         # Deduplicate while preserving order (user-supplied first).
         endpoints = list(dict.fromkeys(user_supplied + discovered))
-        request_budget = max(120, 80 + len(endpoints) * (len(SQLI_PAYLOADS) + 1))
+        # Budget covers the checklist baseline, parameter discovery, and the
+        # error/boolean/time injection passes (each endpoint costs several GETs).
+        param_paths = _candidate_paths(endpoints)
+        per_endpoint = len(SQLI_PAYLOADS) + 2 * len(SQLI_BOOLEAN_PAIRS) + len(SQLI_TIME_PAYLOADS) + 4
+        discovery_cost = min(len(param_paths), 6) * (len(PARAM_WORDLIST) + 1)
+        request_budget = max(200, 100 + discovery_cost + (len(endpoints) + discovery_cost) * per_endpoint)
         try:
             gate = TargetGate(target, i_own_this=i_own_this, max_requests=request_budget)
         except GuardrailError as error:
@@ -889,11 +1171,20 @@ def run_active_probes(
             from .transport import run_transport_probes
 
             findings.extend(run_transport_probes(target, i_own_this=i_own_this, feed=feed))
+            # nuclei-style templated checks (tech/CVE fingerprints, exposed surfaces).
+            from .templates import run_template_checks
+
+            findings.extend(run_template_checks(gate, feed=feed))
+            # Expand the injection surface: fan a parameter wordlist across known
+            # paths so coverage doesn't depend on params being visible in source.
+            feed.emit("attack", f"Discovering query parameters across {min(len(param_paths), 6)} path(s)")
+            endpoints = list(dict.fromkeys(endpoints + discover_params(gate, param_paths, feed=feed)))
             if endpoints:
-                feed.emit("attack", f"Probing {len(endpoints)} endpoint(s) for SQL injection")
+                feed.emit("attack", f"Probing {len(endpoints)} endpoint(s) for SQL injection and reflected XSS")
                 findings.extend(probe_sql_injection(gate, endpoints, feed=feed))
+                findings.extend(probe_reflected_xss(gate, endpoints, feed=feed))
             else:
-                feed.emit("attack", "No query-string endpoints found in source to test for SQLi")
+                feed.emit("attack", "No query-string endpoints found or discovered to test for injection")
     elif not databases:
         feed.emit("attack", "Active mode found nothing to probe (no target and no Firebase config)")
 
