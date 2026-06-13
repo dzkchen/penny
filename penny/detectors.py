@@ -584,7 +584,8 @@ TLS_RULES = (
         owasp=("A02:2021-Cryptographic Failures",),
         impact="Disabling certificate verification exposes traffic to man-in-the-middle interception.",
         remediation="Keep certificate verification enabled; pin or supply a trusted CA bundle instead of turning verification off.",
-        pattern=re.compile(r"\bverify\s*=\s*False\b"),
+        # Scoped to HTTP-client context so it doesn't collide with JWT's verify=False (D016).
+        pattern=re.compile(r"(?:requests|httpx|aiohttp|urllib3|\bsession\b|\.(?:get|post|put|patch|delete|head|request))\b[^\n]*?\bverify\s*=\s*False\b", re.I),
         reason="An HTTP client call disables certificate verification (verify=False).",
     ),
     PatternRule(
@@ -843,46 +844,360 @@ def detect_permissive_firebase_rules(files: Iterable[SourceFile]) -> list[Findin
     return findings
 
 
-# D014: cross-site scripting (XSS) sinks - untrusted data into the DOM/HTML.
-XSS_PATTERNS = [
-    (re.compile(r"\.innerHTML\s*=", re.I), "Assignment to innerHTML can inject script if the value is user-controlled."),
-    (re.compile(r"\.outerHTML\s*=", re.I), "Assignment to outerHTML can inject script if the value is user-controlled."),
-    (re.compile(r"document\.write\s*\(", re.I), "document.write with untrusted input enables XSS."),
-    (re.compile(r"dangerouslySetInnerHTML", re.I), "React dangerouslySetInnerHTML bypasses escaping and can introduce XSS."),
-    (re.compile(r"v-html\s*=", re.I), "Vue v-html renders raw HTML and can introduce XSS."),
-    (re.compile(r"\$\(\s*[^)]*\)\.html\s*\(", re.I), "jQuery .html() with untrusted input enables XSS."),
-    (re.compile(r"insertAdjacentHTML\s*\(", re.I), "insertAdjacentHTML with untrusted input enables XSS."),
-    (re.compile(r"\beval\s*\(\s*.*(location|document|window|req|request|params|query)", re.I), "eval over request/DOM data enables script injection."),
-]
+# ---------------------------------------------------------------------------
+# Data-flow-ish detectors (D014/D015/D019/D023).
+#
+# Pure regex can't trace taint, so these stay high-precision by only firing when
+# a dangerous *sink* and a visible *request-derived input* appear together on the
+# same line. That misses multi-line flows (recall) but almost never fires on
+# benign code (precision) — the tradeoff the project explicitly prefers.
+# ---------------------------------------------------------------------------
+
+# Untrusted-input markers. Express (`req.query/params/body/...`), Flask/Django
+# (`request.args/form/json/...`), and JS template interpolation of `req`.
+_REQUEST_INPUT_RE = re.compile(
+    r"\breq(?:uest)?\.(?:query|params?|body|args|form|values|data|cookies|headers|url|path|files|json|GET|POST|get_json)\b"
+    r"|\brequest\.(?:args|form|values|json|data|files|cookies|headers|GET|POST|get_json)\b"
+    r"|\$\{\s*req(?:uest)?[.\[]",
+    re.I,
+)
+# A value is being *built* (interpolated/concatenated/formatted) rather than passed verbatim.
+_STRING_BUILD_RE = re.compile(r"f['\"]|`[^`]*\$\{|['\"]\s*\+|\+\s*['\"]|\.format\s*\(|%\s*[\(s]")
 
 
-def detect_xss(files: Iterable[SourceFile]) -> list[Finding]:
+def _has_request_input(fragment: str) -> bool:
+    return bool(_REQUEST_INPUT_RE.search(fragment))
+
+
+# D014: server-side request forgery — an outbound HTTP call whose URL is request-derived.
+_SSRF_SINK_RE = re.compile(
+    r"\b(?:requests\.(?:get|post|put|patch|delete|head|request)"
+    r"|httpx\.(?:get|post|put|patch|delete|head|request|stream)"
+    r"|urllib\.request\.urlopen|urlopen"
+    r"|axios(?:\.(?:get|post|put|patch|delete|request|head))?"
+    r"|node-fetch|fetch|got|superagent\.[a-z]+)\s*\(",
+    re.I,
+)
+
+
+def detect_ssrf(files: Iterable[SourceFile]) -> list[Finding]:
     findings: list[Finding] = []
     for file in files:
-        if file.path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".vue", ".html"}:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
             continue
         for line_no, line in enumerate(file.text.splitlines(), start=1):
-            for pattern, reason in XSS_PATTERNS:
-                match = pattern.search(line)
-                if not match:
-                    continue
+            match = _SSRF_SINK_RE.search(line)
+            if not match or not _has_request_input(line[match.end() - 1 :]):
+                continue
+            findings.append(
+                Finding(
+                    title="Possible server-side request forgery (SSRF)",
+                    severity="High",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D014",
+                    owasp=["A10:2021-Server-Side Request Forgery"],
+                    location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "An outbound HTTP request is built from request-controlled input."},
+                    impact="An attacker who controls the target URL can make the server reach internal services, cloud metadata endpoints, or arbitrary hosts.",
+                    remediation="Validate the destination against an allowlist of trusted hosts/schemes; never fetch a URL taken directly from user input.",
+                )
+            )
+    return findings
+
+
+# D015: path traversal — a filesystem read/serve sink fed request-derived input.
+_PATH_SINK_RE = re.compile(
+    r"\b(?:open|io\.open|codecs\.open"
+    r"|fs\.readFile(?:Sync)?|fs\.writeFile(?:Sync)?|fs\.createReadStream|fs\.createWriteStream"
+    r"|res\.sendFile|sendFile|res\.download|send_file|send_from_directory)\s*\(",
+    re.I,
+)
+
+
+def detect_path_traversal(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            match = _PATH_SINK_RE.search(line)
+            if not match or not _has_request_input(line[match.start() :]):
+                continue
+            findings.append(
+                Finding(
+                    title="Possible path traversal",
+                    severity="High",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D015",
+                    owasp=["A01:2021-Broken Access Control"],
+                    location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "A filesystem path is built from request-controlled input."},
+                    impact="An attacker can supply '../' sequences to read or write files outside the intended directory.",
+                    remediation="Resolve the path and confirm it stays within an allowed base directory; reject absolute paths and '..' segments.",
+                )
+            )
+    return findings
+
+
+# D019: open redirect — a redirect target taken from request input.
+_REDIRECT_SINK_RE = re.compile(
+    r"\b(?:res\.redirect|response\.redirect|redirect"
+    r"|location\.assign|location\.replace"
+    r"|window\.location(?:\.href)?\s*=|location\.href\s*=)\s*\(?",
+    re.I,
+)
+
+
+def detect_open_redirect(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            match = _REDIRECT_SINK_RE.search(line)
+            if not match or not _has_request_input(line[match.start() :]):
+                continue
+            findings.append(
+                Finding(
+                    title="Possible open redirect",
+                    severity="Medium",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D019",
+                    owasp=["A01:2021-Broken Access Control"],
+                    location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "A redirect destination is taken directly from request input."},
+                    impact="Open redirects let attackers craft trusted-looking links that bounce victims to phishing or malware sites.",
+                    remediation="Redirect only to a fixed set of safe paths, or validate the target against an allowlist of trusted hosts.",
+                )
+            )
+    return findings
+
+
+# D023: prompt injection — untrusted input concatenated into an LLM prompt/system
+# message (OWASP LLM01). On-brand for AI-built apps: regex catches the obvious
+# string-built case; the --ai pass reasons about the rest.
+_PROMPT_VAR_RE = re.compile(
+    r"\b(?:system[_-]?prompt|sys_prompt|user_prompt|prompt|instruction|preamble|messages?|template)\b",
+    re.I,
+)
+
+
+def detect_prompt_injection(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            if not _PROMPT_VAR_RE.search(line):
+                continue
+            if not _STRING_BUILD_RE.search(line) or not _has_request_input(line):
+                continue
+            is_system = bool(re.search(r"\b(?:system[_-]?prompt|sys_prompt|instruction|preamble)\b", line, re.I))
+            match = _PROMPT_VAR_RE.search(line)
+            findings.append(
+                Finding(
+                    title="Untrusted input built into an LLM prompt",
+                    severity="High" if is_system else "Medium",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D023",
+                    owasp=["A03:2021-Injection", "LLM01:2025-Prompt Injection"],
+                    location=Location(file=file.relative_path, line=line_no, column=(match.start() + 1) if match else 1),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "Request-controlled input is concatenated/interpolated into an LLM prompt or message."},
+                    impact="An attacker can inject instructions that override the system prompt, exfiltrate data, or abuse tools the model can call.",
+                    remediation="Keep untrusted input in a clearly delimited user turn, never in the system prompt; validate/escape it and constrain tool/function permissions.",
+                )
+            )
+    return findings
+
+
+# D016: insecure JWT handling — disabled signature verification or the 'none' alg.
+JWT_RULES = (
+    PatternRule(
+        detector_id="D016",
+        title="JWT signature verification disabled",
+        severity="Critical",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="Accepting the 'none' algorithm lets anyone forge a valid-looking token with any claims.",
+        remediation="Pin an explicit signing algorithm (e.g. RS256/HS256) and reject 'none'; never include 'none' in the allowed algorithms.",
+        pattern=re.compile(r"\balgorithms?['\"]?\s*[:=]\s*\[?\s*['\"]none['\"]", re.I),
+        reason="A JWT library is configured to accept the 'none' (unsigned) algorithm.",
+    ),
+    PatternRule(
+        detector_id="D016",
+        title="JWT signature verification disabled",
+        severity="High",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="Decoding a JWT without verifying its signature lets an attacker tamper with the claims.",
+        remediation="Always verify the signature: pass a key and remove verify=False / verify_signature: False.",
+        pattern=re.compile(r"jwt\.decode\s*\([^)]*verify\s*=\s*False|verify_signature['\"]?\s*:\s*False", re.I),
+        reason="A JWT is decoded with signature verification turned off.",
+    ),
+)
+
+
+def detect_insecure_jwt(files: Iterable[SourceFile]) -> list[Finding]:
+    return _scan_pattern_rules(files, JWT_RULES, extensions=CODE_EXTENSIONS)
+
+
+# D017: weak cryptography — broken modes/ciphers (unconditional) and weak hashing
+# or randomness used in a security context (guarded to avoid flagging cache keys).
+WEAK_CRYPTO_RULES = (
+    PatternRule(
+        detector_id="D017",
+        title="Insecure cipher mode (ECB)",
+        severity="Medium",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="ECB mode encrypts identical plaintext blocks to identical ciphertext, leaking structure of the data.",
+        remediation="Use an authenticated mode such as AES-GCM with a unique nonce per message.",
+        pattern=re.compile(r"\bMODE_ECB\b|['\"](?:aes-(?:128|192|256)-ecb|des-ecb)['\"]", re.I),
+        reason="An ECB block-cipher mode is selected.",
+    ),
+    PatternRule(
+        detector_id="D017",
+        title="Broken cipher (DES/RC4)",
+        severity="Medium",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="DES and RC4 are cryptographically broken and must not protect sensitive data.",
+        remediation="Replace DES/RC4 with a modern authenticated cipher such as AES-GCM or ChaCha20-Poly1305.",
+        pattern=re.compile(r"\bcreateCipher(?:iv)?\s*\(\s*['\"](?:des|des-cbc|rc4)['\"]|\bDES\.new\s*\(|\bARC4\.new\s*\(", re.I),
+        reason="A broken cipher (DES or RC4) is instantiated.",
+    ),
+)
+_WEAK_HASH_RE = re.compile(r"\bhashlib\.(?:md5|sha1)\s*\(|createHash\s*\(\s*['\"](?:md5|sha1)['\"]\s*\)", re.I)
+_INSECURE_RANDOM_RE = re.compile(r"\bMath\.random\s*\(\s*\)|\brandom\.(?:random|randint|choice|randrange)\s*\(", re.I)
+_SECURITY_CONTEXT_RE = re.compile(r"\b(?:password|passwd|pwd|secret|credential|token|salt|otp|nonce|session|api[_-]?key|reset)\b", re.I)
+
+
+def detect_insecure_crypto(files: Iterable[SourceFile]) -> list[Finding]:
+    findings = _scan_pattern_rules(files, WEAK_CRYPTO_RULES, extensions=CODE_EXTENSIONS)
+    for file in files:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            if not _SECURITY_CONTEXT_RE.search(line):
+                continue
+            hash_match = _WEAK_HASH_RE.search(line)
+            rand_match = _INSECURE_RANDOM_RE.search(line)
+            if hash_match:
                 findings.append(
                     Finding(
-                        title="Potential cross-site scripting (XSS) sink",
-                        severity="High",
+                        title="Weak hash in a security context",
+                        severity="Medium",
                         confidence="medium",
                         status="suspected",
                         source="static",
-                        detector_id="D014",
-                        owasp=["A03:2021-Injection"],
-                        location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                        detector_id="D017",
+                        owasp=["A02:2021-Cryptographic Failures"],
+                        location=Location(file=file.relative_path, line=line_no, column=hash_match.start() + 1),
                         snippet=redact_text(line.strip()),
-                        evidence={"reason": reason},
-                        impact="Unescaped untrusted input rendered into the page lets attackers run script in users' browsers.",
-                        remediation="Escape/encode untrusted data, prefer textContent over innerHTML, and sanitize HTML with a vetted library.",
+                        evidence={"reason": "MD5/SHA-1 is used near a password/secret/token."},
+                        impact="MD5 and SHA-1 are fast and broken; hashing passwords or tokens with them is trivially attackable.",
+                        remediation="Use a slow password hash (bcrypt/scrypt/Argon2) for passwords, or SHA-256+ for integrity.",
                     )
                 )
-                break
+            elif rand_match:
+                findings.append(
+                    Finding(
+                        title="Insecure randomness for a secret",
+                        severity="Medium",
+                        confidence="medium",
+                        status="suspected",
+                        source="static",
+                        detector_id="D017",
+                        owasp=["A02:2021-Cryptographic Failures"],
+                        location=Location(file=file.relative_path, line=line_no, column=rand_match.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={"reason": "A non-cryptographic RNG is used to build a token/secret-like value."},
+                        impact="Math.random()/random are predictable, so tokens or secrets generated from them can be guessed.",
+                        remediation="Use a CSPRNG: crypto.randomBytes / secrets.token_urlsafe for any security-sensitive value.",
+                    )
+                )
+    return findings
+
+
+# D018: DOM XSS sinks in client code. Precision-first: the inherently-dangerous
+# HTML APIs (dangerouslySetInnerHTML/v-html/insertAdjacentHTML) fire unconditionally,
+# while innerHTML/outerHTML, jQuery .html(), and document.write only fire when the
+# written value is dynamic — static markup literals are left alone.
+_DANGEROUS_HTML_RE = re.compile(r"dangerouslySetInnerHTML|\bv-html\b|\binsertAdjacentHTML\s*\(")
+_INNERHTML_RE = re.compile(r"\.(?:inner|outer)HTML\s*=\s*(\S.*)$")
+_JQUERY_HTML_RE = re.compile(r"\$\([^)]*\)\.html\s*\(\s*([^)\s].*?)\)?\s*;?\s*$")
+_DOCWRITE_RE = re.compile(r"\bdocument\.write(?:ln)?\s*\(\s*(\S.*?)\)?\s*;?\s*$")
+# .vue/.html templates carry v-html and inline document.write; keep them in scope.
+XSS_EXTENSIONS = CLIENT_EXTENSIONS | {".vue", ".html"}
+
+
+# A right-hand side that is exactly one quoted string literal — optionally
+# terminated by `;` and a trailing line/block comment — is static markup, not a
+# dynamic (attacker-influenceable) value. Matching the whole shape lets a trailing
+# comment (`el.innerHTML = '<hr>';  // note`) stay recognized as static.
+_STATIC_LITERAL_RE = re.compile(r"""^\s*(['"])(?:\\.|(?!\1).)*\1\s*;?\s*(?://.*|/\*.*)?$""")
+
+
+def _is_dynamic_rhs(rhs: str) -> bool:
+    """True when the assigned value is not a single static string literal."""
+    rhs = rhs.strip()
+    if "${" in rhs or "+" in rhs:
+        return True
+    return not _STATIC_LITERAL_RE.match(rhs)
+
+
+def detect_xss_sinks(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in XSS_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            match = _DANGEROUS_HTML_RE.search(line)
+            column = None
+            if match:
+                column = match.start() + 1
+            else:
+                inner = _INNERHTML_RE.search(line)
+                if inner and _is_dynamic_rhs(inner.group(1)):
+                    column = inner.start() + 1
+                else:
+                    jq = _JQUERY_HTML_RE.search(line)
+                    if jq and _is_dynamic_rhs(jq.group(1)):
+                        column = jq.start() + 1
+                    else:
+                        docw = _DOCWRITE_RE.search(line)
+                        if docw and docw.group(1).strip() not in {"", "''", '""'}:
+                            column = docw.start() + 1
+            if column is None:
+                continue
+            findings.append(
+                Finding(
+                    title="Possible DOM XSS sink",
+                    severity="Medium",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D018",
+                    owasp=["A03:2021-Injection"],
+                    location=Location(file=file.relative_path, line=line_no, column=column),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "A dynamic value is written into the DOM as HTML (innerHTML/dangerouslySetInnerHTML/v-html/jQuery .html()/document.write)."},
+                    impact="Rendering attacker-influenced HTML without sanitization enables cross-site scripting.",
+                    remediation="Set textContent instead of innerHTML, or sanitize the HTML with a vetted library (e.g. DOMPurify) before injecting it.",
+                )
+            )
     return findings
 
 
@@ -900,5 +1215,11 @@ def run_detectors(files: list[SourceFile]) -> list[Finding]:
         *detect_debug_mode(files),
         *detect_client_side_db_writes(files),
         *detect_permissive_firebase_rules(files),
-        *detect_xss(files),
+        *detect_ssrf(files),
+        *detect_path_traversal(files),
+        *detect_insecure_jwt(files),
+        *detect_insecure_crypto(files),
+        *detect_xss_sinks(files),
+        *detect_open_redirect(files),
+        *detect_prompt_injection(files),
     ]

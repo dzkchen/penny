@@ -244,6 +244,18 @@ if origin in ALLOWED_ORIGINS:
 Avoid `Access-Control-Allow-Origin: *` on APIs that may return user-specific or credential-adjacent data.
 """
         )
+    # Detectors beyond D001–D006 (D007+, AI001, A00x) don't have a hand-written
+    # diff block; fall back to each finding's own remediation so every detector
+    # still contributes a Section-7 entry instead of being silently dropped.
+    covered = {"D001", "D002", "D003", "D004", "D005", "D006"}
+    seen: set[str] = set()
+    for finding in findings:
+        detector_id = finding["detector_id"]
+        if detector_id in covered or detector_id in seen:
+            continue
+        seen.add(detector_id)
+        remediation = (finding.get("remediation") or "Review the flagged code and apply the appropriate fix.").strip()
+        sections.append(f"### {finding['title']} ({detector_id})\n\n{remediation}")
     return "\n\n".join(sections) if sections else "No concrete fixes were generated because there are no findings."
 
 

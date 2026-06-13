@@ -63,7 +63,9 @@ python -m penny ask "Summarize F-001 and how to fix it" --no-ai   # deterministi
 
 ### AI-assisted detection (`--ai`)
 
-`scan --ai` / `run --ai` add an AI review pass: Penny sends bounded, line-numbered source to Claude (the deep model) and folds back any vulnerabilities it finds — broken auth/authorization, injection through indirect data flow, SSRF, unsafe deserialization, and similar issues the regex detectors can't reason about. These land as `AI001` findings (`source: ai`) alongside the deterministic ones; each finding's snippet is rebuilt from the real source line and redacted, so the model can't smuggle an unredacted secret into persisted output.
+`scan --ai` / `run --ai` add an AI review pass: Penny sends bounded, line-numbered source to Claude (the deep model) and folds back any vulnerabilities it finds — broken auth/authorization, injection through indirect data flow, SSRF, unsafe deserialization, and similar issues the regex detectors can't reason about. The pass also **traces authorization across files** (route → middleware → data access) to surface missing ownership checks, and audits any LLM integration against the **OWASP LLM Top 10** (prompt injection, insecure output handling, unauthorized tool/function use, system-prompt or key leakage). Security-relevant files (auth/api/route/db/LLM) are bundled first so large repos don't truncate the important code away. These land as `AI001` findings (`source: ai`) alongside the deterministic ones; each finding's snippet is rebuilt from the real source line and redacted, so the model can't smuggle an unredacted secret into persisted output.
+
+`--ai` also runs a **secret triage** step: a fast-model pass over the false-positive-prone high-entropy `D002` hits that drops ones it judges benign (hashes, fingerprints, fixtures). Known-prefix secrets are never triaged away, and the context sent to the model is redacted.
 
 Unlike the rest of Penny, `--ai` sends source code to Anthropic, so it is opt-in. It respects the same walker, so gitignored files (e.g. a local `.env`) are never included. Without a key it is a no-op.
 
@@ -170,10 +172,17 @@ Current deterministic checks:
 - `D011`: production debug mode (`app.run(debug=True)`, `DEBUG = True`).
 - `D012`: client-side database write with no server-side authorization — direct Supabase/Firebase mutations (Supabase `.insert/.update/.delete`, Firestore `setDoc/updateDoc/.collection().add/.doc().set`, Realtime Database `set(ref())`/`.ref().push`) in browser-shipped code (server paths like `api/`, `server/`, `functions/` are excluded). This is the core trust-boundary risk for apps that "lack a proper backend": the browser is attacker-controlled, so access control can't be enforced there.
 - `D013`: permissive Firebase security rules — `allow read, write: if true` (Firestore/Storage) or `".read"/".write": true` (Realtime Database) in `firestore.rules`, `storage.rules`, `*.rules`, or `database.rules.json`. Auth-only rules (`if request.auth != null`, no ownership check) are flagged Medium.
+- `D014`: server-side request forgery (SSRF) — an outbound HTTP call (`requests`/`httpx`/`urlopen`/`axios`/`fetch`/`got`) whose URL is built from request-controlled input.
+- `D015`: path traversal — a filesystem read/serve sink (`open`/`fs.readFile`/`sendFile`/`send_file`/`createReadStream`) fed request-controlled input.
+- `D016`: insecure JWT handling — the `none` (unsigned) algorithm, or decoding with signature verification disabled (`verify=False`, `verify_signature: false`).
+- `D017`: weak cryptography — ECB cipher mode and broken ciphers (DES/RC4) unconditionally, plus MD5/SHA-1 hashing or non-cryptographic randomness (`Math.random`, `random.*`) used in a security context (password/token/secret/salt).
+- `D018`: DOM XSS sinks in client code — dynamic `innerHTML`/`outerHTML`, `dangerouslySetInnerHTML`, `v-html`, `insertAdjacentHTML`, jQuery `.html()`, or `document.write` (static markup is not flagged).
+- `D019`: open redirect — a redirect target (`res.redirect`/`redirect`/`window.location`) taken directly from request input.
+- `D023`: prompt injection (OWASP LLM01) — request-controlled input concatenated/interpolated into an LLM prompt or system message (High when it lands in a system prompt). The `--ai` pass reasons about the rest of the LLM Top 10.
 - `AI001`: AI-assisted review (opt-in via `--ai`) for issues regex can't catch — including the client/server trust boundary (missing backend / client-trusted mutations), reported as Critical/High. See "AI-assisted detection" above.
 - `A001` / `A002`: active-probe findings (opt-in via `--active`) — confirmed SQL injection and an anonymously-readable Firebase database. See "Active probing" above.
 
-Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers. The code-pattern detectors (`D008`–`D011`) only scan source files (`.py`, `.js`/`.jsx`, `.ts`/`.tsx`).
+Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers. The code-pattern detectors (`D008`–`D011`, `D014`–`D019`, `D023`) only scan source files (`.py`, `.js`/`.jsx`, `.ts`/`.tsx`); the data-flow-style ones (`D014`/`D015`/`D019`/`D023`) stay high-precision by firing only when a dangerous sink and a request-derived input appear together on the same line.
 
 ### Scan scope and noise control
 

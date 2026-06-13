@@ -136,7 +136,7 @@ def run_browser_probe(
                 confidence="high",
                 status="confirmed",
                 source="dynamic",
-                detector_id="D023",
+                detector_id="D024",
                 owasp=["A02:2021-Cryptographic Failures"],
                 location=Location(file="dynamic:browser", line=1, column=1),
                 snippet="A form action posts over plaintext http://.",
