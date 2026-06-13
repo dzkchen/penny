@@ -22,7 +22,7 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 class MongoMirror:
     def __init__(self) -> None:
         load_dotenv()
-        self.uri = os.environ.get("MONGODB_URI")
+        self.uri = None if os.environ.get("PENNY_DISABLE_MONGO") == "1" else os.environ.get("MONGODB_URI")
         self.database_name = os.environ.get("PENNY_MONGODB_DB", "penny")
 
     def enabled(self) -> bool:
