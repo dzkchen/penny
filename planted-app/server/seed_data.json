@@ -1,0 +1,11 @@
+{
+  "private_notes": [
+    {"id": 1, "user_id": "user-a", "note": "Payroll draft for alice@example.test"},
+    {"id": 2, "user_id": "user-b", "note": "Acquisition note for bob@example.test"},
+    {"id": 3, "user_id": "user-c", "note": "Launch checklist for carol@example.test"}
+  ],
+  "orders": {
+    "1001": {"id": "1001", "user_id": "user-a", "total": 42.5, "item": "demo hoodie"},
+    "1002": {"id": "1002", "user_id": "user-b", "total": 89.0, "item": "private beta seat"}
+  }
+}
