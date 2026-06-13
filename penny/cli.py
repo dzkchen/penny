@@ -18,6 +18,27 @@ from .sources import resolved_scan_source
 from .store import FindingsStore, copy_report_to_findings_dir
 
 
+def _resolve_findings_path(findings: Path | None, out_dir: Path) -> Path:
+    """Resolve which findings file `report` should read.
+
+    When `--findings` is not given explicitly, look inside the `--out` run tree
+    first (`<out>/.penny/runs/latest/findings.json`, then `<out>/findings.json`)
+    so `scan --out X` followed by `report --out X` reports the same run. Falls
+    back to `findings.json` in the current directory for backwards compatibility.
+    """
+    if findings is not None:
+        return findings
+    candidates = [
+        out_dir / ".penny" / "runs" / "latest" / "findings.json",
+        out_dir / "findings.json",
+        Path("findings.json"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: bool = False) -> Path:
     payload = load_findings(findings)
     session_id = payload.get("session_id", "manual-report")
@@ -108,11 +129,11 @@ def _build_typer_app():
 
     @app.command()
     def report(
-        findings: Path = typer.Option(Path("findings.json"), "--findings"),
+        findings: Optional[Path] = typer.Option(None, "--findings", help="Defaults to the latest run under --out."),
         out: Path = typer.Option(Path("."), "--out"),
         export: bool = typer.Option(False, "--export", help="Also write report.html and findings.csv."),
     ) -> None:
-        _report_command(findings, out, EventFeed(), export=export)
+        _report_command(_resolve_findings_path(findings, out), out, EventFeed(), export=export)
 
     @app.command()
     def ask(
@@ -225,7 +246,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--active", action="store_true")
 
     report_parser = sub.add_parser("report")
-    report_parser.add_argument("--findings", type=Path, default=Path("findings.json"))
+    report_parser.add_argument("--findings", type=Path, default=None)
     report_parser.add_argument("--out", type=Path, default=Path("."))
     report_parser.add_argument("--export", action="store_true")
 
@@ -278,7 +299,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
     elif args.command == "report":
-        _report_command(args.findings, args.out, feed, export=args.export)
+        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, export=args.export)
     elif args.command == "ask":
         use_llm = not args.no_ai
         if use_llm:

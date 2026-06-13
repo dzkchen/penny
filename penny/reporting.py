@@ -49,36 +49,67 @@ def _status_word(finding: dict[str, Any]) -> str:
     return "suspected"
 
 
+def _render_dependency_table(deps: list[dict[str, Any]], evidence: dict[str, Any]) -> str:
+    lines = [
+        f"- Vulnerable dependencies: {evidence.get('package_count', len(deps))} "
+        f"package(s), {evidence.get('advisory_count', 0)} advisory(ies)",
+        "",
+        "| Package | Ecosystem | Detected | Recommended | CVEs |",
+        "|---|---|---|---|---|",
+    ]
+    for dep in deps:
+        cves = ", ".join(dep.get("cves", [])) or "—"
+        lines.append(
+            f"| {dep.get('package', '?')} | {dep.get('ecosystem', '?')} "
+            f"| {dep.get('detected_version', '?')} | {dep.get('recommended_version', '?')} | {cves} |"
+        )
+    return "\n".join(lines)
+
+
+def _render_evidence(finding: dict[str, Any]) -> str:
+    evidence = finding.get("evidence", {}) or {}
+    if not evidence:
+        return ""
+    deps = evidence.get("vulnerable_dependencies")
+    if finding["detector_id"] == "D005" and deps:
+        return _render_dependency_table(deps, evidence)
+    if evidence.get("ai_generated"):
+        model = evidence.get("model", "ai")
+        reason = evidence.get("reason", "")
+        line = f"- Evidence: AI review ({model})" + (f" — {reason}" if reason else "")
+        return redact_text(line)
+    scalars = [
+        f"- {key}: {evidence[key]}"
+        for key in sorted(evidence)
+        if not isinstance(evidence[key], (dict, list))
+    ]
+    if scalars:
+        return redact_text("\n".join(scalars))
+    return f"- Evidence: {redact_text(json.dumps(evidence, sort_keys=True))}"
+
+
 def _finding_details(findings: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
     for finding in findings:
         location = finding["location"]
-        evidence = finding.get("evidence", {})
-        blocks.append(
-            "\n".join(
-                [
-                    f"### {finding['id']} - {finding['title']}",
-                    "",
-                    f"- Severity: {finding['severity']}",
-                    f"- Status: {_status_word(finding)}",
-                    f"- Confidence: {finding['confidence']}",
-                    f"- Detector: {finding['detector_id']}",
-                    f"- OWASP: {', '.join(finding.get('owasp', []))}",
-                    f"- Location: `{location['file']}:{location['line']}`",
-                    f"- Evidence: {redact_text(json.dumps(evidence, sort_keys=True))}",
-                    "",
-                    "Redacted snippet:",
-                    "",
-                    "```text",
-                    redact_text(finding.get("snippet", "")),
-                    "```",
-                    "",
-                    f"Impact: {finding['impact']}",
-                    "",
-                    f"Remediation: {finding['remediation']}",
-                ]
-            )
-        )
+        parts = [
+            f"### {finding['id']} - {finding['title']}",
+            "",
+            f"- Severity: {finding['severity']}",
+            f"- Status: {_status_word(finding)}",
+            f"- Confidence: {finding['confidence']}",
+            f"- Detector: {finding['detector_id']}",
+            f"- OWASP: {', '.join(finding.get('owasp', []))}",
+            f"- Location: `{location['file']}:{location['line']}`",
+        ]
+        evidence_block = _render_evidence(finding)
+        if evidence_block:
+            parts.append(evidence_block)
+        snippet = redact_text(finding.get("snippet", "")).strip()
+        if snippet:
+            parts += ["", "Redacted snippet:", "", "```text", snippet, "```"]
+        parts += ["", f"Impact: {finding['impact']}", "", f"Remediation: {finding['remediation']}"]
+        blocks.append("\n".join(parts))
     return "\n\n".join(blocks)
 
 
