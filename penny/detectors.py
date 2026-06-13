@@ -843,6 +843,49 @@ def detect_permissive_firebase_rules(files: Iterable[SourceFile]) -> list[Findin
     return findings
 
 
+# D014: cross-site scripting (XSS) sinks - untrusted data into the DOM/HTML.
+XSS_PATTERNS = [
+    (re.compile(r"\.innerHTML\s*=", re.I), "Assignment to innerHTML can inject script if the value is user-controlled."),
+    (re.compile(r"\.outerHTML\s*=", re.I), "Assignment to outerHTML can inject script if the value is user-controlled."),
+    (re.compile(r"document\.write\s*\(", re.I), "document.write with untrusted input enables XSS."),
+    (re.compile(r"dangerouslySetInnerHTML", re.I), "React dangerouslySetInnerHTML bypasses escaping and can introduce XSS."),
+    (re.compile(r"v-html\s*=", re.I), "Vue v-html renders raw HTML and can introduce XSS."),
+    (re.compile(r"\$\(\s*[^)]*\)\.html\s*\(", re.I), "jQuery .html() with untrusted input enables XSS."),
+    (re.compile(r"insertAdjacentHTML\s*\(", re.I), "insertAdjacentHTML with untrusted input enables XSS."),
+    (re.compile(r"\beval\s*\(\s*.*(location|document|window|req|request|params|query)", re.I), "eval over request/DOM data enables script injection."),
+]
+
+
+def detect_xss(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx", ".vue", ".html"}:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            for pattern, reason in XSS_PATTERNS:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                findings.append(
+                    Finding(
+                        title="Potential cross-site scripting (XSS) sink",
+                        severity="High",
+                        confidence="medium",
+                        status="suspected",
+                        source="static",
+                        detector_id="D014",
+                        owasp=["A03:2021-Injection"],
+                        location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={"reason": reason},
+                        impact="Unescaped untrusted input rendered into the page lets attackers run script in users' browsers.",
+                        remediation="Escape/encode untrusted data, prefer textContent over innerHTML, and sanitize HTML with a vetted library.",
+                    )
+                )
+                break
+    return findings
+
+
 def run_detectors(files: list[SourceFile]) -> list[Finding]:
     return [
         *detect_service_role_in_client(files),
@@ -857,4 +900,5 @@ def run_detectors(files: list[SourceFile]) -> list[Finding]:
         *detect_debug_mode(files),
         *detect_client_side_db_writes(files),
         *detect_permissive_firebase_rules(files),
+        *detect_xss(files),
     ]
