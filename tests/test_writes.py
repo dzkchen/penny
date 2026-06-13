@@ -49,6 +49,19 @@ def test_write_probe_flags_unauthenticated_create_and_mass_assignment() -> None:
     assert "Mass assignment: endpoint binds unexpected request fields" in titles
 
 
+def test_write_probe_ignores_catch_all_acceptor() -> None:
+    # SPA/wildcard server that "accepts" any POST identically — must not be read as
+    # a real create on every candidate endpoint (the SPA catch-all FP class).
+    def client(url, body, headers, timeout):
+        return WriteResponse(201, "OK", {})
+
+    findings = run_safe_write_probe(
+        "http://127.0.0.1:8000", i_own_this=True, i_accept=True, feed=_feed(),
+        client=client,
+    )
+    assert findings == []
+
+
 def test_write_probe_confirm_hook_can_decline_every_write() -> None:
     calls: list[str] = []
 

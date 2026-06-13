@@ -22,6 +22,29 @@ class ScanResult:
     payload: dict
 
 
+def _clean_target(target: str | None, feed: EventFeed) -> str | None:
+    """Normalise the target and fail loudly on a whitespace-glued value.
+
+    A target like ``"http://host/ --ai"`` means a flag got concatenated onto the
+    URL as a single shell token — usually a stray/non-breaking space introduced by
+    copy-pasting a command out of formatted output. Silently accepting it makes the
+    glued flags vanish (e.g. ``--ai`` never takes effect). We keep the URL part and
+    warn so the swallowed flags are obvious. ``str.split()`` also splits on
+    non-breaking spaces, so it recovers the URL in both cases.
+    """
+    if not target:
+        return target
+    parts = target.split()
+    if len(parts) > 1:
+        feed.emit(
+            "gate",
+            f"Target {target!r} contains whitespace; using {parts[0]!r} and ignoring the rest. "
+            "A flag was likely glued onto the URL by a stray space — re-run with a normal space "
+            "between the URL and the next flag.",
+        )
+    return parts[0] if parts else target.strip()
+
+
 def run_scan(
     repo_path: Path,
     *,
@@ -46,6 +69,7 @@ def run_scan(
     endpoints: list[str] | None = None,
 ) -> ScanResult:
     feed = feed or EventFeed()
+    target = _clean_target(target, feed)
     session_id = now_session_id()
     repo_path = repo_path.resolve()
     if not repo_path.exists():

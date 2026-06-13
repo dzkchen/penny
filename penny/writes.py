@@ -23,6 +23,7 @@ assignment). The HTTP client is injected so the logic is unit-tested offline.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
@@ -91,6 +92,16 @@ def _candidate_write_paths(endpoints: Iterable[str] | None) -> list[str]:
     return list(paths)
 
 
+def _normalized_body(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())[:512]
+
+
+# A collection path that cannot legitimately exist. If the server "accepts" a POST
+# here, it accepts any POST (SPA catch-all / wildcard route), so a 200/201 on a real
+# path proves nothing — the same false-positive class the brute-force probe guards.
+_NONEXISTENT_WRITE_PATH = "/__penny_nonexistent_collection_a1b2__"
+
+
 def _same_host_url(base: str, path: str) -> str | None:
     base_parsed = urlparse(base)
     candidate = urljoin(f"{base.rstrip('/')}/", path.lstrip("/"))
@@ -127,6 +138,23 @@ def run_safe_write_probe(
         f"Safe write-path probe on {host}: POST-only, marked '{PENNY_WRITE_MARKER}' records, no PUT/PATCH/DELETE",
     )
 
+    # Baseline: POST to a path that cannot exist. If the server "creates" it, every
+    # endpoint will look writable (SPA catch-all), so we require a real create's
+    # response to differ from this baseline before trusting it.
+    catch_all_body: str | None = None
+    baseline_url = _same_host_url(target, _NONEXISTENT_WRITE_PATH)
+    if baseline_url is not None and (confirm is None or confirm(baseline_url)):
+        try:
+            baseline = client(baseline_url, dict(_TEST_PAYLOAD), {}, timeout_seconds)
+            if baseline.status_code in {200, 201}:
+                catch_all_body = _normalized_body(baseline.text)
+                feed.emit(
+                    "red",
+                    "Server accepts POST to a nonexistent path (catch-all); requiring a distinct response before flagging a write",
+                )
+        except Exception:  # noqa: BLE001
+            catch_all_body = None
+
     unauth_writes: list[dict] = []
     mass_assignment: list[dict] = []
     writes_done = 0
@@ -145,6 +173,10 @@ def run_safe_write_probe(
         try:
             response = client(url, dict(_TEST_PAYLOAD), {}, timeout_seconds)
         except Exception:  # noqa: BLE001 - a failed write must never crash the scan
+            continue
+        # Same page the server returns for a nonexistent collection => not a real
+        # create, just a catch-all responder echoing everything.
+        if catch_all_body is not None and _normalized_body(response.text) == catch_all_body:
             continue
         # Accepted create with no credentials => broken access control on writes.
         if response.status_code in {200, 201}:
