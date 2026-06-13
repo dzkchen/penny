@@ -157,6 +157,10 @@ def host_authorization_error(hostname: str | None, i_own_this: bool) -> str | No
         return "public targets require --i-own-this and a matching DNS TXT proof record"
     if _public_ip_literal(hostname):
         return "public IP literals are blocked; use a DNS hostname with a matching TXT proof record"
+    # TXT ownership proof can be disabled with PENNY_DISABLE_TXT_PROOF=1 (kept in code,
+    # bypassed for trusted local testing). Re-enable for production / shared use.
+    if os.environ.get("PENNY_DISABLE_TXT_PROOF", "").strip() in ("1", "true", "yes"):
+        return None
     if not _has_matching_txt_record(hostname):
         return f"missing TXT proof record; expected {txt_record_hint(hostname)}"
     return None
