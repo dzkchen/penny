@@ -4,7 +4,7 @@ create table private_notes (
   note text not null
 );
 
-alter table private_notes disable row level security;
+alter table private_notes enable row level security;
 
 create policy "public can read private notes"
 on private_notes

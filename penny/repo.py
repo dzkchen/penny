@@ -58,7 +58,7 @@ def _allowed_file(path: Path, root: Path, max_bytes: int) -> bool:
         stat = path.stat()
     except OSError:
         return False
-    return stat.is_file() and stat.st_size <= max_bytes
+    return path.is_file() and stat.st_size <= max_bytes
 
 
 def walk_repo(root: Path, max_bytes: int = 512 * 1024) -> list[SourceFile]:

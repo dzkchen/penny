@@ -43,10 +43,8 @@ def detect_service_role_in_client(files: Iterable[SourceFile]) -> list[Finding]:
             match = SERVICE_KEY_RE.search(line)
             secret = match.group(0) if match else _extract_quoted_secret(line)
             lowered = line.lower()
-            if not secret and not ("service" in lowered and "role" in lowered and "key" in lowered):
+            if not secret:
                 continue
-            if secret is None:
-                secret = line.strip()
             findings.append(
                 Finding(
                     title="Client-visible service-role credential",
