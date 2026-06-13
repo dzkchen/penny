@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from . import llm
 from .ask import answer_question
 from .exports import write_exports
 from .feed import EventFeed
@@ -39,8 +40,16 @@ def _fail(message: str) -> None:
     raise SystemExit(2)
 
 
-def _ask_loop(findings: Path, target: str | None, i_own_this: bool, feed: EventFeed) -> None:
+def _ask_loop(
+    findings: Path,
+    target: str | None,
+    i_own_this: bool,
+    feed: EventFeed,
+    use_llm: bool = False,
+) -> None:
     feed.emit("purple", "Interactive ask mode. Type 'exit' or 'quit' to stop.")
+    if use_llm:
+        feed.emit("purple", llm.describe())
     while True:
         try:
             question = input("penny> ").strip()
@@ -50,7 +59,16 @@ def _ask_loop(findings: Path, target: str | None, i_own_this: bool, feed: EventF
             continue
         if question.lower() in {"exit", "quit", ":q"}:
             break
-        feed.emit("purple", answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this))
+        feed.emit(
+            "purple",
+            answer_question(
+                question,
+                findings_path=findings,
+                target=target,
+                i_own_this=i_own_this,
+                use_llm=use_llm,
+            ),
+        )
 
 
 def _patch_command(findings: Path, repo: Path, out: Path, apply: bool, feed: EventFeed) -> None:
@@ -99,17 +117,25 @@ def _build_typer_app():
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
         feed = EventFeed()
-        feed.emit("purple", answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this))
+        use_llm = not no_ai
+        if use_llm:
+            feed.emit("purple", llm.describe())
+        feed.emit(
+            "purple",
+            answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this, use_llm=use_llm),
+        )
 
     @app.command("ask-loop")
     def ask_loop(
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
-        _ask_loop(findings, target, i_own_this, EventFeed())
+        _ask_loop(findings, target, i_own_this, EventFeed(), use_llm=not no_ai)
 
     @app.command()
     def patch(
@@ -199,11 +225,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     ask_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_parser.add_argument("--target")
     ask_parser.add_argument("--i-own-this", action="store_true")
+    ask_parser.add_argument("--no-ai", action="store_true")
 
     ask_loop_parser = sub.add_parser("ask-loop")
     ask_loop_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_loop_parser.add_argument("--target")
     ask_loop_parser.add_argument("--i-own-this", action="store_true")
+    ask_loop_parser.add_argument("--no-ai", action="store_true")
 
     patch_parser = sub.add_parser("patch")
     patch_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
@@ -240,9 +268,15 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "report":
         _report_command(args.findings, args.out, feed, export=args.export)
     elif args.command == "ask":
-        feed.emit("purple", answer_question(args.question, findings_path=args.findings, target=args.target, i_own_this=args.i_own_this))
+        use_llm = not args.no_ai
+        if use_llm:
+            feed.emit("purple", llm.describe())
+        feed.emit(
+            "purple",
+            answer_question(args.question, findings_path=args.findings, target=args.target, i_own_this=args.i_own_this, use_llm=use_llm),
+        )
     elif args.command == "ask-loop":
-        _ask_loop(args.findings, args.target, args.i_own_this, feed)
+        _ask_loop(args.findings, args.target, args.i_own_this, feed, use_llm=not args.no_ai)
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "knowledge":

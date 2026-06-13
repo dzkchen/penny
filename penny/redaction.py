@@ -11,9 +11,14 @@ JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_
 DB_URL_RE = re.compile(r"\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql)://[^\s'\"<>]+", re.I)
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 KNOWN_SECRET_RE = re.compile(
-    r"\b(?:sk_(?:live|test)_[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"\b(?:sk-ant-[A-Za-z0-9_\-]{20,}|sk-proj-[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,}|"
+    r"sk_(?:live|test)_[A-Za-z0-9_\-]{8,}|rk_(?:live|test)_[A-Za-z0-9_\-]{8,}|"
+    r"ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"xox[baprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{20,}|"
     r"al-[A-Za-z0-9_\-]{20,})\b"
+)
+PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
 )
 HIGH_ENTROPY_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-+/=]{32,}\b")
 
@@ -49,6 +54,7 @@ def redact_text(text: str | None) -> str:
         return ""
     result = str(text)
     replacements = [
+        (PRIVATE_KEY_RE, "private_key"),
         (DB_URL_RE, "db_url"),
         (SERVICE_KEY_RE, "service_key"),
         (JWT_RE, "jwt"),

@@ -6,12 +6,41 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .models import Finding, Location
-from .redaction import KNOWN_SECRET_RE, SERVICE_KEY_RE, looks_high_entropy, redact_text
+from .redaction import (
+    KNOWN_SECRET_RE,
+    PRIVATE_KEY_RE,
+    SERVICE_KEY_RE,
+    looks_high_entropy,
+    redact_text,
+)
 from .repo import SourceFile
 
 
 CLIENT_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}
+CODE_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+DOC_EXTENSIONS = {".md", ".txt", ".rst"}
 SECRET_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-+/=]{32,}\b")
+
+# Shapes that are high-entropy but routinely benign in source/config: subresource
+# integrity hashes, content hashes / git SHAs, and UUIDs. Suppressing these keeps
+# the committed-token detector from flagging README badges, lockfile hashes, and
+# asset fingerprints.
+_SRI_HASH_RE = re.compile(r"^sha(?:256|384|512)-")
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_HASH_DIGEST_LENGTHS = {32, 40, 56, 64, 96, 128}
+
+
+def _is_benign_high_entropy_token(value: str) -> bool:
+    if _SRI_HASH_RE.match(value):
+        return True
+    if _UUID_RE.match(value):
+        return True
+    if _HEX_RE.match(value) and len(value) in _HASH_DIGEST_LENGTHS:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -161,6 +190,10 @@ def detect_service_role_in_client(files: Iterable[SourceFile]) -> list[Finding]:
 def detect_committed_secrets(files: Iterable[SourceFile]) -> list[Finding]:
     findings: list[Finding] = []
     for file in files:
+        # Known-prefix secrets are flagged everywhere (a leaked `ghp_...` in a
+        # README is still a real finding), but the generic high-entropy heuristic
+        # produces mostly noise in prose/docs, so it is skipped there.
+        is_doc = file.path.suffix.lower() in DOC_EXTENSIONS
         for line_no, line in enumerate(file.text.splitlines(), start=1):
             service_match = SERVICE_KEY_RE.search(line)
             for match in KNOWN_SECRET_RE.finditer(line):
@@ -183,9 +216,13 @@ def detect_committed_secrets(files: Iterable[SourceFile]) -> list[Finding]:
                         remediation="Rotate the exposed value, remove it from source, and load it from a server-side secret manager or local .env.",
                     )
                 )
+            if is_doc:
+                continue
             for token_match in SECRET_TOKEN_RE.finditer(line):
                 value = token_match.group(0)
                 if SERVICE_KEY_RE.fullmatch(value) or KNOWN_SECRET_RE.fullmatch(value):
+                    continue
+                if _is_benign_high_entropy_token(value):
                     continue
                 if not looks_high_entropy(value):
                     continue
@@ -338,6 +375,257 @@ def detect_permissive_cors(files: Iterable[SourceFile]) -> list[Finding]:
     return findings
 
 
+@dataclass(frozen=True)
+class PatternRule:
+    detector_id: str
+    title: str
+    severity: str
+    confidence: str
+    owasp: tuple[str, ...]
+    impact: str
+    remediation: str
+    pattern: re.Pattern[str]
+    reason: str
+
+
+# D007: committed private-key material. Scanned in every file type — a PEM header
+# in source control is high-signal regardless of where it lands.
+PRIVATE_KEY_RULES = (
+    PatternRule(
+        detector_id="D007",
+        title="Committed private key",
+        severity="Critical",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="A committed private key lets anyone who can read the repo impersonate the service or decrypt its traffic.",
+        remediation="Remove the key from the repository and its history, rotate it immediately, and load private keys from a secret store at runtime.",
+        pattern=PRIVATE_KEY_RE,
+        reason="A PEM private-key header is present in source-controlled content.",
+    ),
+)
+
+# D008: dangerous execution sinks. Scoped to code files to keep precision high.
+DANGEROUS_SINK_RULES = (
+    PatternRule(
+        detector_id="D008",
+        title="Dangerous command execution",
+        severity="High",
+        confidence="high",
+        owasp=("A03:2021-Injection",),
+        impact="Passing untrusted input to a shell enables command injection and remote code execution.",
+        remediation="Avoid shell execution; call the program directly with an argument list (e.g. subprocess.run([...]) without shell=True).",
+        pattern=re.compile(r"\bos\.system\s*\("),
+        reason="os.system() runs its argument through a shell.",
+    ),
+    PatternRule(
+        detector_id="D008",
+        title="Dangerous command execution",
+        severity="High",
+        confidence="high",
+        owasp=("A03:2021-Injection",),
+        impact="A subprocess launched with shell=True interprets shell metacharacters in interpolated input.",
+        remediation="Drop shell=True and pass the command as a list of arguments so user input is never parsed by a shell.",
+        pattern=re.compile(r"\bsubprocess\.[A-Za-z_]+\([^)]*shell\s*=\s*True"),
+        reason="A subprocess call uses shell=True.",
+    ),
+    PatternRule(
+        detector_id="D008",
+        title="Unsafe deserialization",
+        severity="High",
+        confidence="high",
+        owasp=("A08:2021-Software and Data Integrity Failures",),
+        impact="Deserializing attacker-controlled data with pickle can execute arbitrary code.",
+        remediation="Never unpickle untrusted data; use a safe format such as JSON for data that crosses a trust boundary.",
+        pattern=re.compile(r"\bpickle\.loads?\s*\("),
+        reason="pickle deserialization can instantiate arbitrary objects.",
+    ),
+    PatternRule(
+        detector_id="D008",
+        title="Unsafe deserialization",
+        severity="High",
+        confidence="medium",
+        owasp=("A08:2021-Software and Data Integrity Failures",),
+        impact="yaml.load() without a safe loader can construct arbitrary Python objects from untrusted input.",
+        remediation="Use yaml.safe_load() (or pass Loader=SafeLoader) for any externally supplied YAML.",
+        pattern=re.compile(r"\byaml\.load\s*\((?![^)]*Loader\s*=)"),
+        reason="yaml.load() is called without an explicit safe loader.",
+    ),
+    PatternRule(
+        detector_id="D008",
+        title="Dynamic code evaluation",
+        severity="High",
+        confidence="medium",
+        owasp=("A03:2021-Injection",),
+        impact="Evaluating runtime values as code lets attacker-controlled input run with full program privileges.",
+        remediation="Replace eval/exec with explicit parsing or a lookup table; never evaluate user-influenced strings.",
+        pattern=re.compile(r"(?<![\w.])(?:eval|exec)\s*\("),
+        reason="A dynamic eval/exec call evaluates a runtime value.",
+    ),
+    PatternRule(
+        detector_id="D008",
+        title="Dangerous command execution",
+        severity="High",
+        confidence="medium",
+        owasp=("A03:2021-Injection",),
+        impact="child_process.exec() runs its argument through a shell, enabling command injection.",
+        remediation="Use child_process.execFile()/spawn() with an argument array instead of exec().",
+        pattern=re.compile(r"\bchild_process\.exec\s*\(|\bexec\s*\(\s*`"),
+        reason="A shell-based child_process.exec() call is used.",
+    ),
+)
+
+# D010: transport security explicitly disabled.
+TLS_RULES = (
+    PatternRule(
+        detector_id="D010",
+        title="TLS certificate verification disabled",
+        severity="High",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="Disabling certificate verification exposes traffic to man-in-the-middle interception.",
+        remediation="Keep certificate verification enabled; pin or supply a trusted CA bundle instead of turning verification off.",
+        pattern=re.compile(r"\bverify\s*=\s*False\b"),
+        reason="An HTTP client call disables certificate verification (verify=False).",
+    ),
+    PatternRule(
+        detector_id="D010",
+        title="TLS certificate verification disabled",
+        severity="High",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="rejectUnauthorized: false accepts any certificate, exposing traffic to interception.",
+        remediation="Remove rejectUnauthorized: false and trust a proper CA chain.",
+        pattern=re.compile(r"rejectUnauthorized\s*:\s*false", re.I),
+        reason="A Node TLS option disables certificate verification.",
+    ),
+    PatternRule(
+        detector_id="D010",
+        title="TLS certificate verification disabled",
+        severity="High",
+        confidence="high",
+        owasp=("A02:2021-Cryptographic Failures",),
+        impact="An unverified SSL context skips certificate validation for every connection it is used on.",
+        remediation="Use a default verified context (ssl.create_default_context) and supply trusted CAs as needed.",
+        pattern=re.compile(r"ssl\._create_unverified_context\s*\("),
+        reason="An unverified SSL context is created.",
+    ),
+)
+
+# D011: production debug mode.
+DEBUG_RULES = (
+    PatternRule(
+        detector_id="D011",
+        title="Debug mode enabled",
+        severity="High",
+        confidence="high",
+        owasp=("A05:2021-Security Misconfiguration",),
+        impact="The Werkzeug/Flask debugger allows arbitrary code execution if the app is reachable.",
+        remediation="Never run with debug=True outside local development; drive it from an environment flag that defaults to off.",
+        pattern=re.compile(r"\.run\s*\([^)]*debug\s*=\s*True"),
+        reason="A web server is started with debug=True.",
+    ),
+    PatternRule(
+        detector_id="D011",
+        title="Debug mode enabled",
+        severity="Medium",
+        confidence="medium",
+        owasp=("A05:2021-Security Misconfiguration",),
+        impact="DEBUG = True leaks stack traces, settings, and secrets in error responses.",
+        remediation="Set DEBUG from an environment variable that defaults to False in production.",
+        pattern=re.compile(r"\bDEBUG\s*=\s*True\b"),
+        reason="A framework debug flag is hard-coded to True.",
+    ),
+)
+
+# D009: SQL built by string interpolation and handed to a query call.
+_SQL_EXEC_RE = re.compile(r"\.(?:execute|executemany|query|raw)\s*\(", re.I)
+_SQL_KEYWORD_RE = re.compile(
+    r"\b(?:select|insert\s+into|update|delete\s+from|drop\s+table|union\s+select|where)\b",
+    re.I,
+)
+_SQL_BUILD_RE = re.compile(r"f['\"]|['\"]\s*\+|\+\s*['\"]|['\"]\s*%|%\s*\(|\.format\s*\(")
+
+
+def _scan_pattern_rules(
+    files: Iterable[SourceFile],
+    rules: tuple[PatternRule, ...],
+    *,
+    extensions: set[str] | None = None,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if extensions is not None and file.path.suffix.lower() not in extensions:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            for rule in rules:
+                match = rule.pattern.search(line)
+                if not match:
+                    continue
+                findings.append(
+                    Finding(
+                        title=rule.title,
+                        severity=rule.severity,
+                        confidence=rule.confidence,
+                        status="suspected",
+                        source="static",
+                        detector_id=rule.detector_id,
+                        owasp=list(rule.owasp),
+                        location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={"reason": rule.reason},
+                        impact=rule.impact,
+                        remediation=rule.remediation,
+                    )
+                )
+    return findings
+
+
+def detect_private_keys(files: Iterable[SourceFile]) -> list[Finding]:
+    return _scan_pattern_rules(files, PRIVATE_KEY_RULES)
+
+
+def detect_dangerous_sinks(files: Iterable[SourceFile]) -> list[Finding]:
+    return _scan_pattern_rules(files, DANGEROUS_SINK_RULES, extensions=CODE_EXTENSIONS)
+
+
+def detect_disabled_tls_verification(files: Iterable[SourceFile]) -> list[Finding]:
+    return _scan_pattern_rules(files, TLS_RULES, extensions=CODE_EXTENSIONS)
+
+
+def detect_debug_mode(files: Iterable[SourceFile]) -> list[Finding]:
+    return _scan_pattern_rules(files, DEBUG_RULES, extensions=CODE_EXTENSIONS)
+
+
+def detect_sql_injection(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            exec_match = _SQL_EXEC_RE.search(line)
+            if not exec_match:
+                continue
+            if not _SQL_KEYWORD_RE.search(line) or not _SQL_BUILD_RE.search(line):
+                continue
+            findings.append(
+                Finding(
+                    title="Possible SQL injection",
+                    severity="High",
+                    confidence="medium",
+                    status="suspected",
+                    source="static",
+                    detector_id="D009",
+                    owasp=["A03:2021-Injection"],
+                    location=Location(file=file.relative_path, line=line_no, column=exec_match.start() + 1),
+                    snippet=redact_text(line.strip()),
+                    evidence={"reason": "A SQL statement appears to be built with string interpolation and executed directly."},
+                    impact="Building SQL with string interpolation lets attacker input alter the query and read or modify unintended data.",
+                    remediation="Use parameterized queries (placeholders with bound parameters) instead of interpolating values into the SQL string.",
+                )
+            )
+    return findings
+
+
 def run_detectors(files: list[SourceFile]) -> list[Finding]:
     return [
         *detect_service_role_in_client(files),
@@ -345,4 +633,9 @@ def run_detectors(files: list[SourceFile]) -> list[Finding]:
         *detect_permissive_access_policy(files),
         *detect_vulnerable_dependencies(files),
         *detect_permissive_cors(files),
+        *detect_private_keys(files),
+        *detect_dangerous_sinks(files),
+        *detect_sql_injection(files),
+        *detect_disabled_tls_verification(files),
+        *detect_debug_mode(files),
     ]
