@@ -222,6 +222,12 @@ def generate_report(payload: dict[str, Any]) -> str:
         if any(finding["detector_id"] == "D001" and finding["status"] == "confirmed" for finding in findings)
         else "No critical exploit was dynamically confirmed; review suspected issues before release."
     )
+    # Upgrade the one-line verdict to a richer LLM narrative when a key is configured.
+    # The LLM only sees already-redacted findings and cannot contradict the ground truth.
+    from .llm import llm_verdict
+
+    findings_json = json.dumps({"summary": summary, "findings": findings}, indent=2)
+    verdict = llm_verdict(findings_json, deterministic=verdict)
     executive = (
         f"Penny found {summary.get('total', len(findings))} issue(s), including "
         f"{len(critical)} critical and {summary.get('high_count', 0)} high finding(s). "

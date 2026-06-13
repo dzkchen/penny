@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 from .guardrails import GuardrailError, TargetGate
+from .llm import llm_answer
 from .reporting import load_findings
 
 
@@ -24,6 +26,15 @@ def answer_question(
             target_note = f"\n\nProbe gate: `{target}` is allowed for read-only checks."
         except GuardrailError as error:
             target_note = f"\n\nProbe gate: blocked. {error}"
+
+    deterministic = _deterministic_answer(question, normalized, payload, findings, findings_path, target_note)
+    # Augment with a live Claude explanation when a key is configured; otherwise return
+    # the deterministic answer unchanged. The LLM only ever sees redacted findings.
+    findings_json = json.dumps({"summary": payload.get("summary", {}), "findings": findings}, indent=2)
+    return llm_answer(question, findings_json, deterministic=deterministic)
+
+
+def _deterministic_answer(question, normalized, payload, findings, findings_path, target_note) -> str:
 
     id_match = re.search(r"\bF-\d{3}\b", question, re.I)
     if id_match:

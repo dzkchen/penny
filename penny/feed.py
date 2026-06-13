@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+
+
+def _ensure_utf8_stdout() -> None:
+    # On Windows the default console encoding (cp1252) mangles characters that the
+    # LLM emits (em-dashes, emoji). Reconfigure stdout/stderr to UTF-8 when possible.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_stdout()
 
 
 @dataclass
