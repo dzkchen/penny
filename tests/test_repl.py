@@ -20,7 +20,7 @@ def _session(tmp_path, monkeypatch):
 def test_session_autoloads_last_findings(tmp_path, monkeypatch) -> None:
     session, _ = _session(tmp_path, monkeypatch)
     assert session.payload is not None
-    assert session.payload["summary"]["total"] == 6
+    assert session.payload["summary"]["total"] == 5  # 5 deterministic findings (deps grouped)
 
 
 def test_help_lists_commands(tmp_path, monkeypatch) -> None:

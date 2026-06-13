@@ -33,6 +33,13 @@ _UUID_RE = re.compile(
 _HASH_DIGEST_LENGTHS = {32, 40, 56, 64, 96, 128}
 
 
+SEVERITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+
+# A high-entropy token sitting inside a URL is almost always a doc/asset id, not
+# a credential (real URL-borne secrets use known prefixes, caught separately).
+_URL_RE = re.compile(r"https?://[^\s'\"<>)\]]+")
+
+
 def _is_benign_high_entropy_token(value: str) -> bool:
     if _SRI_HASH_RE.match(value):
         return True
@@ -41,6 +48,10 @@ def _is_benign_high_entropy_token(value: str) -> bool:
     if _HEX_RE.match(value) and len(value) in _HASH_DIGEST_LENGTHS:
         return True
     return False
+
+
+def _within_url(line: str, start: int, end: int) -> bool:
+    return any(match.start() <= start and end <= match.end() for match in _URL_RE.finditer(line))
 
 
 @dataclass(frozen=True)
@@ -120,37 +131,22 @@ def _version_less_than(found: str, safe: tuple[int, ...]) -> bool:
     return parsed + (0,) * (max_len - len(parsed)) < safe + (0,) * (max_len - len(safe))
 
 
-def _dependency_finding(
-    *,
-    file: SourceFile,
-    line_no: int,
-    column: int,
-    package: str,
-    version: str,
-    vuln: VulnerableDependency,
-    line: str,
-) -> Finding:
-    return Finding(
-        title=f"Vulnerable dependency: {package} {version}",
-        severity=vuln.severity,
-        confidence="high",
-        status="suspected",
-        source="static",
-        detector_id="D005",
-        owasp=["A06:2021-Vulnerable and Outdated Components"],
-        location=Location(file=file.relative_path, line=line_no, column=column),
-        snippet=redact_text(line.strip()),
-        evidence={
-            "ecosystem": vuln.ecosystem,
-            "package": package,
-            "detected_version": version,
-            "safe_version": vuln.safe_version,
-            "cve": vuln.cve,
-            "reason": vuln.summary,
-        },
-        impact="Known-vulnerable dependencies can reintroduce exploitable behavior even when application code looks safe.",
-        remediation=f"Upgrade {package} to {vuln.safe_version} or later and rerun dependency tests.",
-    )
+def _max_severity(severities: Iterable[str]) -> str:
+    best, best_rank = "Info", 99
+    for severity in severities:
+        rank = SEVERITY_RANK.get(severity, 50)
+        if rank < best_rank:
+            best, best_rank = severity, rank
+    return best if best_rank < 99 else "High"
+
+
+def _highest_version(versions: Iterable[str]) -> str:
+    best, best_key = "", None
+    for version in versions:
+        key = _parse_version(version)
+        if key and (best_key is None or key > best_key):
+            best, best_key = version, key
+    return best
 
 
 def detect_service_role_in_client(files: Iterable[SourceFile]) -> list[Finding]:
@@ -223,6 +219,8 @@ def detect_committed_secrets(files: Iterable[SourceFile]) -> list[Finding]:
                 if SERVICE_KEY_RE.fullmatch(value) or KNOWN_SECRET_RE.fullmatch(value):
                     continue
                 if _is_benign_high_entropy_token(value):
+                    continue
+                if _within_url(line, token_match.start(), token_match.end()):
                     continue
                 if not looks_high_entropy(value):
                     continue
@@ -317,90 +315,130 @@ def _iter_dependencies(files: Iterable[SourceFile]) -> Iterable[ParsedDependency
                 yield ParsedDependency("pypi", match.group(1), match.group(2), file, line_no, line)
 
 
-def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]:
-    findings: list[Finding] = []
+@dataclass(frozen=True)
+class DependencyRecord:
+    package: str
+    ecosystem: str
+    version: str
+    file: str
+    line_no: int
+    line: str
+    advisories: tuple[dict, ...]
+    source: str
+
+
+def _curated_advisory(dep: ParsedDependency) -> dict | None:
+    vuln = VULNERABLE_DEPENDENCIES.get((dep.ecosystem, dep.package.lower()))
+    if vuln and _version_less_than(dep.version, vuln.vulnerable_below):
+        return {"id": vuln.cve, "cve": vuln.cve, "severity": vuln.severity, "fixed_version": vuln.safe_version, "summary": vuln.summary}
+    return None
+
+
+def collect_dependency_records(files: Iterable[SourceFile], lookup=None) -> list[DependencyRecord]:
+    """One record per vulnerable dependency pin.
+
+    With ``lookup`` (e.g. OSV) each pin is checked against the live feed and
+    falls back to the curated list when the feed returns nothing; without it,
+    only the curated list is used.
+    """
+    records: list[DependencyRecord] = []
     for dep in _iter_dependencies(files):
-        vuln = VULNERABLE_DEPENDENCIES.get((dep.ecosystem, dep.package.lower()))
-        if not vuln or not _version_less_than(dep.version, vuln.vulnerable_below):
+        advisories: list[dict] = []
+        source = "curated"
+        if lookup is not None:
+            for advisory in lookup(dep.ecosystem, dep.package, dep.version):
+                advisories.append(
+                    {
+                        "id": getattr(advisory, "advisory_id", ""),
+                        "cve": getattr(advisory, "cve", ""),
+                        "severity": getattr(advisory, "severity", "High") or "High",
+                        "fixed_version": getattr(advisory, "fixed_version", "") or "",
+                        "summary": getattr(advisory, "summary", ""),
+                    }
+                )
+            if advisories:
+                source = "osv.dev"
+        if not advisories:
+            curated = _curated_advisory(dep)
+            if curated:
+                advisories = [curated]
+        if not advisories:
             continue
-        findings.append(
-            _dependency_finding(
-                file=dep.file,
-                line_no=dep.line_no,
-                column=_line_column(dep.line, dep.package),
+        records.append(
+            DependencyRecord(
                 package=dep.package,
+                ecosystem=dep.ecosystem,
                 version=dep.version,
-                vuln=vuln,
+                file=dep.file.relative_path,
+                line_no=dep.line_no,
                 line=dep.line,
+                advisories=tuple(advisories),
+                source=source,
             )
         )
-    return findings
+    return records
+
+
+def build_dependencies_finding(records: list[DependencyRecord]) -> list[Finding]:
+    """Collapse every vulnerable dependency into a single D005 finding (a list)."""
+    if not records:
+        return []
+    all_severities = [adv["severity"] for record in records for adv in record.advisories]
+    total_advisories = sum(len(record.advisories) for record in records)
+    sources = {record.source for record in records}
+    source = sources.pop() if len(sources) == 1 else "mixed"
+    listed = []
+    for record in records:
+        cves = [adv["cve"] for adv in record.advisories if adv.get("cve")]
+        recommended = _highest_version(adv.get("fixed_version", "") for adv in record.advisories)
+        listed.append(
+            {
+                "package": record.package,
+                "ecosystem": record.ecosystem,
+                "detected_version": record.version,
+                "location": f"{record.file}:{record.line_no}",
+                "recommended_version": recommended or "see advisories",
+                "advisory_count": len(record.advisories),
+                "cves": cves or [adv["id"] for adv in record.advisories],
+            }
+        )
+    first = records[0]
+    package_count = len(records)
+    return [
+        Finding(
+            title=f"Vulnerable dependencies: {package_count} package(s), {total_advisories} advisory(ies)",
+            severity=_max_severity(all_severities),
+            confidence="high",
+            status="suspected",
+            source="static",
+            detector_id="D005",
+            owasp=["A06:2021-Vulnerable and Outdated Components"],
+            location=Location(file=first.file, line=first.line_no, column=_line_column(first.line, first.package)),
+            snippet=redact_text(first.line.strip()),
+            evidence={
+                "package_count": package_count,
+                "advisory_count": total_advisories,
+                "source": source,
+                "vulnerable_dependencies": listed,
+            },
+            impact="Known-vulnerable dependencies can reintroduce exploitable behavior even when application code looks safe.",
+            remediation="Upgrade the listed packages to their recommended fixed versions (or later), regenerate lockfiles, and rerun dependency tests.",
+        )
+    ]
+
+
+def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]:
+    return build_dependencies_finding(collect_dependency_records(files))
 
 
 def detect_dependencies_via_advisories(files: Iterable[SourceFile], lookup) -> list[Finding]:
-    """Emit D005 findings from a live advisory feed (e.g. OSV.dev).
+    """One grouped D005 finding from a live advisory feed (e.g. OSV.dev).
 
     ``lookup(ecosystem, package, version) -> list[Advisory]`` is injected so this
     stays offline-testable; any provider exposing ``advisory_id``, ``cve``,
     ``severity``, ``summary``, and ``fixed_version`` works.
     """
-    findings: list[Finding] = []
-    for dep in _iter_dependencies(files):
-        for advisory in lookup(dep.ecosystem, dep.package, dep.version):
-            fixed = getattr(advisory, "fixed_version", "") or ""
-            remediation = (
-                f"Upgrade {dep.package} to {fixed} or later and rerun dependency tests."
-                if fixed
-                else f"Upgrade {dep.package} to a fixed version and rerun dependency tests."
-            )
-            findings.append(
-                Finding(
-                    title=f"Vulnerable dependency: {dep.package} {dep.version}",
-                    severity=getattr(advisory, "severity", "High") or "High",
-                    confidence="high",
-                    status="suspected",
-                    source="static",
-                    detector_id="D005",
-                    owasp=["A06:2021-Vulnerable and Outdated Components"],
-                    location=Location(file=dep.file.relative_path, line=dep.line_no, column=_line_column(dep.line, dep.package)),
-                    snippet=redact_text(dep.line.strip()),
-                    evidence={
-                        "ecosystem": dep.ecosystem,
-                        "package": dep.package,
-                        "detected_version": dep.version,
-                        "advisory": getattr(advisory, "advisory_id", ""),
-                        "cve": getattr(advisory, "cve", ""),
-                        "fixed_version": fixed or "see advisory",
-                        "reason": getattr(advisory, "summary", "") or "A published advisory affects this version.",
-                        "source": "osv.dev",
-                    },
-                    impact="A dependency with a published advisory can reintroduce exploitable behavior even when application code looks safe.",
-                    remediation=remediation,
-                )
-            )
-    return findings
-
-
-def merge_dependency_findings(curated: list[Finding], advisory_findings: list[Finding]) -> list[Finding]:
-    """Combine curated and advisory D005 findings, dropping curated duplicates.
-
-    Advisory results win for any (package, version) they cover, so online scans
-    get rich CVE data while offline scans keep the curated safety net.
-    """
-
-    def key(finding: Finding) -> tuple[str, str]:
-        return (
-            str(finding.evidence.get("package", "")).lower(),
-            str(finding.evidence.get("detected_version", "")),
-        )
-
-    covered = {key(finding) for finding in advisory_findings}
-    kept = [
-        finding
-        for finding in curated
-        if not (finding.detector_id == "D005" and key(finding) in covered)
-    ]
-    return kept + advisory_findings
+    return build_dependencies_finding(collect_dependency_records(files, lookup))
 
 
 def detect_permissive_cors(files: Iterable[SourceFile]) -> list[Finding]:
@@ -688,6 +726,123 @@ def detect_sql_injection(files: Iterable[SourceFile]) -> list[Finding]:
     return findings
 
 
+# D012: state-changing data operations issued straight from browser code.
+CLIENT_WRITE_PATTERNS = (
+    (re.compile(r"\.from\([^)]*\)\s*\.\s*(?:insert|update|delete|upsert)\s*\("), "Supabase"),
+    (re.compile(r"\b(?:setDoc|updateDoc|deleteDoc|addDoc)\s*\("), "Firestore"),
+    (re.compile(r"\.collection\([^)]*\)[^;\n]{0,80}?\.\s*(?:add|set|update|delete)\s*\("), "Firestore"),
+    (re.compile(r"\.doc\([^)]*\)\s*\.\s*(?:set|update|delete)\s*\("), "Firestore"),
+    (re.compile(r"\b(?:set|update|remove|push)\s*\(\s*ref\s*\("), "Realtime Database"),
+    (re.compile(r"\.ref\([^)]*\)\s*\.\s*(?:set|update|remove|push)\s*\("), "Realtime Database"),
+)
+_SERVER_PATH_MARKERS = ("/api/", "/server/", "/backend/", "/functions/", "/routes/", "/pages/api/", "/app/api/")
+
+
+def _is_server_path(relative_path: str) -> bool:
+    lowered = "/" + relative_path.lower()
+    return any(marker in lowered for marker in _SERVER_PATH_MARKERS)
+
+
+def detect_client_side_db_writes(files: Iterable[SourceFile]) -> list[Finding]:
+    """Flag direct database/BaaS mutations in browser-shipped code.
+
+    Covers Supabase and Firebase (Firestore modular + namespaced, and Realtime
+    Database). When the client writes to the database directly (no server-side
+    route to authorize the operation), access control can only come from backend
+    rules — for AI-built apps that "lack a proper backend" this is the core
+    trust-boundary risk. Server-side files (api/server/functions paths) excluded.
+    """
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in CLIENT_EXTENSIONS:
+            continue
+        if _is_server_path(file.relative_path):
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            for pattern, vendor in CLIENT_WRITE_PATTERNS:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                findings.append(
+                    Finding(
+                        title="Client-side database write without a server-side authorization layer",
+                        severity="High",
+                        confidence="medium",
+                        status="suspected",
+                        source="static",
+                        detector_id="D012",
+                        owasp=["A01:2021-Broken Access Control"],
+                        location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={
+                            "reason": f"A {vendor} data-mutation call runs in browser-shipped code; the client is fully attacker-controlled, so it cannot enforce access control.",
+                            "vendor": vendor,
+                        },
+                        impact="When the browser writes to the database directly, there is no trusted server to authorize the operation. Unless backend rules (e.g. row-level security or Firebase security rules) are airtight, any user can forge, tamper with, or delete other users' data.",
+                        remediation="Route privileged reads/writes through a server-side API or serverless/cloud function that authenticates the user and authorizes each operation; treat the client as untrusted and tighten the database security rules.",
+                    )
+                )
+                break
+    return findings
+
+
+# D013: permissive Firebase security rules (the Firebase equivalent of D003).
+_FIREBASE_RULES_FILES = ("firestore.rules", "storage.rules", "database.rules.json")
+_RULES_OPEN_RE = re.compile(r"allow\s+[a-z,\s]+:\s*if\s+true\b", re.I)
+_RULES_AUTH_ONLY_RE = re.compile(r"allow\s+[a-z,\s]+:\s*if\s+request\.auth\s*!=\s*null\s*;", re.I)
+_RTDB_OPEN_RE = re.compile(r'"\.(?:read|write)"\s*:\s*(?:true|"true"|"auth\s*!=\s*null"|"now\b)', re.I)
+
+
+def _is_firebase_rules_file(relative_path: str) -> bool:
+    name = relative_path.rsplit("/", 1)[-1].lower()
+    return name in _FIREBASE_RULES_FILES or name.endswith(".rules")
+
+
+def detect_permissive_firebase_rules(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for file in files:
+        if not _is_firebase_rules_file(file.relative_path):
+            continue
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            open_match = _RULES_OPEN_RE.search(line) or _RTDB_OPEN_RE.search(line)
+            auth_only = _RULES_AUTH_ONLY_RE.search(line)
+            if open_match:
+                findings.append(
+                    Finding(
+                        title="Firebase security rule grants unrestricted access",
+                        severity="High",
+                        confidence="high",
+                        status="suspected",
+                        source="static",
+                        detector_id="D013",
+                        owasp=["A01:2021-Broken Access Control"],
+                        location=Location(file=file.relative_path, line=line_no, column=open_match.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={"reason": "A Firebase rule allows read/write unconditionally (e.g. `if true` or `\".read\": true`)."},
+                        impact="An open Firebase rule lets any client (often unauthenticated) read or write the affected data directly, bypassing the app entirely.",
+                        remediation="Scope every rule to the authenticated owner (e.g. `allow read, write: if request.auth.uid == resource.data.ownerId`); never ship `if true` on real data.",
+                    )
+                )
+            elif auth_only:
+                findings.append(
+                    Finding(
+                        title="Firebase security rule authorizes any signed-in user",
+                        severity="Medium",
+                        confidence="medium",
+                        status="suspected",
+                        source="static",
+                        detector_id="D013",
+                        owasp=["A01:2021-Broken Access Control"],
+                        location=Location(file=file.relative_path, line=line_no, column=auth_only.start() + 1),
+                        snippet=redact_text(line.strip()),
+                        evidence={"reason": "A Firebase rule authorizes any authenticated user without an ownership check."},
+                        impact="`if request.auth != null` lets any signed-in user touch the data, so one user can read or modify another user's records.",
+                        remediation="Add an ownership predicate such as `request.auth.uid == resource.data.ownerId` instead of allowing every authenticated user.",
+                    )
+                )
+    return findings
+
+
 def run_detectors(files: list[SourceFile]) -> list[Finding]:
     return [
         *detect_service_role_in_client(files),
@@ -700,4 +855,6 @@ def run_detectors(files: list[SourceFile]) -> list[Finding]:
         *detect_sql_injection(files),
         *detect_disabled_tls_verification(files),
         *detect_debug_mode(files),
+        *detect_client_side_db_writes(files),
+        *detect_permissive_firebase_rules(files),
     ]

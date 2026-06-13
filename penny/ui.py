@@ -50,6 +50,7 @@ CHANNEL_STYLE = {
     "mongo": ("🍃", "green"),
     "osv": ("📦", "magenta"),
     "ai": ("🤖", "bright_blue"),
+    "attack": ("💥", "bright_red"),
     "gate": ("⛔", "yellow"),
     "store": ("💾", "bright_black"),
     "blue": ("🛠", "green"),

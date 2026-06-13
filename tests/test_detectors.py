@@ -23,7 +23,7 @@ def test_planted_app_fires_the_three_hero_detectors() -> None:
     findings = assign_finding_ids(run_detectors(files))
     counts = Counter(finding.detector_id for finding in findings)
 
-    assert counts == {"D001": 1, "D002": 1, "D003": 1, "D005": 2, "D006": 1}
+    assert counts == {"D001": 1, "D002": 1, "D003": 1, "D005": 1, "D006": 1}
     service_finding = next(finding for finding in findings if finding.detector_id == "D001")
     assert service_finding.id == "F-001"
     assert service_finding.secret_value == SERVICE_KEY
@@ -36,8 +36,10 @@ def test_p1_static_detectors_include_dependencies_and_cors() -> None:
     findings = run_detectors(files)
 
     dependency_findings = [finding for finding in findings if finding.detector_id == "D005"]
-    assert {finding.evidence["package"] for finding in dependency_findings} == {"jinja2", "lodash"}
-    assert all("safe_version" in finding.evidence for finding in dependency_findings)
+    assert len(dependency_findings) == 1  # all vulnerable deps collapse into one finding
+    listed = dependency_findings[0].evidence["vulnerable_dependencies"]
+    assert {entry["package"] for entry in listed} == {"jinja2", "lodash"}
+    assert all(entry.get("recommended_version") for entry in listed)
 
     cors_finding = next(finding for finding in findings if finding.detector_id == "D006")
     assert cors_finding.title == "Permissive CORS policy"
@@ -102,3 +104,34 @@ def test_integrity_hashes_are_not_flagged_in_source() -> None:
     )
 
     assert detect_committed_secrets([manifest]) == []
+
+
+def test_high_entropy_token_inside_url_is_not_flagged() -> None:
+    # A Google Docs / Drive share id is part of a URL, not a credential.
+    source = _source(
+        "src/pages/Settings.tsx",
+        "const HELP = 'https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz0123456789?usp=sharing';\n",
+    )
+
+    assert detect_committed_secrets([source]) == []
+
+
+def test_client_side_db_write_flagged_and_server_excluded() -> None:
+    client = _source(
+        "src/lib/orders.ts",
+        "await supabase.from('orders').insert({ amount, userId });\n",
+    )
+    firestore = _source(
+        "src/hooks/useProfile.tsx",
+        "await updateDoc(doc(db, 'users', uid), { balance });\n",
+    )
+    server = _source(
+        "src/app/api/orders/route.ts",
+        "await supabase.from('orders').insert({ amount, userId });\n",
+    )
+
+    findings = run_detectors([client, firestore, server])
+    d012 = [f for f in findings if f.detector_id == "D012"]
+
+    assert {f.location.file for f in d012} == {"src/lib/orders.ts", "src/hooks/useProfile.tsx"}
+    assert all(f.severity == "High" for f in d012)

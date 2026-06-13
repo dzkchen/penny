@@ -6,7 +6,6 @@ from penny.advisories import Advisory, _advisory_from_vuln
 from penny.detectors import (
     detect_dependencies_via_advisories,
     detect_vulnerable_dependencies,
-    merge_dependency_findings,
 )
 from penny.repo import SourceFile
 
@@ -39,43 +38,45 @@ def test_advisory_severity_defaults_to_high_without_metadata() -> None:
     assert advisory.fixed_version == ""
 
 
-def test_detect_dependencies_via_advisories_uses_injected_lookup() -> None:
-    files = [_requirements("jinja2==2.10.1\n")]
+def test_advisories_collapse_into_one_grouped_finding() -> None:
+    files = [_requirements("jinja2==2.10.1\nflask==0.12.0\n")]
 
     def fake_lookup(ecosystem, package, version):
-        if (ecosystem, package, version) == ("pypi", "jinja2", "2.10.1"):
-            return [Advisory("GHSA-1", "CVE-2019-10906", "High", "sandbox escape", "2.10.2")]
-        return []
+        if package == "jinja2":
+            return [
+                Advisory("GHSA-1", "CVE-2019-10906", "High", "sandbox escape", "2.10.2"),
+                Advisory("GHSA-2", "CVE-2020-28493", "Medium", "ReDoS", "2.11.3"),
+            ]
+        return []  # flask falls back to the curated list
 
     findings = detect_dependencies_via_advisories(files, fake_lookup)
 
-    assert len(findings) == 1
+    assert len(findings) == 1  # one finding for the whole project
     finding = findings[0]
     assert finding.detector_id == "D005"
-    assert finding.evidence["cve"] == "CVE-2019-10906"
-    assert finding.evidence["source"] == "osv.dev"
-    assert "2.10.2" in finding.remediation
+    assert finding.severity == "High"  # max across all advisories
+    evidence = finding.evidence
+    assert evidence["package_count"] == 2
+    assert evidence["advisory_count"] == 3  # 2 jinja2 + 1 curated flask
+    listed = {entry["package"]: entry for entry in evidence["vulnerable_dependencies"]}
+    assert set(listed) == {"jinja2", "flask"}
+    assert listed["jinja2"]["recommended_version"] == "2.11.3"  # highest fixed version
+    assert "CVE-2019-10906" in listed["jinja2"]["cves"]
 
 
-def test_merge_prefers_advisory_findings_and_drops_curated_duplicate() -> None:
+def test_offline_falls_back_to_curated_single_finding() -> None:
     files = [_requirements("jinja2==2.10.1\n")]
-    curated = detect_vulnerable_dependencies(files)
-    advisory = detect_dependencies_via_advisories(
-        files,
-        lambda *_: [Advisory("GHSA-1", "CVE-2019-10906", "High", "sandbox escape", "2.10.2")],
-    )
 
-    merged = merge_dependency_findings(curated, advisory)
+    online = detect_dependencies_via_advisories(files, lambda *_: [])  # OSV down → curated
+    offline = detect_vulnerable_dependencies(files)
 
-    assert len(curated) == 1  # curated knows jinja2
-    assert len(merged) == 1  # but the duplicate is dropped in favour of OSV
-    assert merged[0].evidence.get("source") == "osv.dev"
+    assert len(online) == len(offline) == 1
+    assert online[0].evidence["vulnerable_dependencies"][0]["package"] == "jinja2"
+    assert online[0].evidence["source"] == "curated"
 
 
-def test_merge_keeps_curated_when_advisories_empty() -> None:
-    files = [_requirements("jinja2==2.10.1\n")]
-    curated = detect_vulnerable_dependencies(files)
+def test_no_findings_when_dependencies_are_clean() -> None:
+    files = [_requirements("requests==2.32.0\n")]
 
-    merged = merge_dependency_findings(curated, [])
-
-    assert merged == curated
+    assert detect_vulnerable_dependencies(files) == []
+    assert detect_dependencies_via_advisories(files, lambda *_: []) == []

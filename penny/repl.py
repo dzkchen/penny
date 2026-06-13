@@ -152,14 +152,19 @@ class Session:
     # ---- commands ---------------------------------------------------------
     def _scan(self, args: list[str]) -> None:
         path: str | None = None
-        use_osv = use_ai = static_only = False
+        use_osv = use_ai = use_active = static_only = False
         target = self.target
+        i_own_this = self.i_own_this
         tokens = iter(args)
         for token in tokens:
             if token == "--osv":
                 use_osv = True
             elif token == "--ai":
                 use_ai = True
+            elif token == "--active":
+                use_active = True
+            elif token == "--i-own-this":
+                i_own_this = True
             elif token == "--static-only":
                 static_only = True
             elif token == "--target":
@@ -167,7 +172,7 @@ class Session:
             elif not token.startswith("-") and path is None:
                 path = token
         if not path:
-            self._warn("Usage: /scan <path> [--osv] [--ai] [--static-only] [--target <url>]")
+            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--i-own-this] [--static-only] [--target <url>]")
             return
 
         self.out(ui.dim(f"Scanning {path}…"))
@@ -179,11 +184,12 @@ class Session:
                     target=target,
                     static_only=static_only,
                     out_dir=self.out_dir,
-                    i_own_this=self.i_own_this,
+                    i_own_this=i_own_this,
                     feed=feed,
                     source_label=path,
                     use_osv=use_osv,
                     use_ai=use_ai,
+                    use_active=use_active,
                 )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             self._error(f"Scan failed: {error}")

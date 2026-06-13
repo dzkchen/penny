@@ -52,6 +52,7 @@ DEFAULT_EXTENSIONS = {
     ".sql",
     ".env",
     ".json",
+    ".rules",
     ".toml",
     ".yaml",
     ".yml",

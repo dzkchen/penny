@@ -33,10 +33,17 @@ AI_SYSTEM = (
     "Review the provided source files and report concrete, high-confidence vulnerabilities: "
     "broken authentication or authorization (IDOR/BOLA, missing ownership checks), injection "
     "(SQL/command/template), SSRF, unsafe deserialization, path traversal, insecure secret "
-    "handling, unsafe redirects, and similar real risks. Only report issues you can point to a "
-    "specific file and line for. Do not report style nits, TODOs, or speculative concerns. "
-    "Prefer precision over recall — a wrong finding is worse than a missed one. "
-    "Return your answer using the required JSON schema."
+    "handling, unsafe redirects, and similar real risks. "
+    "Pay special attention to the client/server trust boundary. If the app performs "
+    "authentication, authorization, or state-changing/data operations directly from "
+    "client-side code — direct database/BaaS calls (Supabase, Firebase) or client-issued "
+    "POST/PUT/PATCH/DELETE requests — with no trusted server-side layer enforcing access "
+    "control, report a single Critical or High finding for that missing backend / "
+    "trusted-client design: the browser is fully attacker-controllable, so any access control "
+    "implemented there can be bypassed. Cite the most representative file and line. "
+    "Only report issues you can point to a specific file and line for. Do not report style "
+    "nits, TODOs, or speculative concerns. Prefer precision over recall — a wrong finding is "
+    "worse than a missed one. Return your answer using the required JSON schema."
 )
 
 RESPONSE_SCHEMA = {
