@@ -45,17 +45,46 @@ WEAK_LOGINS = [
 LOGIN_PATHS = ["/login", "/api/login", "/auth/login"]
 
 
-def run_brute_force(target: str, *, i_own_this: bool, feed: EventFeed, max_requests: int = 40) -> list[Finding]:
-    findings: list[Finding] = []
+def _load_wordlist(wordlist: str | None) -> list[str]:
+    """Load a user-supplied wordlist file (one path per line), else the built-in list."""
+    if not wordlist:
+        return COMMON_PATHS
+    from pathlib import Path
+
     try:
-        gate = TargetGate(target, i_own_this=i_own_this, max_requests=max_requests)
+        lines = Path(wordlist).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return COMMON_PATHS
+    paths = []
+    for line in lines:
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        paths.append(entry if entry.startswith("/") else "/" + entry)
+    return paths or COMMON_PATHS
+
+
+def run_brute_force(
+    target: str,
+    *,
+    i_own_this: bool,
+    feed: EventFeed,
+    wordlist: str | None = None,
+    max_requests: int = 40,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    paths = _load_wordlist(wordlist)
+    # Cap requests to fit the wordlist plus the login spray, so a big list isn't truncated.
+    needed = len(paths) + len(LOGIN_PATHS) * len(WEAK_LOGINS) + 5
+    try:
+        gate = TargetGate(target, i_own_this=i_own_this, max_requests=max(max_requests, needed))
     except GuardrailError as error:
         feed.emit("gate", f"Brute-force target blocked: {error}")
         return findings
 
-    feed.emit("red", f"Brute-force path discovery on {target} ({len(COMMON_PATHS)} paths, read-only)")
+    feed.emit("red", f"Brute-force path discovery on {target} ({len(paths)} paths, read-only)")
     exposed: list[str] = []
-    for path in COMMON_PATHS:
+    for path in paths:
         try:
             resp = gate.request("GET", path)
         except GuardrailError as error:

@@ -32,6 +32,8 @@ def run_scan(
     agentic: bool = False,
     brute: bool = False,
     browser: bool = False,
+    wordlist: str | None = None,
+    pages: int = 8,
     feed: EventFeed | None = None,
     source_label: str | None = None,
     use_osv: bool = False,
@@ -78,11 +80,11 @@ def run_scan(
     if target and not static_only and brute:
         from .bruteforce import run_brute_force
 
-        findings.extend(run_brute_force(target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_brute_force(target, i_own_this=i_own_this, wordlist=wordlist, feed=feed))
     if target and not static_only and browser:
         from .browser import run_browser_probe
 
-        findings.extend(run_browser_probe(target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_browser_probe(target, i_own_this=i_own_this, max_pages=pages, feed=feed))
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(
