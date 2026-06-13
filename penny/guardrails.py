@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ipaddress
+import os
+import re
 import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Mapping
@@ -19,20 +22,23 @@ class SafeResponse:
     headers: dict[str, str]
 
 
-def _hostname_allowed(hostname: str, i_own_this: bool) -> bool:
+DEFAULT_TXT_LABEL = "_penny"
+DEFAULT_TXT_VALUE = "penny-verify=authorized"
+_TXT_CHUNK_RE = re.compile(r'"([^"]*)"')
+
+
+def _is_private_or_loopback_host(hostname: str) -> bool:
     lowered = hostname.lower().strip("[]")
     if lowered in {"localhost", "127.0.0.1", "::1"}:
         return True
     try:
         ip = ipaddress.ip_address(lowered)
-        return ip.is_private or ip.is_loopback or (i_own_this and not ip.is_multicast)
+        return ip.is_private or ip.is_loopback
     except ValueError:
         pass
     try:
         addresses = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
-        if i_own_this:
-            return True
         return False
     for address in addresses:
         candidate = address[4][0]
@@ -42,7 +48,122 @@ def _hostname_allowed(hostname: str, i_own_this: bool) -> bool:
             continue
         if ip.is_private or ip.is_loopback:
             return True
-    return i_own_this
+    return False
+
+
+def _public_ip_literal(hostname: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(hostname.lower().strip("[]"))
+    except ValueError:
+        return False
+    return not (ip.is_private or ip.is_loopback)
+
+
+def _txt_label() -> str:
+    label = os.environ.get("PENNY_TARGET_TXT_LABEL", DEFAULT_TXT_LABEL).strip().strip(".")
+    return label or DEFAULT_TXT_LABEL
+
+
+def _expected_txt_value() -> str:
+    value = os.environ.get("PENNY_TARGET_TXT_VALUE", DEFAULT_TXT_VALUE).strip()
+    return value or DEFAULT_TXT_VALUE
+
+
+def _candidate_txt_names(hostname: str) -> list[str]:
+    lowered = hostname.lower().strip(".")
+    label = _txt_label()
+    candidates = [lowered]
+    if label:
+        candidates.insert(0, f"{label}.{lowered}")
+    seen: dict[str, None] = {}
+    for candidate in candidates:
+        seen.setdefault(candidate, None)
+    return list(seen)
+
+
+def _parse_txt_output(text: str) -> list[str]:
+    records: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        chunks = _TXT_CHUNK_RE.findall(line)
+        if chunks:
+            records.append("".join(chunks))
+            continue
+        lowered = line.lower()
+        if "text =" in lowered:
+            _, _, tail = line.partition("=")
+            candidate = tail.strip().strip('"')
+            if candidate:
+                records.append(candidate)
+    return records
+
+
+def _lookup_txt_records(hostname: str) -> list[str]:
+    try:
+        import dns.resolver  # type: ignore[import-not-found]
+
+        answers = dns.resolver.resolve(hostname, "TXT")
+        records: list[str] = []
+        for answer in answers:
+            strings = getattr(answer, "strings", None)
+            if strings:
+                records.append("".join(chunk.decode("utf-8", errors="ignore") for chunk in strings))
+                continue
+            records.append(str(answer).strip('"'))
+        if records:
+            return records
+    except Exception:  # noqa: BLE001 - fail closed below
+        pass
+
+    commands = (
+        ["dig", "+short", "TXT", hostname],
+        ["nslookup", "-type=TXT", hostname],
+    )
+    for command in commands:
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=3.0, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        records = _parse_txt_output(completed.stdout)
+        if records:
+            return records
+    return []
+
+
+def _has_matching_txt_record(hostname: str) -> bool:
+    expected = _expected_txt_value()
+    for candidate in _candidate_txt_names(hostname):
+        if expected in _lookup_txt_records(candidate):
+            return True
+    return False
+
+
+def txt_record_hint(hostname: str) -> str:
+    names = _candidate_txt_names(hostname)
+    value = _expected_txt_value()
+    if len(names) == 1:
+        return f'{names[0]} TXT "{value}"'
+    return f'{names[0]} TXT "{value}" (or {names[1]} TXT "{value}")'
+
+
+def host_authorization_error(hostname: str | None, i_own_this: bool) -> str | None:
+    if not hostname:
+        return "target must include a hostname"
+    if _is_private_or_loopback_host(hostname):
+        return None
+    if not i_own_this:
+        return "public targets require --i-own-this and a matching DNS TXT proof record"
+    if _public_ip_literal(hostname):
+        return "public IP literals are blocked; use a DNS hostname with a matching TXT proof record"
+    if not _has_matching_txt_record(hostname):
+        return f"missing TXT proof record; expected {txt_record_hint(hostname)}"
+    return None
+
+
+def _hostname_allowed(hostname: str, i_own_this: bool) -> bool:
+    return host_authorization_error(hostname, i_own_this) is None
 
 
 def host_allowed(hostname: str | None, i_own_this: bool) -> bool:
@@ -51,11 +172,9 @@ def host_allowed(hostname: str | None, i_own_this: bool) -> bool:
     Non-HTTP probes (the TCP port scan, the TLS handshake inspector) cannot go
     through :class:`TargetGate` because they are not HTTP requests, but they must
     obey the same gate: localhost/private hosts are allowed by default and any
-    public host requires ``i_own_this``.
+    public host requires ``i_own_this`` plus a matching DNS TXT proof record.
     """
-    if not hostname:
-        return False
-    return _hostname_allowed(hostname, i_own_this)
+    return host_authorization_error(hostname, i_own_this) is None
 
 
 class TargetGate:
@@ -74,8 +193,9 @@ class TargetGate:
             raise GuardrailError("target must use http or https")
         if not parsed.hostname:
             raise GuardrailError("target must include a hostname")
-        if not _hostname_allowed(parsed.hostname, i_own_this):
-            raise GuardrailError("public targets require --i-own-this and are limited to read-only probes")
+        authorization_error = host_authorization_error(parsed.hostname, i_own_this)
+        if authorization_error:
+            raise GuardrailError(authorization_error)
         self.base_url = base_url.rstrip("/")
         self.parsed = parsed
         self.i_own_this = i_own_this

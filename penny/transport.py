@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from .feed import EventFeed
-from .guardrails import GuardrailError, TargetGate, host_allowed
+from .guardrails import GuardrailError, TargetGate, host_authorization_error, host_allowed
 from .models import Finding, Location
 
 # Below this the cert is "about to expire"; below TLS 1.2 the protocol is obsolete.
@@ -300,8 +300,9 @@ def run_transport_probes(
     """Gather transport facts about ``target`` and analyze them. Never raises into a scan."""
     parsed = urlparse(target)
     host = parsed.hostname or target
-    if not host_allowed(host, i_own_this):
-        feed.emit("gate", f"Transport probe blocked for {host}: public hosts require --i-own-this")
+    authorization_error = host_authorization_error(host, i_own_this)
+    if authorization_error:
+        feed.emit("gate", f"Transport probe blocked for {host}: {authorization_error}")
         return []
     scheme = (parsed.scheme or "").lower()
     feed.emit("attack", f"Transport-security probe on {host} (read-only TLS + HSTS + downgrade check)")

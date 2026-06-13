@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from .feed import EventFeed
-from .guardrails import host_allowed
+from .guardrails import host_authorization_error
 from .models import Finding, Location
 
 # Hard ceilings. Inputs are clamped to these no matter what the caller passes, so
@@ -129,8 +129,9 @@ def run_load_test(
 ) -> list[Finding]:
     """Ramp load against ``target`` until the failure knee, then stop. Bounded."""
     host = urlparse(target).hostname or target
-    if not host_allowed(host, i_own_this):
-        feed.emit("gate", f"Load test blocked for {host}: public hosts require --i-own-this")
+    authorization_error = host_authorization_error(host, i_own_this)
+    if authorization_error:
+        feed.emit("gate", f"Load test blocked for {host}: {authorization_error}")
         return []
 
     fetch = fetch or _default_fetch

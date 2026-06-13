@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from .feed import EventFeed
-from .guardrails import host_allowed
+from .guardrails import host_authorization_error
 from .models import Finding, Location
 
 # Probe every port concurrently. A sequential scan blocks the full `timeout` on
@@ -119,8 +119,9 @@ def run_port_scan(
 ) -> list[Finding]:
     """Scan ``target``'s host for reachable common services. Read-only connect scan."""
     host = urlparse(target).hostname or target
-    if not host_allowed(host, i_own_this):
-        feed.emit("gate", f"Port scan blocked for {host}: public hosts require --i-own-this")
+    authorization_error = host_authorization_error(host, i_own_this)
+    if authorization_error:
+        feed.emit("gate", f"Port scan blocked for {host}: {authorization_error}")
         return []
     ports = ports or DEFAULT_PORTS
     connect = connect or _tcp_connect

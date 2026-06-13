@@ -296,7 +296,7 @@ penny › /target https://my-owned-app.example
 penny › /scan ../my-firebase-app --active --i-own-this
 ```
 
-Active probes go through the same `TargetGate` as every other request: only `GET`/`HEAD`/`OPTIONS`, rate-limited, same-origin, no redirects off the target. Reaching any **public** host (e.g. `*.firebaseio.com`) requires `--i-own-this` — without it the probe is blocked, not sent. Payloads are detection-only; Penny never sends destructive input (`DROP TABLE`, writes, deletes).
+Active probes go through the same `TargetGate` as every other request: only `GET`/`HEAD`/`OPTIONS`, rate-limited, same-origin, no redirects off the target. Reaching any **public** host (e.g. `*.firebaseio.com`) requires `--i-own-this` **and** a matching DNS TXT proof record — without both, the probe is blocked, not sent. By default Penny expects `_penny.<hostname>` (or the bare hostname) to publish `TXT "penny-verify=authorized"`. Payloads are detection-only; Penny never sends destructive input (`DROP TABLE`, writes, deletes).
 
 `<path>` can be a local directory or a git source URL ending in `.git`, including an optional ref suffix:
 
@@ -360,9 +360,9 @@ The planted app includes a client-visible service-role key, a committed fake sec
 
 ## Safety Model
 
-Penny only runs read-only HTTP probes (`GET`/`HEAD`/`OPTIONS`). Localhost and private-network targets are allowed by default. Public targets require `--i-own-this`; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
+Penny only runs read-only HTTP probes (`GET`/`HEAD`/`OPTIONS`). Localhost and private-network targets are allowed by default. Public targets require `--i-own-this` plus a matching DNS TXT proof record; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
 
-`--active` probing (SQLi, Firebase open-rules, the checklist baseline, and the `A011` transport/MitM-exposure check) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. The `--netscan` port scan is a read-only TCP **connect** scan (it opens and immediately closes a socket; it never sends a payload to a service), and the `A011` transport check uses a normal client TLS handshake — both obey the same authorization rule via a shared `host_allowed` gate. Public hosts still require `--i-own-this`, so any of these against a hosted backend are blocked unless you explicitly assert ownership. Penny deliberately stops at *finding* MitM exposure; it does not implement interception (ARP/DNS spoofing, rogue APs, TLS forging), which would target other parties' traffic.
+`--active` probing (SQLi, Firebase open-rules, the checklist baseline, and the `A011` transport/MitM-exposure check) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. The `--netscan` port scan is a read-only TCP **connect** scan (it opens and immediately closes a socket; it never sends a payload to a service), and the `A011` transport check uses a normal client TLS handshake — both obey the same authorization rule via a shared `host_allowed` gate. Public hosts still require `--i-own-this` plus a matching TXT proof record, so any of these against a hosted backend are blocked unless you explicitly assert ownership and the target opts in via DNS. Penny deliberately stops at *finding* MitM exposure; it does not implement interception (ARP/DNS spoofing, rogue APs, TLS forging), which would target other parties' traffic.
 
 Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, private keys, database URLs, emails, and high-entropy token-shaped values before persistence.
 

@@ -46,6 +46,5 @@ def test_public_host_requires_ownership() -> None:
     assert _scan({6379}, target="http://8.8.8.8") == []
 
 
-def test_public_host_allowed_with_ownership() -> None:
-    findings = _scan({6379}, target="http://8.8.8.8", i_own_this=True)
-    assert any(f.detector_id == "N002" for f in findings)
+def test_public_ip_literal_stays_blocked_even_with_ownership() -> None:
+    assert _scan({6379}, target="http://8.8.8.8", i_own_this=True) == []

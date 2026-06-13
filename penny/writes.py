@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 from .feed import EventFeed
-from .guardrails import host_allowed
+from .guardrails import host_authorization_error
 from .models import Finding, Location
 from .redaction import redact_text
 
@@ -125,8 +125,9 @@ def run_safe_write_probe(
 ) -> list[Finding]:
     """POST a marked, benign test record to candidate write endpoints (consented)."""
     host = urlparse(target).hostname or target
-    if not host_allowed(host, i_own_this):
-        feed.emit("gate", f"Write-path probe blocked for {host}: public hosts require --i-own-this")
+    authorization_error = host_authorization_error(host, i_own_this)
+    if authorization_error:
+        feed.emit("gate", f"Write-path probe blocked for {host}: {authorization_error}")
         return []
     if not i_accept:
         feed.emit("gate", "Write-path probe skipped: pass --i-accept to allow benign test POSTs (creates marked records)")
