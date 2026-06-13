@@ -94,7 +94,9 @@ def _llm_answer(question: str, payload: dict, findings: list[dict]) -> str | Non
     context = _findings_context(payload, findings)
     rag = _rag_context(question)
     prompt = f"{rag}Scan findings (JSON):\n{context}\n\nDeveloper question: {question}"
-    return llm_complete(prompt, system=SYSTEM_PROMPT, deep=True, max_tokens=1024)
+    # Chat answers use the "fast" tier so model-mode 'auto' routes them to Haiku;
+    # 'sonnet' mode still forces Sonnet, 'haiku' forces Haiku.
+    return llm_complete(prompt, system=SYSTEM_PROMPT, deep=False, max_tokens=1024)
 
 
 def _static_answer(

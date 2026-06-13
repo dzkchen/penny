@@ -33,6 +33,7 @@ HELP = """\
 /show <F-001>                     show one finding in detail
 /target <url|off>                 set the dynamic-probe target
 /ai <on|off>                      toggle AI answers/review
+/model <auto|haiku|sonnet>        pick the Claude model mode (auto = Haiku chat + Sonnet work)
 /clear                            clear the screen
 /help                             show this help
 /exit                             leave
@@ -181,6 +182,8 @@ class Session:
             self._show(args)
         elif cmd == "ai":
             self._toggle_ai(args)
+        elif cmd == "model":
+            self._set_model(args)
         elif cmd == "target":
             self._set_target(args)
         else:
@@ -374,6 +377,21 @@ class Session:
         else:
             self.use_ai = False
             self.out(ui.dim("AI off — answers are deterministic."))
+
+    def _set_model(self, args: list[str]) -> None:
+        if not args:
+            self.out(ui.dim(llm.describe_model_mode()))
+            self.out(ui.dim("Usage: /model <auto|haiku|sonnet>"))
+            self.out(ui.dim("  auto   — Haiku for quick chat, Sonnet for audits/fixes (recommended)"))
+            self.out(ui.dim("  haiku  — fast + cheap for everything"))
+            self.out(ui.dim("  sonnet — deep + accurate for everything"))
+            return
+        try:
+            mode = llm.set_model_mode(args[0])
+        except ValueError as error:
+            self._warn(str(error))
+            return
+        self.out(ui.style(f"✓ {llm.describe_model_mode()}", "green"))
 
     def _set_target(self, args: list[str]) -> None:
         if not args or args[0].lower() == "off":

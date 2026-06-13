@@ -207,6 +207,22 @@ def _build_typer_app():
             answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this, use_llm=use_llm),
         )
 
+    @app.command()
+    def model(
+        mode: Optional[str] = typer.Argument(None, help="auto | haiku | sonnet (omit to show current)"),
+    ) -> None:
+        feed = EventFeed()
+        if not mode:
+            feed.emit("purple", llm.describe_model_mode())
+            feed.emit("purple", "Set with: penny model <auto|haiku|sonnet>")
+            return
+        try:
+            llm.set_model_mode(mode)
+        except ValueError as error:
+            _fail(str(error))
+        feed.emit("purple", llm.describe_model_mode())
+        feed.emit("purple", "Tip: add PENNY_MODEL_MODE=<mode> to .env to make it permanent.")
+
     @app.command("ask-loop")
     def ask_loop(
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
@@ -353,6 +369,9 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     ask_loop_parser.add_argument("--i-own-this", action="store_true")
     ask_loop_parser.add_argument("--no-ai", action="store_true")
 
+    model_parser = sub.add_parser("model")
+    model_parser.add_argument("mode", nargs="?", default=None)
+
     patch_parser = sub.add_parser("patch")
     patch_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     patch_parser.add_argument("--repo", type=Path, default=Path("."))
@@ -422,6 +441,15 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "ask-loop":
         _ask_loop(args.findings, args.target, args.i_own_this, feed, use_llm=not args.no_ai)
+    elif args.command == "model":
+        if not args.mode:
+            feed.emit("purple", llm.describe_model_mode())
+        else:
+            try:
+                llm.set_model_mode(args.mode)
+                feed.emit("purple", llm.describe_model_mode())
+            except ValueError as error:
+                _fail(str(error))
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "fix":
