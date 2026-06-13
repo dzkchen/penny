@@ -107,9 +107,10 @@ class Session:
             lines.append(f"{ui.dim('loaded')} {total} finding(s) from {self.findings_path}")
         else:
             lines.append(ui.dim("no findings yet — run /scan <path>"))
-        lines.append("")
-        lines.append(ui.dim("Ask a question, or type /help for commands."))
         self.out(ui.panel("\n".join(lines), title="Penny — purple-team assistant for AI-built apps", color="magenta"))
+        self.out()
+        # Show the command menu up front so the REPL is self-explanatory on launch.
+        self._help()
         self.out()
 
     def _help(self) -> None:
