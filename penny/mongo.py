@@ -30,6 +30,22 @@ class MongoMirror:
     def enabled(self) -> bool:
         return bool(self.uri)
 
+    def _client_kwargs(self, timeout_ms: int) -> dict[str, Any]:
+        """MongoClient options. For TLS/Atlas URIs, pin the CA bundle to certifi so
+        verification works on systems without a usable OS trust store (common on
+        macOS Python builds, which otherwise raise CERTIFICATE_VERIFY_FAILED)."""
+        kwargs: dict[str, Any] = {"serverSelectionTimeoutMS": timeout_ms}
+        uri = (self.uri or "").lower()
+        uses_tls = uri.startswith("mongodb+srv://") or "tls=true" in uri or "ssl=true" in uri
+        if uses_tls:
+            try:
+                import certifi
+
+                kwargs["tlsCAFile"] = certifi.where()
+            except Exception:
+                pass
+        return kwargs
+
     def mirror(self, payload: dict[str, Any]) -> str | None:
         if not self.enabled():
             return None
@@ -38,19 +54,23 @@ class MongoMirror:
         except Exception:
             return "pymongo is not installed; skipped Mongo mirror"
 
-        client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
-        db = client[self.database_name]
-        now = datetime.now(UTC)
-        db.scan_history.insert_one(scan_history_doc(payload, now=now))
-        for finding in payload.get("findings", []):
-            pattern_doc = vuln_pattern_doc(finding, now=now)
-            db.vuln_patterns.update_one(
-                {"detector_id": finding["detector_id"], "title": finding["title"]},
-                {"$set": pattern_doc, "$inc": {"observation_count": 1}, "$setOnInsert": {"created_at": now}},
-                upsert=True,
-            )
-        client.close()
-        return "mirrored redacted stats and generic patterns to Mongo"
+        client = MongoClient(self.uri, **self._client_kwargs(1500))
+        try:
+            db = client[self.database_name]
+            now = datetime.now(UTC)
+            db.scan_history.insert_one(scan_history_doc(payload, now=now))
+            for finding in payload.get("findings", []):
+                pattern_doc = vuln_pattern_doc(finding, now=now)
+                db.vuln_patterns.update_one(
+                    {"detector_id": finding["detector_id"], "title": finding["title"]},
+                    {"$set": pattern_doc, "$inc": {"observation_count": 1}, "$setOnInsert": {"created_at": now}},
+                    upsert=True,
+                )
+            return "mirrored redacted stats and generic patterns to Mongo"
+        except Exception as error:
+            return f"Mongo mirror skipped: {error}"
+        finally:
+            client.close()
 
     def search_patterns(self, query: str, *, limit: int = 5) -> tuple[list[dict[str, Any]], str | None]:
         if not self.enabled():
@@ -60,7 +80,7 @@ class MongoMirror:
         except Exception:
             return [], "pymongo is not installed; skipped Mongo knowledge search"
 
-        client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
+        client = MongoClient(self.uri, **self._client_kwargs(1500))
         try:
             db = client[self.database_name]
             try:
@@ -91,7 +111,7 @@ class MongoMirror:
 
         dims = embedding_dimensions()
         name = "vuln_pattern_vector_index"
-        client = MongoClient(self.uri, serverSelectionTimeoutMS=8000)
+        client = MongoClient(self.uri, **self._client_kwargs(8000))
         try:
             col = client[self.database_name].vuln_patterns
             existing = {index["name"]: index for index in col.list_search_indexes()}
@@ -118,7 +138,7 @@ class MongoMirror:
         except Exception:
             return [], "pymongo is not installed; skipped Mongo trends"
 
-        client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
+        client = MongoClient(self.uri, **self._client_kwargs(1500))
         try:
             db = client[self.database_name]
             rows = list(db.scan_history.aggregate(trend_pipeline(days=days, limit=limit)))

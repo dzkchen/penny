@@ -45,6 +45,19 @@ def _hostname_allowed(hostname: str, i_own_this: bool) -> bool:
     return i_own_this
 
 
+def host_allowed(hostname: str | None, i_own_this: bool) -> bool:
+    """Public predicate sharing TargetGate's authorization rule.
+
+    Non-HTTP probes (the TCP port scan, the TLS handshake inspector) cannot go
+    through :class:`TargetGate` because they are not HTTP requests, but they must
+    obey the same gate: localhost/private hosts are allowed by default and any
+    public host requires ``i_own_this``.
+    """
+    if not hostname:
+        return False
+    return _hostname_allowed(hostname, i_own_this)
+
+
 class TargetGate:
     def __init__(
         self,
