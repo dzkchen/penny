@@ -124,6 +124,43 @@ def _wrap(line: str, width: int) -> list[str]:
     return wrapped
 
 
+def _hard_chunk(line: str, width: int) -> list[str]:
+    """Break a single line into <= width visible-column chunks, splitting even
+    unbroken runs (e.g. long file paths with no spaces). ANSI codes are carried
+    along as zero-width so colour survives the break."""
+    if width <= 0:
+        return [line]
+    chunks: list[str] = []
+    current = ""
+    current_len = 0
+    for part in re.split(r"(\x1b\[[0-9;]*m)", line):
+        if not part:
+            continue
+        if _ANSI_RE.fullmatch(part):
+            current += part  # zero-width: never forces a break
+            continue
+        for char in part:
+            if current_len >= width:
+                chunks.append(current)
+                current, current_len = "", 0
+            current += char
+            current_len += 1
+    if current or not chunks:
+        chunks.append(current)
+    return chunks
+
+
+def _wrap_cell(text: str, width: int) -> list[str]:
+    """Wrap a table cell to ``width`` visible columns: word-wrap first, then
+    hard-break any word still too long (paths, hashes). Returns >= 1 line."""
+    if width <= 0 or visible_len(text) <= width:
+        return [text]
+    lines: list[str] = []
+    for line in _wrap(text, width):
+        lines.extend(_hard_chunk(line, width) if visible_len(line) > width else [line])
+    return lines
+
+
 def panel(body: str, *, title: str | None = None, color: str = "cyan") -> str:
     raw = body.split("\n")
     if title:
@@ -143,17 +180,42 @@ def panel(body: str, *, title: str | None = None, color: str = "cyan") -> str:
     return "\n".join(rows)
 
 
-def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = None) -> str:
+def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = None, *, max_width: int | None = None) -> str:
     cols = len(headers)
     aligns = aligns or ["left"] * cols
+    gap = 2
     widths = [visible_len(headers[i]) for i in range(cols)]
     for row in rows:
         for i in range(cols):
             widths[i] = max(widths[i], visible_len(str(row[i])))
-    out = ["  ".join(_pad(style(headers[i], "bold"), widths[i], aligns[i]) for i in range(cols))]
-    out.append(dim("  ".join("─" * widths[i] for i in range(cols))))
+
+    # Keep the table inside the terminal. Without this the widest columns (file
+    # paths, titles) run past the right edge and the terminal soft-wraps them
+    # mid-cell, mangling every column. Instead, shave the widest column(s) down
+    # until the row fits, then wrap the overflowing cells onto continuation lines.
+    budget = (max_width if max_width is not None else _term_width()) - gap
+    available = budget - gap * (cols - 1)
+    min_col = 6
+    while sum(widths) > available and max(widths) > min_col:
+        widest = widths.index(max(widths))
+        widths[widest] -= 1
+
+    def render_row(cells: list[str]) -> list[str]:
+        wrapped = [_wrap_cell(str(cells[i]), widths[i]) for i in range(cols)]
+        height = max((len(cell) for cell in wrapped), default=1)
+        lines = []
+        for line_index in range(height):
+            pieces = [
+                _pad(wrapped[i][line_index] if line_index < len(wrapped[i]) else "", widths[i], aligns[i])
+                for i in range(cols)
+            ]
+            lines.append((" " * gap).join(pieces))
+        return lines
+
+    out = render_row([style(headers[i], "bold") for i in range(cols)])
+    out.append(dim((" " * gap).join("─" * widths[i] for i in range(cols))))
     for row in rows:
-        out.append("  ".join(_pad(str(row[i]), widths[i], aligns[i]) for i in range(cols)))
+        out.extend(render_row(list(row)))
     return "\n".join(out)
 
 

@@ -294,6 +294,8 @@ def print_scan_summary(payload: dict, out_dir: Path, *, verbose: bool = False) -
                 print(ui.dim(f"      {loc['file']}:{loc['line']}"))
 
     hint = "penny report" + ("" if out_dir == Path(".") else f" --out {out_dir}")
-    tip = ui.dim("Tip: ctrl-o expands findings live during a scan; ") + ui.dim("--verbose prints every hit.")
     print()
-    print(ui.style(f"  → Next: {hint}", "cyan") + "    " + tip)
+    # Two lines, not one wide one: on a narrow terminal a single joined line
+    # soft-wraps mid-sentence; separate lines stay readable at any width.
+    print(ui.style(f"  → Next: {hint}", "cyan"))
+    print(ui.dim("    Tip: ctrl-o expands findings live during a scan; --verbose prints every hit."))
