@@ -5,11 +5,22 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .models import SEVERITY_ORDER
 from .redaction import redact_text
+
+_SEV_EMOJI = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🔵", "Info": "⚪"}
 
 
 def load_findings(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _by_severity(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Most severe first; ties broken by detector then location for stability."""
+    return sorted(
+        findings,
+        key=lambda f: (SEVERITY_ORDER.get(f["severity"], 99), f["detector_id"], f["location"]["file"]),
+    )
 
 
 def _severity_rollup(findings: list[dict[str, Any]]) -> str:
@@ -17,9 +28,11 @@ def _severity_rollup(findings: list[dict[str, Any]]) -> str:
     lines = ["| Severity | Count |", "|---|---:|"]
     for severity in ("Critical", "High", "Medium", "Low", "Info"):
         if counts.get(severity, 0):
-            lines.append(f"| {severity} | {counts[severity]} |")
+            lines.append(f"| {_SEV_EMOJI[severity]} {severity} | {counts[severity]} |")
     if len(lines) == 2:
         lines.append("| None | 0 |")
+    else:
+        lines.append(f"| **Total** | **{sum(counts.values())}** |")
     return "\n".join(lines)
 
 
@@ -94,27 +107,27 @@ def _render_evidence(finding: dict[str, Any]) -> str:
 
 def _finding_details(findings: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
-    for finding in findings:
+    for finding in _by_severity(findings):
         location = finding["location"]
+        emoji = _SEV_EMOJI.get(finding["severity"], "")
+        owasp = ", ".join(finding.get("owasp", [])) or "—"
         parts = [
-            f"### {finding['id']} - {finding['title']}",
+            f"### {emoji} {finding['id']} · {finding['title']}",
             "",
-            f"- Severity: {finding['severity']}",
-            f"- Status: {_status_word(finding)}",
-            f"- Confidence: {finding['confidence']}",
-            f"- Detector: {finding['detector_id']}",
-            f"- OWASP: {', '.join(finding.get('owasp', []))}",
-            f"- Location: `{location['file']}:{location['line']}`",
+            f"**{finding['severity']}** · {_status_word(finding)} · confidence {finding['confidence']} "
+            f"· `{finding['detector_id']}` · `{location['file']}:{location['line']}`",
+            "",
+            f"_OWASP: {owasp}_",
         ]
         evidence_block = _render_evidence(finding)
         if evidence_block:
-            parts.append(evidence_block)
+            parts += ["", evidence_block]
         snippet = redact_text(finding.get("snippet", "")).strip()
         if snippet:
-            parts += ["", "Redacted snippet:", "", "```text", snippet, "```"]
-        parts += ["", f"Impact: {finding['impact']}", "", f"Remediation: {finding['remediation']}"]
+            parts += ["", "<details><summary>Redacted snippet</summary>", "", "```text", snippet, "```", "", "</details>"]
+        parts += ["", f"**Impact:** {finding['impact']}", "", f"**Fix:** {finding['remediation']}"]
         blocks.append("\n".join(parts))
-    return "\n\n".join(blocks)
+    return "\n\n---\n\n".join(blocks)
 
 
 def _confirmed_attack_path(findings: list[dict[str, Any]]) -> str:
@@ -249,7 +262,7 @@ Avoid `Access-Control-Allow-Origin: *` on APIs that may return user-specific or 
     # still contributes a Section-7 entry instead of being silently dropped.
     covered = {"D001", "D002", "D003", "D004", "D005", "D006"}
     seen: set[str] = set()
-    for finding in findings:
+    for finding in _by_severity(findings):
         detector_id = finding["detector_id"]
         if detector_id in covered or detector_id in seen:
             continue
@@ -285,11 +298,19 @@ def generate_report(payload: dict[str, Any], *, use_llm: bool = False) -> str:
         detector_titles = " ".join(f"{f.get('detector_id', '')} {f.get('title', '')}" for f in findings)
         retrieved, _ = MongoMirror().search_patterns(detector_titles or "security findings", limit=3)
         verdict = llm_verdict(findings_json, deterministic=verdict, retrieved=retrieved)
-    executive = (
-        f"Penny found {summary.get('total', len(findings))} issue(s), including "
-        f"{len(critical)} critical and {summary.get('high_count', 0)} high finding(s). "
-        f"{len(confirmed)} finding(s) were dynamically confirmed."
-    )
+    ordered = _by_severity(findings)
+    high_count = summary.get("high_count", sum(1 for f in findings if f["severity"] == "High"))
+    executive_lines = [
+        f"Penny found **{summary.get('total', len(findings))} issue(s)** — "
+        f"{len(critical)} critical, {high_count} high — and dynamically confirmed {len(confirmed)}.",
+    ]
+    if ordered:
+        top = ordered[0]
+        executive_lines.append(
+            f"\n**Fix first:** {_SEV_EMOJI.get(top['severity'], '')} {top['id']} · {top['title']} "
+            f"(`{top['location']['file']}:{top['location']['line']}`)."
+        )
+    executive = "\n".join(executive_lines)
     return "\n\n".join(
         [
             "# Penny Security Report",

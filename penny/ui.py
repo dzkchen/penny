@@ -48,15 +48,16 @@ SEVERITY_STYLE = {
 CHANNEL_STYLE = {
     "scan": ("🔍", "cyan"),
     "mongo": ("🍃", "green"),
-    "osv": ("📦", "magenta"),
+    "osv": ("📦", "bright_magenta"),
     "ai": ("🤖", "bright_blue"),
     "attack": ("💥", "bright_red"),
-    "gate": ("⛔", "yellow"),
+    "red": ("›", "bright_red"),
+    "gate": ("⛔", "bright_yellow"),
     "store": ("💾", "bright_black"),
-    "blue": ("🛠", "green"),
-    "purple": ("◆", "magenta"),
-    "report": ("📄", "cyan"),
-    "error": ("✖", "red"),
+    "blue": ("🛠", "bright_green"),
+    "purple": ("◆", "bright_magenta"),
+    "report": ("📄", "bright_cyan"),
+    "error": ("✖", "bright_red"),
 }
 
 

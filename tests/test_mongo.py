@@ -4,7 +4,16 @@ import json
 from datetime import UTC, datetime
 
 from penny.feed import EventFeed
-from penny.mongo import safe_pattern_result, safe_trend_result, scan_history_doc, trend_pipeline, vector_search_pipeline, vuln_pattern_doc
+from penny import embeddings
+from penny.mongo import (
+    safe_pattern_result,
+    safe_trend_result,
+    scan_history_doc,
+    trend_pipeline,
+    vector_search_pipeline,
+    vuln_pattern_doc,
+    vuln_pattern_operations,
+)
 from penny.scanner import run_scan
 
 from .conftest import ROOT
@@ -30,6 +39,46 @@ def test_mongo_docs_contain_only_stats_and_generic_patterns(tmp_path, monkeypatc
     from penny.embeddings import embedding_dimensions
 
     assert len(pattern["embedding"]) == embedding_dimensions()
+
+
+def test_mirror_operations_collapse_duplicate_hits_into_one_upsert(monkeypatch) -> None:
+    # The old mirror embedded + upserted once per hit, so a repo with hundreds of
+    # findings froze the CLI on N sequential round-trips. Operations must scale
+    # with distinct (detector_id, title) patterns and embed in a single batch.
+    monkeypatch.setenv("PENNY_DISABLE_VOYAGE", "1")  # deterministic hash embeddings
+    calls: list[int] = []
+    real_embed = embeddings.embed_documents
+
+    def counted(texts):
+        calls.append(len(texts))
+        return real_embed(texts)
+
+    monkeypatch.setattr(embeddings, "embed_documents", counted)
+
+    findings = []
+    for line in range(200):  # 200 hits, but only two distinct patterns
+        findings.append(
+            {
+                "detector_id": "D002",
+                "title": "Committed application secret",
+                "severity": "High",
+                "impact": "x",
+                "remediation": "y",
+                "location": {"file": f"f{line}.js", "line": 1},
+            }
+        )
+    findings.append(
+        {"detector_id": "D012", "title": "Dangerous eval", "severity": "Medium", "impact": "x", "remediation": "y"}
+    )
+
+    operations = vuln_pattern_operations(findings)
+
+    assert len(operations) == 2  # one upsert per distinct pattern, not 201
+    assert len(calls) == 1  # all unique patterns embedded in a single batched call
+    by_detector = {op._filter["detector_id"]: op for op in operations}
+    # observation_count is incremented by the number of collapsed hits.
+    assert by_detector["D002"]._doc["$inc"]["observation_count"] == 200
+    assert by_detector["D012"]._doc["$inc"]["observation_count"] == 1
 
 
 def test_vector_search_pipeline_targets_atlas_vector_index(monkeypatch) -> None:

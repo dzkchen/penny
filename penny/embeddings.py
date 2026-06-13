@@ -79,7 +79,12 @@ def _hash_embedding(text: str, dimensions: int = HASH_DIMS) -> list[float]:
     return [round(value / magnitude, 6) for value in vector]
 
 
-def _voyage_embedding(text: str, *, input_type: str) -> list[float] | None:
+# Voyage caps a single embed call at 128 inputs; chunk larger batches so a scan
+# with many distinct patterns still costs O(n / 128) round-trips, not O(n).
+_VOYAGE_BATCH = 128
+
+
+def _voyage_embeddings(texts: list[str], *, input_type: str) -> list[list[float]] | None:
     key = _voyage_key()
     if key is None:
         return None
@@ -87,10 +92,19 @@ def _voyage_embedding(text: str, *, input_type: str) -> list[float] | None:
         import voyageai
 
         client = voyageai.Client(api_key=key)
-        result = client.embed([text], model=VOYAGE_MODEL, input_type=input_type)
-        return result.embeddings[0]
+        out: list[list[float]] = []
+        for start in range(0, len(texts), _VOYAGE_BATCH):
+            chunk = texts[start : start + _VOYAGE_BATCH]
+            result = client.embed(chunk, model=VOYAGE_MODEL, input_type=input_type)
+            out.extend(result.embeddings)
+        return out
     except Exception:
         return None
+
+
+def _voyage_embedding(text: str, *, input_type: str) -> list[float] | None:
+    vectors = _voyage_embeddings([text], input_type=input_type)
+    return vectors[0] if vectors else None
 
 
 def embed_document(text: str) -> list[float]:
@@ -100,6 +114,24 @@ def embed_document(text: str) -> list[float]:
         if vector is not None:
             return vector
     return _hash_embedding(text)
+
+
+def embed_documents(texts: list[str]) -> list[list[float]]:
+    """Embed many documents in as few backend calls as possible.
+
+    Equivalent to ``[embed_document(t) for t in texts]`` but, on the Voyage
+    backend, batches the inputs into a handful of API calls instead of one call
+    per text — the difference between a scan that mirrors instantly and one that
+    freezes on hundreds of sequential round-trips. Falls back to the hash
+    embedding when the backend is unavailable.
+    """
+    if not texts:
+        return []
+    if backend() == "voyage":
+        vectors = _voyage_embeddings(texts, input_type="document")
+        if vectors is not None:
+            return vectors
+    return [_hash_embedding(text) for text in texts]
 
 
 def embed_query(text: str) -> list[float]:

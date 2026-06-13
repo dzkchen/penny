@@ -59,13 +59,9 @@ class MongoMirror:
             db = client[self.database_name]
             now = datetime.now(UTC)
             db.scan_history.insert_one(scan_history_doc(payload, now=now))
-            for finding in payload.get("findings", []):
-                pattern_doc = vuln_pattern_doc(finding, now=now)
-                db.vuln_patterns.update_one(
-                    {"detector_id": finding["detector_id"], "title": finding["title"]},
-                    {"$set": pattern_doc, "$inc": {"observation_count": 1}, "$setOnInsert": {"created_at": now}},
-                    upsert=True,
-                )
+            operations = vuln_pattern_operations(payload.get("findings", []), now=now)
+            if operations:
+                db.vuln_patterns.bulk_write(operations, ordered=False)
             return "mirrored redacted stats and generic patterns to Mongo"
         except Exception as error:
             return f"Mongo mirror skipped: {error}"
@@ -164,10 +160,14 @@ def scan_history_doc(payload: dict[str, Any], *, now: datetime | None = None) ->
     }
 
 
+def _pattern_text(finding: dict[str, Any]) -> str:
+    return f"{finding['title']} {finding['impact']} {finding['remediation']}"
+
+
 def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     from .embeddings import embed_document, embedding_model_name
 
-    pattern_text = f"{finding['title']} {finding['impact']} {finding['remediation']}"
+    pattern_text = _pattern_text(finding)
     return {
         "detector_id": finding["detector_id"],
         "title": finding["title"],
@@ -180,6 +180,63 @@ def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) ->
         "embedding": embed_document(pattern_text),
         "updated_at": now or datetime.now(UTC),
     }
+
+
+def vuln_pattern_operations(findings: list[dict[str, Any]], *, now: datetime | None = None) -> list[Any]:
+    """Build one upsert per *distinct* ``(detector_id, title)`` pattern.
+
+    A scan surfaces the same detector+title once per hit — hundreds of times on a
+    real repo. The previous mirror embedded and upserted each hit separately, so
+    cost grew with raw findings: N Voyage calls + N Atlas round-trips, which froze
+    the CLI after the scan had effectively finished. Here we collapse findings by
+    the upsert key, embed every unique pattern in one batched call, and return
+    ``UpdateOne`` ops for a single ``bulk_write`` — cost now scales with distinct
+    patterns, not hit count. ``observation_count`` is incremented by the number of
+    hits so the running tally is preserved.
+    """
+    from pymongo import UpdateOne
+
+    from .embeddings import embed_documents, embedding_model_name
+
+    now = now or datetime.now(UTC)
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for finding in findings:
+        key = (finding["detector_id"], finding["title"])
+        bucket = groups.get(key)
+        if bucket is None:
+            groups[key] = {"finding": finding, "count": 1}
+        else:
+            bucket["count"] += 1
+    if not groups:
+        return []
+
+    model = embedding_model_name()
+    texts = [_pattern_text(group["finding"]) for group in groups.values()]
+    embeddings = embed_documents(texts)
+
+    operations: list[Any] = []
+    for group, pattern_text, embedding in zip(groups.values(), texts, embeddings):
+        finding = group["finding"]
+        doc = {
+            "detector_id": finding["detector_id"],
+            "title": finding["title"],
+            "severity": finding["severity"],
+            "owasp": finding.get("owasp", []),
+            "remediation": finding["remediation"],
+            "pattern_text": pattern_text,
+            "embedding_text": pattern_text,
+            "embedding_model": model,
+            "embedding": embedding,
+            "updated_at": now,
+        }
+        operations.append(
+            UpdateOne(
+                {"detector_id": finding["detector_id"], "title": finding["title"]},
+                {"$set": doc, "$inc": {"observation_count": group["count"]}, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+        )
+    return operations
 
 
 def safe_pattern_result(doc: dict[str, Any]) -> dict[str, Any]:

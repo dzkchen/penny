@@ -10,6 +10,7 @@ from .agent_fix import run_agent_fix
 from .ask import answer_question
 from .models import SEVERITY_ORDER
 from .feed import EventFeed
+from .live import LiveScanFeed, print_scan_summary
 from .mongo import MongoMirror
 from .patches import apply_patch_plans, write_patch_file
 from .reporting import generate_report, load_findings
@@ -47,20 +48,6 @@ def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, use_llm: 
 def _fail(message: str) -> None:
     print(f"[error] {message}", file=sys.stderr)
     raise SystemExit(2)
-
-
-def _emit_scan_summary(payload: dict, out_dir: Path, feed: EventFeed) -> None:
-    """Close the scan loop with a severity rollup and the exact next command."""
-    summary = payload.get("summary", {})
-    by_severity = summary.get("by_severity", {})
-    total = summary.get("total", 0)
-    if not total:
-        feed.emit("scan", "No findings. Nice.")
-        return
-    parts = [f"{by_severity[name]} {name.lower()}" for name in ("Critical", "High", "Medium", "Low", "Info") if by_severity.get(name)]
-    feed.emit("scan", f"Found {total} issue(s): {', '.join(parts)}")
-    hint = "penny report" + ("" if out_dir == Path(".") else f" --out {out_dir}")
-    feed.emit("scan", f"Next: {hint}")
 
 
 def _enforce_fail_on(payload: dict, threshold: str | None, feed: EventFeed) -> None:
@@ -175,14 +162,16 @@ def _build_typer_app():
         i_accept: bool = typer.Option(False, "--i-accept", help="Consent to safe write-path testing: POST-only benign marked test records to detect unauthenticated writes / mass assignment (owned targets only; never PUT/PATCH/DELETE)."),
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
+        verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
     ) -> None:
-        feed = EventFeed()
+        feed = LiveScanFeed()
         try:
-            with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
+            with feed:
+                with resolved_scan_source(path) as resolved:
+                    result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        _emit_scan_summary(result.payload, out, feed)
+        print_scan_summary(result.payload, out, verbose=verbose)
         _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command()
@@ -315,13 +304,16 @@ def _build_typer_app():
         i_accept: bool = typer.Option(False, "--i-accept", help="Consent to safe write-path testing: POST-only benign marked test records to detect unauthenticated writes / mass assignment (owned targets only; never PUT/PATCH/DELETE)."),
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
+        verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
     ) -> None:
-        feed = EventFeed()
+        feed = LiveScanFeed()
         try:
-            with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
+            with feed:
+                with resolved_scan_source(path) as resolved:
+                    result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        print_scan_summary(result.payload, out, verbose=verbose)
         _report_command(result.findings_path, out, feed, use_llm=ai)
         _enforce_fail_on(result.payload, fail_on, feed)
 
@@ -359,6 +351,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--i-accept", action="store_true")
     scan_parser.add_argument("--wordlist", default=None)
     scan_parser.add_argument("--pages", type=int, default=8)
+    scan_parser.add_argument("--verbose", "-v", action="store_true")
 
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=None)
@@ -426,6 +419,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--i-accept", action="store_true")
     run_parser.add_argument("--wordlist", default=None)
     run_parser.add_argument("--pages", type=int, default=8)
+    run_parser.add_argument("--verbose", "-v", action="store_true")
 
     replay_parser = sub.add_parser("demo-replay")
     replay_parser.add_argument("--recording", type=Path)
@@ -434,12 +428,14 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     feed = EventFeed()
     if args.command == "scan":
+        feed = LiveScanFeed()
         try:
-            with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
+            with feed:
+                with resolved_scan_source(args.path) as resolved:
+                    result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        _emit_scan_summary(result.payload, args.out, feed)
+        print_scan_summary(result.payload, args.out, verbose=args.verbose)
         _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
         _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, use_llm=args.ai)
@@ -488,11 +484,14 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 f"{row['detector_id']}: {row['count']} finding(s), critical={row['critical_count']}, high={row['high_count']}",
             )
     elif args.command == "run":
+        feed = LiveScanFeed()
         try:
-            with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
+            with feed:
+                with resolved_scan_source(args.path) as resolved:
+                    result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        print_scan_summary(result.payload, args.out, verbose=args.verbose)
         _report_command(result.findings_path, args.out, feed)
         _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "demo-replay":
