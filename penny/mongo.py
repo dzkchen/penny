@@ -78,6 +78,38 @@ class MongoMirror:
         finally:
             client.close()
 
+    def ensure_vector_index(self) -> str:
+        """Create or recreate the Atlas vector index at the active backend's dimensions."""
+        if not self.enabled():
+            return "Mongo disabled; no index created"
+        try:
+            from pymongo import MongoClient
+            from pymongo.operations import SearchIndexModel
+        except Exception:
+            return "pymongo not installed; cannot manage index"
+        from .embeddings import backend, embedding_dimensions
+
+        dims = embedding_dimensions()
+        name = "vuln_pattern_vector_index"
+        client = MongoClient(self.uri, serverSelectionTimeoutMS=8000)
+        try:
+            col = client[self.database_name].vuln_patterns
+            existing = {index["name"]: index for index in col.list_search_indexes()}
+            if name in existing:
+                # If dimensions differ from the current backend, drop and recreate.
+                col.drop_search_index(name)
+            model = SearchIndexModel(
+                definition={"fields": [{"type": "vector", "path": "embedding", "numDimensions": dims, "similarity": "cosine"}]},
+                name=name,
+                type="vectorSearch",
+            )
+            col.create_search_index(model=model)
+            return f"vector index requested for backend={backend()} dims={dims} (builds async)"
+        except Exception as error:
+            return f"index management skipped: {error}"
+        finally:
+            client.close()
+
     def trends(self, *, days: int = 7, limit: int = 10) -> tuple[list[dict[str, Any]], str | None]:
         if not self.enabled():
             return [], None
@@ -113,6 +145,8 @@ def scan_history_doc(payload: dict[str, Any], *, now: datetime | None = None) ->
 
 
 def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    from .embeddings import embed_document, embedding_model_name
+
     pattern_text = f"{finding['title']} {finding['impact']} {finding['remediation']}"
     return {
         "detector_id": finding["detector_id"],
@@ -122,8 +156,8 @@ def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) ->
         "remediation": finding["remediation"],
         "pattern_text": pattern_text,
         "embedding_text": pattern_text,
-        "embedding_model": "penny-hash-v1",
-        "embedding": hashed_embedding(pattern_text),
+        "embedding_model": embedding_model_name(),
+        "embedding": embed_document(pattern_text),
         "updated_at": now or datetime.now(UTC),
     }
 
@@ -149,12 +183,14 @@ def safe_trend_result(doc: dict[str, Any]) -> dict[str, Any]:
 
 
 def vector_search_pipeline(query: str, *, limit: int = 5, index: str = "vuln_pattern_vector_index") -> list[dict[str, Any]]:
+    from .embeddings import embed_query
+
     return [
         {
             "$vectorSearch": {
                 "index": index,
                 "path": "embedding",
-                "queryVector": hashed_embedding(query),
+                "queryVector": embed_query(query),
                 "numCandidates": max(limit * 10, 20),
                 "limit": limit,
             }
