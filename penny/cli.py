@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import llm
 from .ask import answer_question
@@ -160,11 +160,13 @@ def _build_typer_app():
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
         active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
+        diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
+        endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active)
+                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _emit_scan_summary(result.payload, out, feed)
@@ -256,11 +258,13 @@ def _build_typer_app():
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
         active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
+        diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
+        endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active)
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed)
@@ -290,6 +294,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--ai", action="store_true")
     scan_parser.add_argument("--active", action="store_true")
     scan_parser.add_argument("--fail-on", default=None)
+    scan_parser.add_argument("--diff", default=None)
+    scan_parser.add_argument("--endpoint", action="append", default=None)
 
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=None)
@@ -332,6 +338,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--ai", action="store_true")
     run_parser.add_argument("--active", action="store_true")
     run_parser.add_argument("--fail-on", default=None)
+    run_parser.add_argument("--diff", default=None)
+    run_parser.add_argument("--endpoint", action="append", default=None)
 
     replay_parser = sub.add_parser("demo-replay")
     replay_parser.add_argument("--recording", type=Path)
@@ -342,7 +350,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active)
+                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _emit_scan_summary(result.payload, args.out, feed)
@@ -383,7 +391,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "run":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active)
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)

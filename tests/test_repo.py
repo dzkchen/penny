@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 from penny.detectors import detect_committed_secrets, run_detectors
-from penny.repo import walk_repo
+from penny.repo import changed_files, walk_repo
 
 
 def _git(cwd, *args) -> None:
@@ -89,3 +89,42 @@ def test_walk_repo_still_flags_tracked_env(tmp_path) -> None:
     assert ".env" in {file.relative_path for file in files}
     findings = detect_committed_secrets(files)
     assert any(finding.detector_id == "D002" for finding in findings)
+
+
+def test_changed_files_returns_none_outside_git(tmp_path) -> None:
+    (tmp_path / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    assert changed_files(tmp_path, "main") is None
+
+
+@pytest.mark.skipif(not _has_git(), reason="git is required for --diff")
+def test_changed_files_lists_changes_versus_base(tmp_path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    (tmp_path / "base.py").write_text("print('base')\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "base")
+    _git(tmp_path, "branch", "base-ref")
+    # New committed change plus an untracked file should both be in scope.
+    (tmp_path / "feature.py").write_text("print('feature')\n", encoding="utf-8")
+    _git(tmp_path, "add", "feature.py")
+    _git(tmp_path, "commit", "-m", "feature")
+    (tmp_path / "wip.py").write_text("print('wip')\n", encoding="utf-8")
+
+    changed = changed_files(tmp_path, "base-ref")
+    assert changed is not None
+    names = {path.name for path in changed}
+    assert "feature.py" in names
+    assert "wip.py" in names
+    assert "base.py" not in names
+
+
+@pytest.mark.skipif(not _has_git(), reason="git is required for --diff")
+def test_changed_files_unresolvable_ref_returns_none(tmp_path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "Test")
+    (tmp_path / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "init")
+    assert changed_files(tmp_path, "nonexistent-ref") is None

@@ -110,6 +110,56 @@ def _git_ignored_paths(root: Path, candidates: list[Path]) -> set[Path]:
     return {Path(token) for token in result.stdout.split("\0") if token}
 
 
+def changed_files(root: Path, base_ref: str) -> set[Path] | None:
+    """Return absolute paths changed versus ``base_ref`` (committed, staged, unstaged, untracked).
+
+    Used by ``--diff`` to scan only what a PR touches. Returns ``None`` (meaning
+    "could not determine — scan everything") when the path is not a git work tree,
+    git is unavailable, or ``base_ref`` does not resolve. Never raises.
+    """
+    root = root.resolve()
+    git_root = root if root.is_dir() else root.parent
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(git_root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        return None
+    names: set[str] = set()
+    commands = [
+        ["git", "-C", str(git_root), "diff", "--name-only", f"{base_ref}...HEAD"],
+        ["git", "-C", str(git_root), "diff", "--name-only"],
+        ["git", "-C", str(git_root), "diff", "--name-only", "--cached"],
+        ["git", "-C", str(git_root), "ls-files", "--others", "--exclude-standard"],
+    ]
+    saw_base = False
+    for command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        if "...HEAD" in command[-1]:
+            saw_base = True
+        names.update(line for line in result.stdout.splitlines() if line)
+    if not saw_base:
+        # base_ref did not resolve; caller should fall back to a full scan.
+        return None
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(git_root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        repo_top = Path(top.stdout.strip()) if top.returncode == 0 else git_root
+    except (OSError, subprocess.SubprocessError):
+        repo_top = git_root
+    return {(repo_top / name).resolve() for name in names}
+
+
 def _allowed_file(path: Path, root: Path, max_bytes: int) -> bool:
     try:
         relative_parts = path.relative_to(root).parts

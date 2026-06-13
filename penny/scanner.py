@@ -11,7 +11,7 @@ from .feed import EventFeed
 from .models import assign_finding_ids, dedupe_cross_detector, now_session_id
 from .mongo import MongoMirror
 from .probes import confirm_bola_order_access, confirm_cors_policy, confirm_service_key_read
-from .repo import walk_repo
+from .repo import changed_files, walk_repo
 from .store import FindingsStore
 
 
@@ -34,6 +34,8 @@ def run_scan(
     use_osv: bool = False,
     use_ai: bool = False,
     use_active: bool = False,
+    diff_base: str | None = None,
+    endpoints: list[str] | None = None,
 ) -> ScanResult:
     feed = feed or EventFeed()
     session_id = now_session_id()
@@ -42,6 +44,13 @@ def run_scan(
         raise FileNotFoundError(f"scan path does not exist: {repo_path}")
     feed.emit("scan", f"Walking {repo_path}")
     files = walk_repo(repo_path)
+    if diff_base:
+        changed = changed_files(repo_path, diff_base)
+        if changed is None:
+            feed.emit("scan", f"--diff: could not resolve '{diff_base}' (not a git tree or bad ref); scanning all files")
+        else:
+            files = [file for file in files if file.path.resolve() in changed]
+            feed.emit("scan", f"--diff {diff_base}: {len(files)} changed file(s) in scope")
     feed.emit("scan", f"Loaded {len(files)} source file(s)")
     mongo = MongoMirror()
     knowledge_query = " ".join(file.relative_path for file in files[:50])
@@ -72,7 +81,7 @@ def run_scan(
     elif target and static_only:
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
     if use_active:
-        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed, extra_endpoints=endpoints))
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(

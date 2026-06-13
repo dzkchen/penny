@@ -78,6 +78,29 @@ def discover_firebase_databases(files: Iterable[SourceFile]) -> list[str]:
     return sorted(found)
 
 
+def parse_endpoint_specs(specs: Iterable[str]) -> list[tuple[str, str]]:
+    """Parse user-supplied `--endpoint` values into (path, param) pairs.
+
+    Accepts `/api/users?id=1`, `/api/users?id`, or `/api/users?a=1&b=2` (one pair
+    per parameter). SPAs build URLs dynamically, so source discovery often finds
+    nothing — this lets the user point A001 at the endpoints they know exist.
+    """
+    endpoints: dict[tuple[str, str], None] = {}
+    for raw in specs:
+        spec = (raw or "").strip()
+        if not spec:
+            continue
+        path, _, query = spec.partition("?")
+        path = path or "/"
+        if not query:
+            continue
+        for clause in query.split("&"):
+            param = clause.split("=", 1)[0].strip()
+            if param:
+                endpoints[(path, param)] = None
+    return list(endpoints)
+
+
 def discover_query_endpoints(files: Iterable[SourceFile]) -> list[tuple[str, str]]:
     """Best-effort (path, param) pairs pulled from URL string literals in source."""
     endpoints: dict[tuple[str, str], None] = {}
@@ -214,6 +237,7 @@ def run_active_probes(
     *,
     i_own_this: bool,
     feed: EventFeed,
+    extra_endpoints: list[str] | None = None,
 ) -> list[Finding]:
     """Orchestrate every active probe. Opt-in; never raises into the scan."""
     feed.emit("attack", "Active mode: sending non-destructive probe requests")
@@ -225,7 +249,12 @@ def run_active_probes(
         findings.extend(probe_firebase_open_rules(database_url, i_own_this=i_own_this, feed=feed))
 
     if target:
-        endpoints = discover_query_endpoints(files)
+        discovered = discover_query_endpoints(files)
+        user_supplied = parse_endpoint_specs(extra_endpoints or [])
+        if user_supplied:
+            feed.emit("attack", f"Added {len(user_supplied)} endpoint(s) from --endpoint")
+        # Deduplicate while preserving order (user-supplied first).
+        endpoints = list(dict.fromkeys(user_supplied + discovered))
         if endpoints:
             try:
                 gate = TargetGate(target, i_own_this=i_own_this, max_requests=40)

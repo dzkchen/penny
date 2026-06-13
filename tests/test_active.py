@@ -5,6 +5,7 @@ from pathlib import Path
 from penny.active import (
     discover_firebase_databases,
     discover_query_endpoints,
+    parse_endpoint_specs,
     probe_sql_injection,
     run_firebase_open_rules_probe,
 )
@@ -82,3 +83,13 @@ def test_discovery_finds_firebase_url_and_query_endpoint() -> None:
 
     assert discover_firebase_databases(files) == ["https://fp-default-rtdb.firebaseio.com"]
     assert ("/api/search", "q") in discover_query_endpoints(files)
+
+
+def test_parse_endpoint_specs_handles_variants() -> None:
+    pairs = parse_endpoint_specs(["/api/users?id=1", "/search?q", "/multi?a=1&b=2", "", "/noquery"])
+    assert ("/api/users", "id") in pairs
+    assert ("/search", "q") in pairs
+    assert ("/multi", "a") in pairs
+    assert ("/multi", "b") in pairs
+    # No-query and blank specs are ignored (nothing to inject into).
+    assert all(path != "/noquery" for path, _ in pairs)

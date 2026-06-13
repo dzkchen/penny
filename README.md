@@ -38,11 +38,11 @@ Available commands: `/scan`, `/report`, `/findings`, `/show <id>`, `/target`, `/
 Replace the `<...>` placeholders with your own values (e.g. `--target http://localhost:3000`, `--out .`).
 
 ```bash
-python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>]
+python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
 python -m penny report [--findings <path>] [--out <dir>] [--export]
 python -m penny ask "question" [--findings <path>] [--target <url>] [--no-ai]
 python -m penny ask-loop [--findings <path>] [--target <url>] [--no-ai]
-python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>]
+python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
 python -m penny patch [--findings <path>] --repo <path> [--out penny.patch] [--apply]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends [--days 7] [--limit 10]
@@ -125,6 +125,20 @@ GitHub code scanning.
 
 ```bash
 python -m penny scan . --osv --fail-on high   # non-zero exit if any High+ finding
+```
+
+### Faster scans and targeted probes
+
+- `--diff <ref>` scans only files changed versus a git ref (committed, staged, unstaged,
+  and untracked), so PR/pre-commit runs stay fast. Falls back to a full scan when the path
+  is not a git tree or the ref does not resolve.
+- `--endpoint <path?param>` adds endpoints for active SQLi probing (repeatable). SPAs build
+  URLs dynamically, so source discovery often finds nothing — point A001 at the endpoints
+  you know exist, e.g. `--endpoint '/api/users?id=1' --endpoint '/search?q='`.
+
+```bash
+python -m penny scan . --diff main --osv --fail-on high
+python -m penny scan ./app --active --i-own-this --target https://app.example.com --endpoint '/api/users?id=1'
 ```
 
 The planted app includes a client-visible service-role key, a committed fake secret, a permissive RLS-style policy, a mock Supabase REST endpoint, a BOLA-style order endpoint, known-vulnerable dependency fixtures, and a permissive CORS header.
