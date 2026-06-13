@@ -165,3 +165,97 @@ def test_client_side_db_write_flagged_and_server_excluded() -> None:
 
     assert {f.location.file for f in d012} == {"src/lib/orders.ts", "src/hooks/useProfile.tsx"}
     assert all(f.severity == "High" for f in d012)
+
+
+def test_dataflow_detectors_fire_on_request_derived_sinks() -> None:
+    server = _source(
+        "server/app.py",
+        "\n".join(
+            [
+                "import requests",
+                "r = requests.get(request.args['url'])",
+                "data = open(request.args.get('f')).read()",
+                "return redirect(request.args.get('next'))",
+                "system_prompt = f'You are a bot. {request.args[\"q\"]}'",
+            ]
+        ),
+    )
+    by_id = {f.detector_id: f for f in run_detectors([server])}
+
+    assert "D014" in by_id  # SSRF
+    assert "D015" in by_id  # path traversal
+    assert "D019" in by_id  # open redirect
+    assert "D023" in by_id  # prompt injection
+    assert by_id["D023"].severity == "High"  # system-prompt build is High
+
+
+def test_dataflow_detectors_quiet_without_request_input() -> None:
+    # Constant / function-param sinks must not fire (precision over recall).
+    benign = _source(
+        "src/api.ts",
+        "\n".join(
+            [
+                "const r = await fetch(`/api/orders/${orderId}`);",
+                "const data = open('config.json');",
+                "res.redirect('/dashboard');",
+                "const prompt = `Summarize: ${doc.body}`;",
+            ]
+        ),
+    )
+
+    ids = {f.detector_id for f in run_detectors([benign])}
+    assert not ({"D014", "D015", "D019", "D023"} & ids)
+
+
+def test_insecure_jwt_and_crypto_detectors() -> None:
+    source = _source(
+        "server/auth.py",
+        "\n".join(
+            [
+                "claims = jwt.decode(token, verify=False)",
+                "opts = {'algorithms': ['none']}",
+                "import hashlib",
+                "pw_hash = hashlib.md5(password.encode())",
+                "cipher = AES.new(key, AES.MODE_ECB)",
+            ]
+        ),
+    )
+    findings = run_detectors([source])
+    d016 = {f.severity for f in findings if f.detector_id == "D016"}
+    d017 = [f for f in findings if f.detector_id == "D017"]
+
+    assert "Critical" in d016  # the 'none' algorithm
+    assert any(f.title.startswith("Weak hash") for f in d017)
+    assert any("ECB" in f.title for f in d017)
+
+
+def test_weak_hash_without_security_context_is_not_flagged() -> None:
+    # md5 of a non-sensitive value (cache key) is a common benign use.
+    source = _source("src/cache.py", "cache_key = hashlib.md5(url.encode()).hexdigest()\n")
+
+    assert [f.detector_id for f in run_detectors([source]) if f.detector_id == "D017"] == []
+
+
+def test_xss_sink_skips_static_markup() -> None:
+    source = _source(
+        "src/render.tsx",
+        "\n".join(
+            [
+                "el.innerHTML = userBio;",
+                "container.innerHTML = '';",
+                "card.innerHTML = '<hr>';",
+            ]
+        ),
+    )
+    d018 = [f for f in run_detectors([source]) if f.detector_id == "D018"]
+
+    # Only the dynamic assignment is flagged; empty and static-literal markup are not.
+    assert [f.location.line for f in d018] == [1]
+
+
+def test_jwt_verify_false_is_not_also_a_tls_finding() -> None:
+    source = _source("server/auth.py", "claims = jwt.decode(token, verify=False)\n")
+    ids = {f.detector_id for f in run_detectors([source])}
+
+    assert "D016" in ids
+    assert "D010" not in ids

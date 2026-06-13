@@ -34,6 +34,15 @@ AI_SYSTEM = (
     "broken authentication or authorization (IDOR/BOLA, missing ownership checks), injection "
     "(SQL/command/template), SSRF, unsafe deserialization, path traversal, insecure secret "
     "handling, unsafe redirects, and similar real risks. "
+    "Trace authorization across files: follow each route or handler through its middleware to "
+    "the data access, and flag any state-changing or data-returning endpoint that does not bind "
+    "the requested object to the authenticated caller (missing ownership checks / broken access "
+    "control), even when each individual line looks fine. "
+    "Because this is an AI-built app, also audit any LLM integration for the OWASP LLM Top 10: "
+    "prompt injection (untrusted input concatenated into prompts or system messages), insecure "
+    "output handling (model output flowing into SQL/shell/eval/HTML or an authorization decision), "
+    "tool/function-calling without authorization checks, SSRF or data exfiltration via model tool "
+    "use, system-prompt or secret leakage, and a model API key shipped to client-side code. "
     "Pay special attention to the client/server trust boundary. If the app performs "
     "authentication, authorization, or state-changing/data operations directly from "
     "client-side code — direct database/BaaS calls (Supabase, Firebase) or client-issued "
@@ -45,6 +54,22 @@ AI_SYSTEM = (
     "nits, TODOs, or speculative concerns. Prefer precision over recall — a wrong finding is "
     "worse than a missed one. Return your answer using the required JSON schema."
 )
+
+# Filenames/paths most likely to hold the trust-boundary, authz, and LLM-integration
+# logic worth spending the bounded char budget on. Files matching these are bundled
+# first so large repos don't truncate the security-relevant code away (see backlog).
+_PRIORITY_MARKERS = (
+    "auth", "login", "session", "middleware", "permission", "role", "acl",
+    "api", "route", "router", "handler", "endpoint", "controller", "server",
+    "db", "database", "query", "model", "supabase", "firebase", "firestore",
+    "prompt", "llm", "agent", "chat", "openai", "anthropic", "completion", "tool",
+)
+
+
+def _priority(file: SourceFile) -> int:
+    """Lower sorts first. Security-relevant files lead the bundle."""
+    lowered = file.relative_path.lower()
+    return 0 if any(marker in lowered for marker in _PRIORITY_MARKERS) else 1
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -148,7 +173,9 @@ def ai_review(files: list[SourceFile], *, feed: EventFeed | None = None) -> list
         if feed:
             feed.emit("ai", "AI review skipped (no ANTHROPIC_API_KEY)")
         return []
-    code_files = [file for file in files if file.path.suffix.lower() in CODE_EXTENSIONS][:MAX_FILES]
+    code_files = [file for file in files if file.path.suffix.lower() in CODE_EXTENSIONS]
+    # Stable sort keeps original order within each priority band.
+    code_files = sorted(code_files, key=_priority)[:MAX_FILES]
     if not code_files:
         return []
     bundle, included = _build_bundle(code_files)
@@ -168,3 +195,95 @@ def ai_review(files: list[SourceFile], *, feed: EventFeed | None = None) -> list
     if feed:
         feed.emit("ai", f"AI review surfaced {len(findings)} finding(s)")
     return findings
+
+
+TRIAGE_SYSTEM = (
+    "You triage candidate secret detections from a static scanner. Each candidate is a "
+    "high-entropy token flagged in source. Decide, for each, whether it is a REAL leaked "
+    "credential (API key, password, private token, connection string) or a BENIGN high-entropy "
+    "value (a hash/digest, content fingerprint, git SHA, UUID, public identifier, test fixture, "
+    "example/placeholder, or minified asset). Judge from the variable name and surrounding code, "
+    "not the token text (it is redacted). When genuinely unsure, treat it as a real secret. "
+    "Return your answer using the required JSON schema."
+)
+
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "index": {"type": "integer"},
+                    "is_secret": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "is_secret", "reason"],
+            },
+        }
+    },
+    "required": ["verdicts"],
+}
+
+
+def _context_lines(file: SourceFile | None, line: int, *, radius: int = 2) -> str:
+    if file is None:
+        return ""
+    lines = file.text.splitlines()
+    start = max(line - radius, 1)
+    end = min(line + radius, len(lines))
+    return "\n".join(redact_text(lines[i - 1]) for i in range(start, end + 1))
+
+
+def triage_secret_findings(
+    findings: list[Finding], files: list[SourceFile], *, feed: EventFeed | None = None
+) -> list[Finding]:
+    """Drop high-entropy ``D002`` findings a fast model judges to be benign.
+
+    Targets only the heuristic (confidence ``medium``) high-entropy hits — the
+    false-positive-prone ones — never the known-prefix secrets. Degrades to a
+    no-op when the LLM is unavailable, so it never weakens offline behavior.
+    """
+    if not llm.available():
+        return findings
+    candidates = [
+        (index, finding)
+        for index, finding in enumerate(findings)
+        if finding.detector_id == "D002" and finding.confidence == "medium"
+    ]
+    if not candidates:
+        return findings
+    by_path = {file.relative_path: file for file in files}
+    blocks = []
+    for ordinal, (_, finding) in enumerate(candidates):
+        context = _context_lines(by_path.get(finding.location.file), finding.location.line)
+        blocks.append(f"[{ordinal}] {finding.location.file}:{finding.location.line}\n{context}")
+    if feed:
+        feed.emit("ai", f"Triaging {len(candidates)} high-entropy token(s) with {llm.fast_model()}")
+    prompt = (
+        "Classify each candidate below as a real secret or benign. Use the bracketed index.\n\n"
+        + "\n\n".join(blocks)
+    )
+    raw = llm.complete(prompt, system=TRIAGE_SYSTEM, deep=False, max_tokens=1024, response_schema=TRIAGE_SCHEMA)
+    if not raw:
+        return findings
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return findings
+    benign_ordinals: set[int] = set()
+    for verdict in data.get("verdicts", []) if isinstance(data, dict) else []:
+        if isinstance(verdict, dict) and verdict.get("is_secret") is False:
+            try:
+                benign_ordinals.add(int(verdict["index"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    drop = {candidates[ordinal][0] for ordinal in benign_ordinals if 0 <= ordinal < len(candidates)}
+    if not drop:
+        return findings
+    if feed:
+        feed.emit("ai", f"Secret triage dismissed {len(drop)} false-positive high-entropy token(s)")
+    return [finding for index, finding in enumerate(findings) if index not in drop]
