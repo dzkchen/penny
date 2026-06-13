@@ -551,11 +551,25 @@ class Session:
 
         attack_type = args[0] if args else None
         target = self.target
-        for a in args[1:]:
-            if not a.startswith("-"):
+        kwargs: dict[str, str] = {}
+        tokens = iter(args[1:])
+        for a in tokens:
+            if a == "--key":
+                kwargs["apikey"] = next(tokens, "")
+            elif a == "--tables":
+                kwargs["tables"] = next(tokens, "")
+            elif a == "--supabase-url":
+                kwargs["supabase_url"] = next(tokens, "")
+            elif a == "--login-url":
+                kwargs["login_url"] = next(tokens, "")
+            elif a == "--creds":
+                kwargs["creds"] = next(tokens, "")
+            elif not a.startswith("-"):
                 target = a
         if not attack_type:
-            self.out(ui.dim(f"Usage: /cloud-attack <type> [target]   types: {', '.join(available_attacks())}"))
+            self.out(ui.dim(f"Usage: /cloud-attack <type> [target] [opts]   types: {', '.join(available_attacks())}"))
+            self.out(ui.dim("  supabase-dump opts: --supabase-url <url> --key <anon/service key> --tables a,b,c"))
+            self.out(ui.dim("  cred-stuffing opts: --login-url <url> --creds user:pass,user:pass"))
             return
         if not target:
             self._warn("No target set. Use /target <url> first.")
@@ -565,6 +579,7 @@ class Session:
             attack_type, target,
             i_own_this=self.i_own_this, feed=feed,
             keep_alive="--destroy" not in args,
+            **kwargs,
         )
         if findings:
             self.out(ui.style(f"Cloud attack produced {len(findings)} finding(s).", "bright_green"))
