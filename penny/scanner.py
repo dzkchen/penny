@@ -26,6 +26,7 @@ def run_scan(
     static_only: bool = False,
     out_dir: Path = Path("."),
     i_own_this: bool = False,
+    agentic: bool = False,
     feed: EventFeed | None = None,
     source_label: str | None = None,
 ) -> ScanResult:
@@ -51,6 +52,10 @@ def run_scan(
         confirm_service_key_read(findings, target, i_own_this=i_own_this, feed=feed)
         confirm_bola_order_access(findings, target, i_own_this=i_own_this, feed=feed)
         confirm_cors_policy(findings, target, i_own_this=i_own_this, feed=feed)
+        if agentic:
+            from .agentic import run_agentic_probe_from_files
+
+            findings.extend(run_agentic_probe_from_files(files, target, i_own_this=i_own_this, feed=feed))
     elif target and static_only:
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
     findings = assign_finding_ids(findings)
