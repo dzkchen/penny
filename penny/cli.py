@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from . import llm
 from .agent_fix import run_agent_fix
 from .ask import answer_question
 from .exports import write_exports
@@ -40,8 +41,16 @@ def _fail(message: str) -> None:
     raise SystemExit(2)
 
 
-def _ask_loop(findings: Path, target: str | None, i_own_this: bool, feed: EventFeed) -> None:
+def _ask_loop(
+    findings: Path,
+    target: str | None,
+    i_own_this: bool,
+    feed: EventFeed,
+    use_llm: bool = False,
+) -> None:
     feed.emit("purple", "Interactive ask mode. Type 'exit' or 'quit' to stop.")
+    if use_llm:
+        feed.emit("purple", llm.describe())
     while True:
         try:
             question = input("penny> ").strip()
@@ -51,7 +60,16 @@ def _ask_loop(findings: Path, target: str | None, i_own_this: bool, feed: EventF
             continue
         if question.lower() in {"exit", "quit", ":q"}:
             break
-        feed.emit("purple", answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this))
+        feed.emit(
+            "purple",
+            answer_question(
+                question,
+                findings_path=findings,
+                target=target,
+                i_own_this=i_own_this,
+                use_llm=use_llm,
+            ),
+        )
 
 
 def _patch_command(findings: Path, repo: Path, out: Path, apply: bool, feed: EventFeed) -> None:
@@ -98,11 +116,16 @@ def _build_typer_app():
         static_only: bool = typer.Option(False, "--static-only"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories."),
+        ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
+        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks."),
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
+        brute: bool = typer.Option(False, "--brute", help="Run a small wordlist brute-force of common paths/logins (owned targets only)."),
+        browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
     ) -> None:
         try:
             with resolved_scan_source(path) as resolved:
-                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, agentic=agentic, feed=EventFeed(), source_label=path)
+                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path, use_osv=osv, use_ai=ai, use_active=active, agentic=agentic, brute=brute, browser=browser)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
 
@@ -120,17 +143,25 @@ def _build_typer_app():
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
         feed = EventFeed()
-        feed.emit("purple", answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this))
+        use_llm = not no_ai
+        if use_llm:
+            feed.emit("purple", llm.describe())
+        feed.emit(
+            "purple",
+            answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this, use_llm=use_llm),
+        )
 
     @app.command("ask-loop")
     def ask_loop(
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
-        _ask_loop(findings, target, i_own_this, EventFeed())
+        _ask_loop(findings, target, i_own_this, EventFeed(), use_llm=not no_ai)
 
     @app.command()
     def patch(
@@ -198,12 +229,17 @@ def _build_typer_app():
         target: str = typer.Option(..., "--target"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories."),
+        ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
+        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks."),
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
+        brute: bool = typer.Option(False, "--brute", help="Run a small wordlist brute-force of common paths/logins (owned targets only)."),
+        browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, agentic=agentic, feed=feed, source_label=path)
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, agentic=agentic, brute=brute, browser=browser)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed)
@@ -228,7 +264,12 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--static-only", action="store_true")
     scan_parser.add_argument("--out", type=Path, default=Path("."))
     scan_parser.add_argument("--i-own-this", action="store_true")
+    scan_parser.add_argument("--osv", action="store_true")
+    scan_parser.add_argument("--ai", action="store_true")
+    scan_parser.add_argument("--active", action="store_true")
     scan_parser.add_argument("--agentic", action="store_true")
+    scan_parser.add_argument("--brute", action="store_true")
+    scan_parser.add_argument("--browser", action="store_true")
 
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=Path("findings.json"))
@@ -240,11 +281,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     ask_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_parser.add_argument("--target")
     ask_parser.add_argument("--i-own-this", action="store_true")
+    ask_parser.add_argument("--no-ai", action="store_true")
 
     ask_loop_parser = sub.add_parser("ask-loop")
     ask_loop_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_loop_parser.add_argument("--target")
     ask_loop_parser.add_argument("--i-own-this", action="store_true")
+    ask_loop_parser.add_argument("--no-ai", action="store_true")
 
     patch_parser = sub.add_parser("patch")
     patch_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
@@ -277,7 +320,12 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--target", required=True)
     run_parser.add_argument("--out", type=Path, default=Path("."))
     run_parser.add_argument("--i-own-this", action="store_true")
+    run_parser.add_argument("--osv", action="store_true")
+    run_parser.add_argument("--ai", action="store_true")
+    run_parser.add_argument("--active", action="store_true")
     run_parser.add_argument("--agentic", action="store_true")
+    run_parser.add_argument("--brute", action="store_true")
+    run_parser.add_argument("--browser", action="store_true")
 
     replay_parser = sub.add_parser("demo-replay")
     replay_parser.add_argument("--recording", type=Path)
@@ -288,15 +336,21 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, agentic=args.agentic, feed=feed, source_label=args.path)
+                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, agentic=args.agentic, brute=args.brute, browser=args.browser)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
     elif args.command == "report":
         _report_command(args.findings, args.out, feed, export=args.export)
     elif args.command == "ask":
-        feed.emit("purple", answer_question(args.question, findings_path=args.findings, target=args.target, i_own_this=args.i_own_this))
+        use_llm = not args.no_ai
+        if use_llm:
+            feed.emit("purple", llm.describe())
+        feed.emit(
+            "purple",
+            answer_question(args.question, findings_path=args.findings, target=args.target, i_own_this=args.i_own_this, use_llm=use_llm),
+        )
     elif args.command == "ask-loop":
-        _ask_loop(args.findings, args.target, args.i_own_this, feed)
+        _ask_loop(args.findings, args.target, args.i_own_this, feed, use_llm=not args.no_ai)
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "fix":
@@ -325,7 +379,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "run":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, agentic=args.agentic, feed=feed, source_label=args.path)
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, agentic=args.agentic, brute=args.brute, browser=args.browser)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)
@@ -334,6 +388,12 @@ def _fallback_main(argv: list[str] | None = None) -> None:
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("repl", "shell"):
+        from .repl import run_repl
+
+        run_repl()
+        return
     try:
         app = _build_typer_app()
     except Exception:

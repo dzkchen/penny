@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .detectors import run_detectors
+from .active import run_active_probes
+from .advisories import lookup as osv_lookup
+from .ai_review import ai_review
+from .detectors import detect_dependencies_via_advisories, run_detectors
 from .feed import EventFeed
 from .models import assign_finding_ids, now_session_id
 from .mongo import MongoMirror
@@ -27,8 +30,13 @@ def run_scan(
     out_dir: Path = Path("."),
     i_own_this: bool = False,
     agentic: bool = False,
+    brute: bool = False,
+    browser: bool = False,
     feed: EventFeed | None = None,
     source_label: str | None = None,
+    use_osv: bool = False,
+    use_ai: bool = False,
+    use_active: bool = False,
 ) -> ScanResult:
     feed = feed or EventFeed()
     session_id = now_session_id()
@@ -46,6 +54,13 @@ def run_scan(
     elif patterns:
         feed.emit("mongo", f"Knowledge search returned {len(patterns)} generic pattern(s)")
     findings = run_detectors(files)
+    if use_osv:
+        advisory_findings = detect_dependencies_via_advisories(files, osv_lookup)
+        findings = [finding for finding in findings if finding.detector_id != "D005"] + advisory_findings
+        package_count = advisory_findings[0].evidence.get("package_count", 0) if advisory_findings else 0
+        feed.emit("osv", f"OSV review: {package_count} vulnerable dependency package(s)")
+    if use_ai:
+        findings.extend(ai_review(files, feed=feed))
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
@@ -58,6 +73,16 @@ def run_scan(
             findings.extend(run_agentic_probe_from_files(files, target, i_own_this=i_own_this, feed=feed))
     elif target and static_only:
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
+    if use_active:
+        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed))
+    if target and not static_only and brute:
+        from .bruteforce import run_brute_force
+
+        findings.extend(run_brute_force(target, i_own_this=i_own_this, feed=feed))
+    if target and not static_only and browser:
+        from .browser import run_browser_probe
+
+        findings.extend(run_browser_probe(target, i_own_this=i_own_this, feed=feed))
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(

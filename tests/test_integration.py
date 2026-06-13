@@ -37,7 +37,7 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     assert bola_finding["evidence"]["dynamic_probe"]["cross_user_order_id"] == "1002"
     cors_finding = next(finding for finding in payload["findings"] if finding["detector_id"] == "D006")
     assert cors_finding["status"] == "confirmed"
-    assert payload["summary"]["total"] == 7
+    assert payload["summary"]["total"] == 6  # vulnerable deps collapse into one finding
     assert payload["summary"]["confirmed_count"] == 3
 
     combined_output = (tmp_path / "findings.json").read_text(encoding="utf-8") + (tmp_path / "report.md").read_text(encoding="utf-8")

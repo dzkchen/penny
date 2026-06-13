@@ -1,15 +1,11 @@
-"""Optional live-LLM layer for Penny.
+"""Anthropic client + Penny's AI helpers (merged: feat's API client + RAG/fix layer).
 
-Design rules (must not break the safety model):
-- The LLM only ever receives ALREADY-REDACTED findings JSON. Raw secrets never reach it.
-- The LLM never performs I/O: it does not read files, run shell, or make HTTP requests.
-- Every LLM call has a deterministic fallback, so the core demo runs with no API key.
-- Anything the LLM returns is passed through redaction again before display, in case
-  it echoes a value back.
-
-The LLM's job is purely linguistic: explain findings, write the narrative parts of the
-report, and answer questions in natural language. The deterministic Python remains the
-source of truth for detection, confirmation, and structured fixes.
+Design rules (safety):
+- LLM helpers that summarize findings only receive ALREADY-REDACTED findings JSON.
+- The fix helper receives real local file contents (needed to patch), but only at the
+  user's explicit request and its output is shown as a diff for approval.
+- Every call degrades to deterministic output when no key / on any error.
+- Talks to the API over httpx (already a dependency); no SDK required.
 """
 
 from __future__ import annotations
@@ -19,78 +15,143 @@ from pathlib import Path
 
 from .redaction import redact_text
 
+DEFAULT_DEEP_MODEL = "claude-sonnet-4-6"
+DEFAULT_FAST_MODEL = "claude-sonnet-4-6"
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_BASE_URL = "https://api.anthropic.com"
 
-def _load_dotenv(path: Path = Path(".env")) -> None:
-    if not path.exists():
+_DOTENV_LOADED = False
+
+
+def _load_dotenv(path: Path | None = None) -> None:
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
         return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
+    _DOTENV_LOADED = True
+    env_path = path or Path(".env")
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
-def _api_key() -> str | None:
+def api_key() -> str | None:
     _load_dotenv()
     if os.environ.get("PENNY_DISABLE_LLM") == "1":
         return None
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    # Reject obvious placeholder values so a half-filled .env doesn't pretend to work.
     if not key or "your-key" in key or "your-real-key" in key:
         return None
     return key
 
 
-# Defaults chosen for hackathon demos: fast + inexpensive so runs stay well under the
-# 90s target and don't burn budget. Override with PENNY_DEEP_MODEL / PENNY_FAST_MODEL.
-def _model() -> str:
-    _load_dotenv()
-    return os.environ.get("PENNY_DEEP_MODEL", "").strip() or "claude-sonnet-4-6"
+# Backwards-compatible alias used by the RAG/agentic modules.
+def _api_key() -> str | None:
+    return api_key()
 
 
-def _fast_model() -> str:
-    _load_dotenv()
-    return os.environ.get("PENNY_FAST_MODEL", "").strip() or "claude-sonnet-4-6"
+def available() -> bool:
+    return api_key() is not None
 
 
 def llm_available() -> bool:
-    """True if a usable Anthropic key is configured and the SDK is importable."""
-    if _api_key() is None:
-        return False
-    try:
-        import anthropic  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return api_key() is not None
 
 
-def _call(system: str, user: str, *, fast: bool = False, max_tokens: int = 1024) -> str | None:
-    """Single Claude call. Returns redacted text, or None on any failure/no-key."""
-    key = _api_key()
+def deep_model() -> str:
+    _load_dotenv()
+    return os.environ.get("PENNY_DEEP_MODEL", "").strip() or DEFAULT_DEEP_MODEL
+
+
+def fast_model() -> str:
+    _load_dotenv()
+    return os.environ.get("PENNY_FAST_MODEL", "").strip() or DEFAULT_FAST_MODEL
+
+
+def _model() -> str:
+    return deep_model()
+
+
+def complete(
+    prompt: str,
+    *,
+    system: str | None = None,
+    deep: bool = True,
+    max_tokens: int = 1024,
+    timeout: float = 30.0,
+    response_schema: dict | None = None,
+) -> str | None:
+    """Return Claude's text answer, or None if the call cannot be made."""
+    key = api_key()
     if key is None:
         return None
     try:
-        import anthropic
-    except Exception:
+        import httpx
+    except ImportError:
         return None
+
+    body: dict[str, object] = {
+        "model": deep_model() if deep else fast_model(),
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+        body["system"] = system
+    if response_schema is not None:
+        body["output_config"] = {"format": {"type": "json_schema", "schema": response_schema}}
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     try:
-        client = anthropic.Anthropic(api_key=key)
-        response = client.messages.create(
-            model=_fast_model() if fast else _model(),
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        response = httpx.post(
+            f"{base_url}/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
         )
-        parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
-        text = "\n".join(parts).strip()
-        if not text:
-            return None
-        # Defense in depth: redact anything the model echoes back.
-        return redact_text(text)
+        response.raise_for_status()
+        data = response.json()
     except Exception:
         return None
 
+    if not isinstance(data, dict):
+        return None
+    blocks = data.get("content", [])
+    text = "".join(
+        block.get("text", "")
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    ).strip()
+    return text or None
+
+
+def describe() -> str:
+    if not available():
+        return "AI disabled (no ANTHROPIC_API_KEY); using deterministic answers"
+    return f"AI enabled via {deep_model()}"
+
+
+def _call(system: str, user: str, *, fast: bool = False, max_tokens: int = 1024) -> str | None:
+    """Single Claude call returning redacted text, or None. Used by RAG helpers."""
+    result = complete(user, system=system, deep=not fast, max_tokens=max_tokens)
+    return redact_text(result) if result else None
+
+
+# ---------------------------------------------------------------------------
+# RAG-grounded helpers (ask answer, verdict) and the code-fix helper
+# ---------------------------------------------------------------------------
 
 _ASK_SYSTEM = (
     "You are Penny, the Purple-Team agent of a consented security audit tool. "
@@ -104,7 +165,6 @@ _ASK_SYSTEM = (
 
 
 def _rag_block(retrieved: list[dict] | None) -> str:
-    """Format Mongo vector-search hits as a retrieval context block for the prompt."""
     if not retrieved:
         return ""
     lines = []
@@ -119,11 +179,6 @@ def _rag_block(retrieved: list[dict] | None) -> str:
 
 
 def llm_answer(question: str, findings_json: str, *, deterministic: str, retrieved: list[dict] | None = None) -> str:
-    """Augment the deterministic ask answer with an LLM explanation when available.
-
-    When `retrieved` (Mongo vector-search hits) is provided, this is true RAG: the model
-    generates grounded in patterns recalled from the vector knowledge base.
-    """
     user = (
         f"{_rag_block(retrieved)}"
         f"REDACTED FINDINGS JSON:\n{findings_json}\n\n"
@@ -144,7 +199,6 @@ _VERDICT_SYSTEM = (
 
 
 def llm_verdict(findings_json: str, *, deterministic: str, retrieved: list[dict] | None = None) -> str:
-    """Replace the one-line template verdict with a richer LLM narrative when available."""
     user = (
         f"{_rag_block(retrieved)}"
         f"REDACTED FINDINGS JSON:\n{findings_json}\n\n"
@@ -170,19 +224,8 @@ _FIX_SYSTEM = (
 
 
 def llm_fix_file(relative_path: str, file_contents: str, findings_for_file: str) -> str | None:
-    """Ask Claude for a corrected whole-file version. Returns new contents, or None.
-
-    Note: unlike the redacted findings sent elsewhere, the fix agent needs the REAL file
-    contents to produce a working patch. This runs only on the user's LOCAL files at their
-    explicit request (penny patch), never on third-party data, and its output is shown as a
-    diff for approval before anything is written.
-    """
-    key = _api_key()
-    if key is None:
-        return None
-    try:
-        import anthropic
-    except Exception:
+    """Ask Claude for a corrected whole-file version. Returns new contents, or None."""
+    if api_key() is None:
         return None
     user = (
         f"FILE PATH: {relative_path}\n\n"
@@ -190,24 +233,14 @@ def llm_fix_file(relative_path: str, file_contents: str, findings_for_file: str)
         f"CURRENT FILE CONTENTS:\n<<<PENNY_FILE_START>>>\n{file_contents}\n<<<PENNY_FILE_END>>>\n\n"
         "Return the corrected whole file between the markers."
     )
-    try:
-        client = anthropic.Anthropic(api_key=key)
-        response = client.messages.create(
-            model=_model(),
-            max_tokens=8192,
-            system=_FIX_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-        )
-        parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
-        text = "\n".join(parts)
-    except Exception:
+    text = complete(user, system=_FIX_SYSTEM, deep=True, max_tokens=8192)
+    if not text:
         return None
     start = text.find("<<<PENNY_FILE_START>>>")
     end = text.find("<<<PENNY_FILE_END>>>")
     if start == -1 or end == -1 or end <= start:
         return None
     fixed = text[start + len("<<<PENNY_FILE_START>>>") : end]
-    # Strip a single leading/trailing newline introduced by the markers.
     if fixed.startswith("\n"):
         fixed = fixed[1:]
     if fixed.endswith("\n"):
