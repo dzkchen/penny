@@ -10,3 +10,6 @@ dist/
 .penny/
 findings.json
 report.md
+
+next-vuln-fixture/.next/
+next-vuln-fixture/node_modules/

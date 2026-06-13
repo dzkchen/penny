@@ -49,6 +49,18 @@ scan/audit flags:  --target <url>  --active  --brute  --browser  --agentic
 Natural language works too: "pentest this app", "audit ./planted-app", "fix the issues",
 or just ask a question. For a live site you own:  /target <url>   /own on   /audit ."""
 
+STARTER_EXAMPLE = """\
+Start with natural language or a slash command.
+
+Example
+"Run a full audit on ./file_path --target https://your-app.example --active --osv --ai"
+
+Common commands
+/audit   /scan   /findings   /report   /fix
+
+/help shows the full command list.
+/exit leaves Penny."""
+
 
 class PrettyFeed(EventFeed):
     """Feed that renders scan progress as styled lines (skips per-finding spam)."""
@@ -112,15 +124,9 @@ class Session:
             f"{ui.dim('version')} {__version__}    {ui.dim('cwd')} {os.getcwd()}",
             f"{ui.dim('AI')} " + (f"on · {llm.deep_model()}" if self.use_ai else "off (set ANTHROPIC_API_KEY)"),
         ]
-        if self.payload:
-            total = self.payload.get("summary", {}).get("total", 0)
-            lines.append(f"{ui.dim('loaded')} {total} finding(s) from {self.findings_path}")
-        else:
-            lines.append(ui.dim("no findings yet — run /scan <path>"))
         self.out(ui.panel("\n".join(lines), title="Penny — purple-team assistant for AI-built apps", color="magenta"))
         self.out()
-        # Show the command menu up front so the REPL is self-explanatory on launch.
-        self._help()
+        self.out(ui.panel(STARTER_EXAMPLE, title="How To Use", color="cyan"))
         self.out()
 
     def _help(self) -> None:

@@ -81,7 +81,13 @@ def github_fix_roundtrip(
     changed = run_agent_fix(payload, clone_dir, feed=feed, auto_yes=auto_yes)
     if not changed:
         feed.emit("blue", "No fixes applied; nothing to commit")
-        return {"clone_dir": str(clone_dir), "changed": [], "committed": False, "pushed": False}
+        return {
+            "clone_dir": str(clone_dir),
+            "changed": [],
+            "committed": False,
+            "pushed": False,
+            "scan_payload": result.payload,
+        }
 
     # Stage and commit on the fix branch.
     _run_git(["add", "-A"], cwd=clone_dir)
@@ -104,4 +110,5 @@ def github_fix_roundtrip(
         "committed": True,
         "pushed": pushed,
         "branch": branch,
+        "scan_payload": result.payload,
     }

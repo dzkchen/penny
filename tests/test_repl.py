@@ -30,6 +30,17 @@ def test_help_lists_commands(tmp_path, monkeypatch) -> None:
     assert "/scan" in text and "/exit" in text
 
 
+def test_greet_shows_recommended_prompt_without_loaded_state(tmp_path, monkeypatch) -> None:
+    session, captured = _session(tmp_path, monkeypatch)
+    session.greet()
+    text = "\n".join(captured)
+    assert "How To Use" in text
+    assert "Run a full audit on ./file_path" in text
+    assert "/help shows the full command list." in text
+    assert "loaded" not in text
+    assert "Commands" not in text
+
+
 def test_findings_table_and_show(tmp_path, monkeypatch) -> None:
     session, captured = _session(tmp_path, monkeypatch)
     session.handle("/findings")
