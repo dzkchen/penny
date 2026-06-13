@@ -35,6 +35,10 @@ HELP = """\
 /own <on|off>                     confirm you OWN the target (needed for public URLs)
 /ai <on|off>                      toggle AI answers/review
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
+/cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
+/boxes                            list active cloud boxes + auto-destroy timers
+/kill                             stop running cloud attacks (keep boxes)
+/destroy                          destroy all cloud boxes now
 /clear   /help   /exit
 
 scan/audit flags:  --target <url>  --active  --brute  --browser  --agentic
@@ -291,6 +295,14 @@ class Session:
             self._set_own(args)
         elif cmd == "target":
             self._set_target(args)
+        elif cmd in ("cloud", "cloud-attack"):
+            self._cloud_attack(args)
+        elif cmd in ("boxes", "attack-status"):
+            self._cloud_status()
+        elif cmd == "kill":
+            self._cloud_kill()
+        elif cmd == "destroy":
+            self._cloud_destroy()
         else:
             self._error(f"Unknown command: /{cmd}") if cmd else None
             self.out(ui.dim("Try /help."))
@@ -531,6 +543,43 @@ class Session:
             return
         self.target = args[0]
         self.out(ui.style(f"Probe target set: {self.target}", "green"))
+
+    # ---- cloud (Vultr) tier ----------------------------------------------
+    def _cloud_attack(self, args: list[str]) -> None:
+        from .cloud import cloud_attack
+        from .cloud_attacks import available_attacks
+
+        attack_type = args[0] if args else None
+        target = self.target
+        for a in args[1:]:
+            if not a.startswith("-"):
+                target = a
+        if not attack_type:
+            self.out(ui.dim(f"Usage: /cloud-attack <type> [target]   types: {', '.join(available_attacks())}"))
+            return
+        if not target:
+            self._warn("No target set. Use /target <url> first.")
+            return
+        feed = PrettyFeed(self.printer)
+        findings = cloud_attack(
+            attack_type, target,
+            i_own_this=self.i_own_this, feed=feed,
+            keep_alive="--destroy" not in args,
+        )
+        if findings:
+            self.out(ui.style(f"Cloud attack produced {len(findings)} finding(s).", "bright_green"))
+
+    def _cloud_status(self) -> None:
+        from .cloud import status
+        status(PrettyFeed(self.printer))
+
+    def _cloud_kill(self) -> None:
+        from .cloud import kill_all
+        kill_all(PrettyFeed(self.printer))
+
+    def _cloud_destroy(self) -> None:
+        from .cloud import destroy_all
+        destroy_all(PrettyFeed(self.printer))
 
     def _knowledge(self, args: list[str]) -> None:
         from .mongo import MongoMirror
