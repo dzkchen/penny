@@ -31,15 +31,17 @@ HELP = """\
 /fix [--yes]                      fix flagged files with approval (Claude rewrites them)
 /findings                         list the current findings
 /show <F-001>                     show one finding in detail
-/target <url|off>                 set the dynamic-probe target
+/target <url|off>                 set the live target to attack/probe
+/own <on|off>                     confirm you OWN the target (needed for public URLs)
 /ai <on|off>                      toggle AI answers/review
-/model <auto|haiku|sonnet>        pick the Claude model mode (auto = Haiku chat + Sonnet work)
-/clear                            clear the screen
-/help                             show this help
-/exit                             leave
+/model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
+/clear   /help   /exit
 
-Natural language works too: "pentest this app", "run a full audit on ./planted-app",
-"fix the issues", or just ask a question about the findings."""
+scan/audit flags:  --target <url>  --active  --brute  --browser  --agentic
+                   --osv  --ai  --static-only  --i-own-this
+
+Natural language works too: "pentest this app", "audit ./planted-app", "fix the issues",
+or just ask a question. For a live site you own:  /target <url>   /own on   /audit ."""
 
 
 class PrettyFeed(EventFeed):
@@ -63,7 +65,10 @@ class Session:
         self.payload: dict[str, Any] | None = None
         self.findings_path: Path | None = None
         self.target: str | None = None
-        self.i_own_this = False
+        # Default ownership from .env (PENNY_I_OWN_THIS=1) so you never retype it.
+        # Still env-gated, not silently always-on, so it stays a conscious choice.
+        llm._load_dotenv()
+        self.i_own_this = os.environ.get("PENNY_I_OWN_THIS", "").strip() in ("1", "true", "yes")
         self.use_ai = llm.available()
         self._autoload()
 
@@ -201,6 +206,8 @@ class Session:
             self._toggle_ai(args)
         elif cmd == "model":
             self._set_model(args)
+        elif cmd == "own":
+            self._set_own(args)
         elif cmd == "target":
             self._set_target(args)
         else:
@@ -413,6 +420,15 @@ class Session:
             self._warn(str(error))
             return
         self.out(ui.style(f"✓ {llm.describe_model_mode()}", "green"))
+
+    def _set_own(self, args: list[str]) -> None:
+        want = args[0].lower() if args else ("off" if self.i_own_this else "on")
+        if want == "on":
+            self.i_own_this = True
+            self.out(ui.style("✓ Ownership confirmed — public targets can now be probed (only test what you own).", "yellow"))
+        else:
+            self.i_own_this = False
+            self.out(ui.dim("Ownership off — only localhost/private targets allowed."))
 
     def _set_target(self, args: list[str]) -> None:
         if not args or args[0].lower() == "off":
