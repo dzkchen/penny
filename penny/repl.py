@@ -173,32 +173,37 @@ class Session:
             self._findings()
             return True
 
-        # --- fix ---
-        if "fix" in low:
-            self._fix(["--yes"] if ("just" in low or "all" in low or "auto" in low) else [])
+        # Questions (start with a question word or end with '?') are NEVER actions —
+        # they go to ask-mode so "what should blue fix first?" stays a question.
+        is_question = low.strip().endswith("?") or low.split()[:1] and low.split()[0] in (
+            "what", "why", "how", "is", "are", "should", "can", "does", "do", "which", "who", "when", "where",
+        )
+
+        # --- fix (imperative only) ---
+        if not is_question and ("fix the" in low or "fix it" in low or "fix them" in low or low.strip() in ("fix", "apply fixes", "fix everything")):
+            self._fix(["--yes"] if ("just" in low or "all" in low or "auto" in low or "everything" in low) else [])
             return True
 
         # --- report / export ---
-        if "report" in low or "export" in low:
+        if not is_question and ("report" in low or "export" in low):
             self._report(["--export"] if "export" in low else [])
             return True
 
         # --- knowledge base / RAG lookup ---
-        if "knowledge" in low or "similar" in low or "have you seen" in low:
+        if not is_question and ("knowledge base" in low or "similar findings" in low):
             self._knowledge([line])
             return True
 
-        # --- full audit (broad) ---
+        # --- full audit (broad, imperative only) ---
         audit_words = ("pentest", "pen test", "audit", "full scan", "run everything", "test this", "attack", "hack")
-        if any(word in low for word in audit_words):
-            extra = []
+        if not is_question and any(word in low for word in audit_words):
             if url:
                 self._set_target([url])
             self._audit([path] if path else [])
             return True
 
         # --- plain scan ---
-        if ("scan" in low or "check" in low) and (path or url):
+        if not is_question and ("scan" in low or "check" in low) and (path or url):
             if url:
                 self._set_target([url])
             self._scan([path] if path else [])
