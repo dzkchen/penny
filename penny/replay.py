@@ -68,7 +68,6 @@ def run_demo_replay(*, recording: Path | None = None, out_dir: Path = Path("."),
     latest_dir = store.latest_dir()
     latest_dir.mkdir(parents=True, exist_ok=True)
     (latest_dir / "findings.json").write_text(findings_path.read_text(encoding="utf-8"), encoding="utf-8")
-    (out_dir / "findings.json").write_text(findings_path.read_text(encoding="utf-8"), encoding="utf-8")
     report_path = store.write_report(session_id, generate_report(payload))
     feed.emit("report", f"Wrote {report_path}")
     return findings_path, report_path

@@ -65,8 +65,7 @@ class FindingsStore:
         payload = build_findings_payload(session_id, findings, scan=scan)
         run_path = self.run_dir(session_id) / "findings.json"
         latest_path = self.latest_dir() / "findings.json"
-        root_path = self.out_dir / "findings.json"
-        for path in (run_path, latest_path, root_path):
+        for path in (run_path, latest_path):
             _write_json(path, payload)
         return payload, run_path
 
@@ -74,8 +73,7 @@ class FindingsStore:
         report_markdown = report_markdown.rstrip() + "\n"
         run_path = self.run_dir(session_id) / "report.md"
         latest_path = self.latest_dir() / "report.md"
-        root_path = self.out_dir / "report.md"
-        for path in (run_path, latest_path, root_path):
+        for path in (run_path, latest_path):
             _write_text(path, report_markdown)
         return run_path
 

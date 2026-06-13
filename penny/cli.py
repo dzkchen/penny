@@ -9,7 +9,6 @@ from . import llm
 from .agent_fix import run_agent_fix
 from .ask import answer_question
 from .models import SEVERITY_ORDER
-from .exports import write_exports
 from .feed import EventFeed
 from .mongo import MongoMirror
 from .patches import apply_patch_plans, write_patch_file
@@ -23,25 +22,16 @@ from .store import FindingsStore, copy_report_to_findings_dir
 def _resolve_findings_path(findings: Path | None, out_dir: Path) -> Path:
     """Resolve which findings file `report` should read.
 
-    When `--findings` is not given explicitly, look inside the `--out` run tree
-    first (`<out>/.penny/runs/latest/findings.json`, then `<out>/findings.json`)
-    so `scan --out X` followed by `report --out X` reports the same run. Falls
-    back to `findings.json` in the current directory for backwards compatibility.
+    When `--findings` is not given explicitly, read the latest run under `--out`
+    (`<out>/.penny/runs/latest/findings.json`) so `scan --out X` followed by
+    `report --out X` reports the same run.
     """
     if findings is not None:
         return findings
-    candidates = [
-        out_dir / ".penny" / "runs" / "latest" / "findings.json",
-        out_dir / "findings.json",
-        Path("findings.json"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
+    return out_dir / ".penny" / "runs" / "latest" / "findings.json"
 
 
-def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: bool = False) -> Path:
+def _report_command(findings: Path, out_dir: Path, feed: EventFeed) -> Path:
     payload = load_findings(findings)
     session_id = payload.get("session_id", "manual-report")
     feed.emit("blue", "Writing report with concrete fixes")
@@ -51,11 +41,6 @@ def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: b
     verdict = report.split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip()
     feed.emit("purple", f"Verdict: {verdict}")
     feed.emit("report", f"Wrote {report_path}")
-    if export:
-        paths = write_exports(payload, report, out_dir)
-        feed.emit("report", f"Wrote {paths['html']}")
-        feed.emit("report", f"Wrote {paths['csv']}")
-        feed.emit("report", f"Wrote {paths['sarif']}")
     return report_path
 
 
@@ -201,9 +186,8 @@ def _build_typer_app():
     def report(
         findings: Optional[Path] = typer.Option(None, "--findings", help="Defaults to the latest run under --out."),
         out: Path = typer.Option(Path("."), "--out"),
-        export: bool = typer.Option(False, "--export", help="Also write report.html and findings.csv."),
     ) -> None:
-        _report_command(_resolve_findings_path(findings, out), out, EventFeed(), export=export)
+        _report_command(_resolve_findings_path(findings, out), out, EventFeed())
 
     @app.command()
     def ask(
@@ -353,7 +337,6 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=None)
     report_parser.add_argument("--out", type=Path, default=Path("."))
-    report_parser.add_argument("--export", action="store_true")
 
     ask_parser = sub.add_parser("ask")
     ask_parser.add_argument("question")
@@ -426,7 +409,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         _emit_scan_summary(result.payload, args.out, feed)
         _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
-        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, export=args.export)
+        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed)
     elif args.command == "ask":
         use_llm = not args.no_ai
         if use_llm:

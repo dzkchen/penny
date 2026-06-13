@@ -15,7 +15,6 @@ from typing import Any
 
 from . import __version__, llm, ui
 from .ask import answer_question
-from .exports import write_exports
 from .feed import Event, EventFeed
 from .reporting import generate_report, load_findings
 from .scanner import run_scan
@@ -28,7 +27,7 @@ HELP = """\
 /audit <path> [--target <url>]    FULL audit: scan + AI + all probes + report
 /full  <path> [--target <url>]    alias for /audit
 /scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--static-only] [--target <url>]
-/report [--export]                write report.md (+ html/csv)
+/report                           write report.md to .penny/runs/
 /fix [--yes]                      fix flagged files with approval (Claude rewrites them)
 /findings                         list the current findings
 /show <F-001>                     show one finding in detail
@@ -81,7 +80,6 @@ class Session:
     def _autoload(self) -> None:
         for candidate in (
             self.out_dir / ".penny" / "runs" / "latest" / "findings.json",
-            self.out_dir / "findings.json",
         ):
             if candidate.exists():
                 try:
@@ -275,7 +273,7 @@ class Session:
         forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True}
         self._scan([path], force=forced)
         if self.payload:
-            self._report(["--export"])
+            self._report([])
         self.out(ui.style("✅ Full audit complete — findings + report.md written.", "bright_green"))
 
     def _fix(self, args: list[str]) -> None:
@@ -364,10 +362,6 @@ class Session:
         report_path = store.write_report(payload.get("session_id", "manual-report"), report)
         copy_report_to_findings_dir(report_path, self.findings_path)
         self.out(ui.style(f"📄 report.md → {report_path}", "green"))
-        if "--export" in args:
-            paths = write_exports(payload, report, self.out_dir)
-            self.out(ui.style(f"📄 report.html → {paths['html']}", "green"))
-            self.out(ui.style(f"📊 findings.csv → {paths['csv']}", "green"))
 
     def _toggle_ai(self, args: list[str]) -> None:
         want = args[0].lower() if args else ("off" if self.use_ai else "on")

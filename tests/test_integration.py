@@ -21,10 +21,11 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     report_path = FindingsStore(tmp_path).write_report(result.session_id, report)
 
     assert result.findings_path.exists()
-    assert (tmp_path / "findings.json").exists()
     assert (tmp_path / ".penny/runs/latest/findings.json").exists()
+    assert not (tmp_path / "findings.json").exists()
     assert report_path.exists()
-    assert (tmp_path / "report.md").exists()
+    assert (tmp_path / ".penny/runs/latest/report.md").exists()
+    assert not (tmp_path / "report.md").exists()
 
     payload = json.loads(result.findings_path.read_text(encoding="utf-8"))
     assert payload["scan"]["source"] == str((ROOT / "planted-app").resolve())
@@ -40,7 +41,7 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     assert payload["summary"]["total"] == 6  # vulnerable deps collapse into one finding
     assert payload["summary"]["confirmed_count"] == 3
 
-    combined_output = (tmp_path / "findings.json").read_text(encoding="utf-8") + (tmp_path / "report.md").read_text(encoding="utf-8")
+    combined_output = result.findings_path.read_text(encoding="utf-8") + report_path.read_text(encoding="utf-8")
     for raw in (SERVICE_KEY, PAYMENT_SECRET, "alice@example.test", "bob@example.test", "carol@example.test"):
         assert raw not in combined_output
     assert "Critical client-exposed service credential confirmed" in combined_output

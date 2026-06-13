@@ -2,44 +2,249 @@
 
 Penny is a local-first Python CLI penetration-testing assistant for AI-built apps. It scans a small repository, proves safe localhost vulnerabilities when a target is supplied, writes redacted findings, and generates a developer-focused remediation report.
 
-The MVP is demo-first:
+Penny is meant to be driven from interactive mode. Start it with no arguments:
 
 ```bash
-python -m penny run ./planted-app --target http://127.0.0.1:8787
+python -m penny            # or, after install: penny
 ```
 
-Installable CLI metadata is included, so after installing the package the same command is:
+Then run the security workflow from the `penny ›` prompt:
 
-```bash
-penny run ./planted-app --target http://127.0.0.1:8787
+```text
+penny › /target http://127.0.0.1:8787
+penny › /audit ./planted-app
+penny › /findings
+penny › /show F-001
+penny › what should Blue fix first?
+penny › /report
 ```
 
-## Interactive mode
+The same scanner, report writer, assistant, and fix engine are still available as one-shot commands for CI and scripts, but the README follows the interactive flow first.
 
-Run `penny` with no arguments to launch an interactive session (a styled REPL — no extra dependencies required). Type a question to ask the assistant about the loaded findings, or a `/command` to act:
+## Architecture maps
+
+```text
++--------------------+
+| Developer / REPL   |
++---------+----------+
+          |
+          v
++--------------------+        +----------------------+
+| penny REPL / CLI   |------->| Source resolver      |
+| cli.py / repl.py   |        | sources.py           |
++---------+----------+        +----------+-----------+
+          |                              |
+          |                              v
+          |                   +----------------------+
+          |                   | Repo walker          |
+          |                   | repo.py              |
+          |                   +----------+-----------+
+          |                              |
+          v                              v
++----------------------------------------------------+
+| Scan orchestrator                                  |
+| scanner.py                                         |
++----+-----------+-----------+-----------+-----------+
+     |           |           |           |
+     v           v           v           v
++----------+ +----------+ +----------+ +-------------+
+| Static   | | Dynamic  | | Active   | | AI / OSV    |
+|detectors | | probes   | | probes   | | optional    |
+|detectors | |probes.py | |active.py | |ai/advisory |
++----+-----+ +----+-----+ +----+-----+ +------+------+
+     |            |            |              |
+     +------------+------------+--------------+
+                  |
+                  v
+        +----------------------+
+        | Finding models       |
+        | models.py            |
+        +----------+-----------+
+                   |
+                   v
+        +----------------------+
+        | Redaction            |
+        | redaction.py         |
+        +----------+-----------+
+                   |
+                   v
+        +----------------------+
+        | Findings store       |
+        | store.py             |
+        | .penny/runs/*        |
+        +----+-------------+---+
+             |             |
+             v             v
++------------------+   +------------------+
+| Report generator |   | Ask / Fix actions  |
+| reporting.py     |   | ask.py patches.py |
++--------+---------+   +------------------+
+         |
+         v
++------------------+
+| Local output     |
+| findings.json    |
+| report.md        |
+| store.py         |
++------------------+
+```
+
+### Trust / data boundaries
+
+```text
++---------------- LOCAL MACHINE ----------------+
+|                                                |
+|  +-----------+        +---------------------+  |
+|  | Source    |------->| Penny process       |  |
+|  | repo      |        | scanner/report/ask  |  |
+|  +-----------+        +----------+----------+  |
+|                                  |             |
+|                                  v             |
+|                       +---------------------+  |
+|                       | Local output        |  |
+|                       | findings/report     |  |
+|                       +---------------------+  |
+|                                                |
++--------------------------+---------------------+
+                           |
+                           | guarded GET/HEAD/OPTIONS
+                           v
+              +--------------------------+
+              | Consented target app     |
+              | localhost/private/public |
+              +--------------------------+
+
+Optional outbound paths:
+
+Penny ---> Anthropic Claude
+          - /scan --ai and /audit send bounded source code
+          - questions send redacted findings
+          - /fix sends explicit local file content
+
+Penny ---> OSV.dev
+          - /scan --osv and /audit send package names and versions only
+
+Penny ---> MongoDB
+          - redacted stats and generic patterns only
+
+Penny ---> Git remote
+          - only when scan source is a git URL
+```
+
+### Planted app fixture
+
+```text
++-------------------- planted-app --------------------+
+|                                                     |
+|  +-------------------+                              |
+|  | frontend/src      |                              |
+|  | planted secrets   |                              |
+|  +---------+---------+                              |
+|            |                                        |
+|            v                                        |
+|  +-------------------+        +------------------+  |
+|  | server/app.py     |<-------| seed_data.json   |  |
+|  | mock REST target  |        +------------------+  |
+|  +----+---------+----+                              |
+|       |         |                                   |
+|       v         v                                   |
+|  /health   /rest/v1/private_notes                  |
+|    |              |                                 |
+|    v              v                                 |
+|  CORS       service-key confirmation                |
+|                                                     |
+|  /api/orders/<id>                                  |
+|       |                                             |
+|       v                                             |
+|  BOLA confirmation                                  |
+|                                                     |
+|  policies/private_notes.sql                         |
+|       |                                             |
+|       v                                             |
+|  permissive RLS static finding                      |
++-----------------------------------------------------+
+```
+
+## Interactive Mode
+
+Run `penny` with no arguments to launch a styled REPL with no extra dependencies. The shell auto-loads the most recent scan, shows whether AI is available, and keeps the current findings and target in session so you can move through scan, triage, report, and fix without copying file paths between commands.
 
 ```bash
 python -m penny            # or: penny
 ```
 
+### 1. Set a Live Target
+
+Use `/target` when you want Penny to confirm issues against a running app. Without a target, Penny still performs static and code-aware checks.
+
+```text
+penny › /target http://127.0.0.1:8787
+```
+
+### 2. Audit the App
+
+`/audit` is the full interactive path: scan source, run AI review when configured, run dependency and live-probe checks, then write a report. Natural language routes here too, so "pentest ./planted-app" and "run a full audit on ./planted-app" work.
+
+```text
+penny › /audit ./planted-app
+```
+
+For a narrower pass, use `/scan` directly:
+
 ```text
 penny › /scan ./planted-app --osv --ai
+penny › /scan ./planted-app --static-only
+penny › /scan ./app --active --i-own-this --target https://app.example.com
+```
+
+### 3. Inspect and Ask
+
+After a scan, `/findings` gives the ranked table, `/show` opens one finding, and plain questions ask the assistant about the loaded run.
+
+```text
 penny › /findings
 penny › /show F-001
 penny › what should Blue fix first?
-penny › /report --export
+```
+
+Questions use Claude when `ANTHROPIC_API_KEY` is configured and `/ai on` is active. If not, Penny answers with deterministic local logic so the flow still works offline.
+
+### 4. Report and Fix
+
+Generate the Markdown report at any point from the current findings — it is written to `.penny/runs/<session>/report.md` (and `.penny/runs/latest/`). Use `/fix` when you want Penny to propose and apply local code changes with approval.
+
+```text
+penny › /report
+penny › /fix
 penny › /exit
 ```
 
-Available commands: `/scan`, `/report`, `/findings`, `/show <id>`, `/target`, `/ai on|off`, `/clear`, `/help`, `/exit`. On startup Penny auto-loads the most recent scan's findings if present, and shows whether AI is enabled. Colour is used on a TTY and disabled automatically when output is piped. The one-shot subcommands below remain available for scripting.
+Available interactive commands:
 
-## Commands
+```text
+/audit <path> [--target <url>]    full audit: scan + AI + probes + report
+/full <path> [--target <url>]     alias for /audit
+/scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--static-only] [--target <url>]
+/report                           write report.md to .penny/runs/
+/fix [--yes]                      fix flagged files with approval
+/findings                         list current findings
+/show <F-001>                     show one finding in detail
+/target <url|off>                 set or clear the dynamic-probe target
+/ai <on|off>                      toggle AI answers/review
+/clear                            clear the screen
+/help                             show help
+/exit                             leave
+```
 
-Replace the `<...>` placeholders with your own values (e.g. `--target http://localhost:3000`, `--out .`).
+Colour is used on a TTY and disabled automatically when output is piped.
+
+## Scriptable Equivalents
+
+Use these when you need automation outside the interactive shell. They read and write the same `.penny/runs/latest` state that the REPL auto-loads.
 
 ```bash
 python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
-python -m penny report [--findings <path>] [--out <dir>] [--export]
+python -m penny report [--findings <path>] [--out <dir>]
 python -m penny ask "question" [--findings <path>] [--target <url>] [--no-ai]
 python -m penny ask-loop [--findings <path>] [--target <url>] [--no-ai]
 python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
@@ -49,62 +254,73 @@ python -m penny trends [--days 7] [--limit 10]
 python -m penny demo-replay [--recording <path>] [--out <dir>]
 ```
 
-The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available.
+The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available. Running `python -m penny` with no subcommand is still the recommended starting point.
 
 ## AI Assistant
 
-`ask` and `ask-loop` answer questions about a scan using Claude. Penny reads `ANTHROPIC_API_KEY` from the environment or a local `.env`, and the model from `PENNY_DEEP_MODEL` (default `claude-sonnet-4-6`). The model only ever sees the already-redacted findings JSON — Penny never sends source snippets, raw secrets, or `secret_value` fields. When no key is configured, the request fails, or you pass `--no-ai`, Penny falls back to deterministic answers, so the demo always works offline.
+Inside the REPL, plain-language questions answer against the loaded findings:
 
-```bash
-cp .env.example .env   # then set ANTHROPIC_API_KEY
-python -m penny ask "What did Red confirm and what should Blue fix first?" --findings .penny/runs/latest/findings.json
-python -m penny ask "Summarize F-001 and how to fix it" --no-ai   # deterministic, no API call
+```text
+penny › what did Red confirm and what should Blue fix first?
+penny › /ai off
+penny › summarize F-001 and how to fix it
 ```
+
+Penny reads `ANTHROPIC_API_KEY` from the environment or a local `.env`, and the model from `PENNY_DEEP_MODEL` (default `claude-sonnet-4-6`). Questions only send the already-redacted findings JSON to the model — not raw source snippets, raw secrets, or `secret_value` fields. When no key is configured, the request fails, or AI is off, Penny falls back to deterministic answers.
 
 ### AI-assisted detection (`--ai`)
 
-`scan --ai` / `run --ai` add an AI review pass: Penny sends bounded, line-numbered source to Claude (the deep model) and folds back any vulnerabilities it finds — broken auth/authorization, injection through indirect data flow, SSRF, unsafe deserialization, and similar issues the regex detectors can't reason about. The pass also **traces authorization across files** (route → middleware → data access) to surface missing ownership checks, and audits any LLM integration against the **OWASP LLM Top 10** (prompt injection, insecure output handling, unauthorized tool/function use, system-prompt or key leakage). Security-relevant files (auth/api/route/db/LLM) are bundled first so large repos don't truncate the important code away. These land as `AI001` findings (`source: ai`) alongside the deterministic ones; each finding's snippet is rebuilt from the real source line and redacted, so the model can't smuggle an unredacted secret into persisted output.
+In interactive mode, `/audit` enables the AI review pass as part of the full workflow. For narrower scans, pass `--ai` to `/scan`:
+
+```text
+penny › /scan ./planted-app --ai
+```
+
+The AI review sends bounded, line-numbered source to Claude (the deep model) and folds back vulnerabilities it finds — broken auth/authorization, injection through indirect data flow, SSRF, unsafe deserialization, and similar issues the regex detectors cannot reason about. The pass also **traces authorization across files** (route → middleware → data access) to surface missing ownership checks, and audits any LLM integration against the **OWASP LLM Top 10** (prompt injection, insecure output handling, unauthorized tool/function use, system-prompt or key leakage). Security-relevant files (auth/api/route/db/LLM) are bundled first so large repos do not truncate the important code away. These land as `AI001` findings (`source: ai`) alongside the deterministic ones; each finding's snippet is rebuilt from the real source line and redacted, so the model cannot smuggle an unredacted secret into persisted output.
 
 `--ai` also runs a **secret triage** step: a fast-model pass over the false-positive-prone high-entropy `D002` hits that drops ones it judges benign (hashes, fingerprints, fixtures). Known-prefix secrets are never triaged away, and the context sent to the model is redacted.
 
-Unlike the rest of Penny, `--ai` sends source code to Anthropic, so it is opt-in. It respects the same walker, so gitignored files (e.g. a local `.env`) are never included. Without a key it is a no-op.
+Unlike normal question-answering, `--ai` sends source code to Anthropic, so it remains opt-in for `/scan` and explicit in the `/audit` flow. It respects the same walker, so gitignored files (e.g. a local `.env`) are never included. Without a key it is a no-op.
 
 ### Active probing (`--active`)
 
-By default Penny's dynamic checks are read-only confirmations. `scan --active` / `run --active` go further and send **non-destructive attack payloads** to a live target to demonstrate real weaknesses:
+By default Penny's dynamic checks are read-only confirmations against the REPL target. `/scan --active` and `/audit` go further and send **non-destructive attack payloads** to a live target to demonstrate real weaknesses:
 
 - **SQL injection (`A001`):** appends benign SQL metacharacters (`'`, `' OR '1'='1`, …) to query-string parameters discovered in the source and looks for database error signatures. Read-only `GET` requests only.
 - **Firebase open rules (`A002`):** for Firebase apps, reads the Realtime Database REST endpoint (`/.json?shallow=true`) **without authentication** to prove whether the security rules expose data to anonymous clients — the meaningful "pentest" for a NoSQL/Firebase backend. Only the status code and top-level key count are stored, never the data.
 
-```bash
-python -m penny scan ../my-firebase-app --active --i-own-this --out .
+```text
+penny › /target https://my-owned-app.example
+penny › /scan ../my-firebase-app --active --i-own-this
 ```
 
 Active probes go through the same `TargetGate` as every other request: only `GET`/`HEAD`/`OPTIONS`, rate-limited, same-origin, no redirects off the target. Reaching any **public** host (e.g. `*.firebaseio.com`) requires `--i-own-this` — without it the probe is blocked, not sent. Payloads are detection-only; Penny never sends destructive input (`DROP TABLE`, writes, deletes).
 
 `<path>` can be a local directory or a git source URL ending in `.git`, including an optional ref suffix:
 
-```bash
-python -m penny scan https://github.com/owner/repo.git#main --static-only
+```text
+penny › /scan https://github.com/owner/repo.git#main --static-only
 ```
 
 Git sources are cloned into a temporary local directory and scanned with the same deterministic repo walker as normal local paths.
 
 ## Local Demo
 
-Start the deterministic planted target:
+Start the deterministic planted target in one terminal:
 
 ```bash
 python planted-app/server/app.py
 ```
 
-Then scan it from another terminal:
+Then drive the demo from another terminal through interactive mode:
 
-```bash
-python -m penny run ./planted-app --target http://127.0.0.1:8787
-python -m penny ask "What did Red confirm and what should Blue fix first?" --findings .penny/runs/latest/findings.json
-python -m penny report --findings .penny/runs/latest/findings.json --export
-python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --out penny.patch
+```text
+$ python -m penny
+penny › /target http://127.0.0.1:8787
+penny › /audit ./planted-app
+penny › what did Red confirm and what should Blue fix first?
+penny › /report
+penny › /fix
 ```
 
 Expected outputs:
@@ -113,17 +329,10 @@ Expected outputs:
 - `.penny/runs/<session_id>/report.md`
 - `.penny/runs/latest/findings.json`
 - `.penny/runs/latest/report.md`
-- `findings.json`
-- `report.md`
-- `report.html`, `findings.csv`, and `findings.sarif` when `report --export` is used
-- `penny.patch` when `patch` is used
 
 ### Gating CI/PRs
 
-`scan`/`run` accept `--fail-on <severity>` (Critical/High/Medium/Low/Info). Penny exits `1`
-when any finding is at or above that severity, so it can fail a build; usage and scan errors
-use exit code `2`. The SARIF export (`report --export` → `findings.sarif`) can be uploaded to
-GitHub code scanning.
+Interactive mode is for local triage. For CI, use the scriptable `scan` command with `--fail-on <severity>` (Critical/High/Medium/Low/Info). Penny exits `1` when any finding is at or above that severity, so it can fail a build; usage and scan errors use exit code `2`.
 
 ```bash
 python -m penny scan . --osv --fail-on high   # non-zero exit if any High+ finding
@@ -131,12 +340,14 @@ python -m penny scan . --osv --fail-on high   # non-zero exit if any High+ findi
 
 ### Faster scans and targeted probes
 
-- `--diff <ref>` scans only files changed versus a git ref (committed, staged, unstaged,
-  and untracked), so PR/pre-commit runs stay fast. Falls back to a full scan when the path
-  is not a git tree or the ref does not resolve.
-- `--endpoint <path?param>` adds endpoints for active SQLi probing (repeatable). SPAs build
-  URLs dynamically, so source discovery often finds nothing — point A001 at the endpoints
-  you know exist, e.g. `--endpoint '/api/users?id=1' --endpoint '/search?q='`.
+Use `/scan` from the REPL when you want a smaller or more directed pass:
+
+```text
+penny › /scan . --osv
+penny › /scan ./app --active --i-own-this --target https://app.example.com
+```
+
+For CI and other scriptable runs, `--diff <ref>` scans only files changed versus a git ref (committed, staged, unstaged, and untracked), so PR/pre-commit runs stay fast. It falls back to a full scan when the path is not a git tree or the ref does not resolve. `--endpoint <path?param>` adds endpoints for active SQLi probing. SPAs build URLs dynamically, so source discovery often finds nothing; point A001 at the endpoints you know exist:
 
 ```bash
 python -m penny scan . --diff main --osv --fail-on high
@@ -153,7 +364,7 @@ Penny only runs read-only HTTP probes (`GET`/`HEAD`/`OPTIONS`). Localhost and pr
 
 Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, private keys, database URLs, emails, and high-entropy token-shaped values before persistence.
 
-By default Penny only talks to the scan target's localhost. Three features add opt-in outbound calls, and each sends the minimum needed: `ask`/`ask-loop` send the already-redacted findings to the configured Claude model; `--osv` sends only dependency names and versions to OSV.dev; `--ai` sends source code (never gitignored files) to the Claude model. All three degrade to local-only behavior when disabled or unconfigured.
+By default Penny only talks to the scan target's localhost. Three features add opt-in outbound calls, and each sends the minimum needed: interactive questions send the already-redacted findings to the configured Claude model; `/scan --osv` and `/audit` send only dependency names and versions to OSV.dev; `/scan --ai` and `/audit` send source code (never gitignored files) to the Claude model. All three degrade to local-only behavior when disabled or unconfigured.
 
 ## Coverage
 
@@ -190,20 +401,20 @@ Dynamic probes are still read-only. `D004` stores only status codes, object IDs,
 - **Documentation isn't a credential store.** The generic high-entropy heuristic is skipped in `.md`/`.txt`/`.rst`, known-benign high-entropy shapes (subresource-integrity hashes, content hashes / git SHAs, UUIDs) are ignored everywhere, and high-entropy strings inside URLs (Google Docs/Drive share ids, CDN asset hashes) are ignored — so README badges (e.g. `shields.io`), lockfile integrity hashes, asset fingerprints, and doc links don't become findings. Real known-prefix secrets are still flagged even in docs and URLs.
 - **Generated output is excluded.** Penny ignores common build/cache directories such as `.next/`, `.nuxt/`, `.svelte-kit/`, `.turbo/`, `dist/`, `build/`, `out/`, `coverage/`, and lock/cache artifacts so reports focus on source code rather than generated manifests.
 
-## CLI-Only Fix Workflow
+## Interactive Fix Workflow
 
-Penny does not require or ship a web UI. The P2 fix workflow is CLI-only:
+Penny does not require or ship a web UI. From the REPL, `/fix` reads the current findings and proposes local code changes with approval:
 
-```bash
-python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --out penny.patch
-python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --apply
+```text
+penny › /fix
+penny › /fix --yes
 ```
 
-Patch previews are redacted so they can be reviewed without writing raw secrets into a patch file. `--apply` is explicit and modifies only the local repo path supplied with `--repo`.
+The scriptable `patch` command still exists for non-interactive patch previews. Patch previews are redacted so they can be reviewed without writing raw secrets into a patch file. `--apply` is explicit and modifies only the local repo path supplied with `--repo`.
 
 ## Mongo Boundary
 
-MongoDB is optional. The core demo works without Mongo, Atlas, RAG, Vultr, GitHub clone support, or a REPL.
+MongoDB is optional. The interactive scan, triage, report, and fix loop works without Mongo, Atlas, RAG, Vultr, or GitHub clone support.
 
 When `MONGODB_URI` is configured, Penny mirrors only safe data:
 
@@ -212,7 +423,7 @@ When `MONGODB_URI` is configured, Penny mirrors only safe data:
 
 Penny does not write reports, app names, target URLs, source snippets, raw evidence, secrets, or code to Mongo.
 
-The CLI can also query the optional knowledge library:
+The optional knowledge library is available as scriptable commands:
 
 ```bash
 python -m penny knowledge "service key in client code"
