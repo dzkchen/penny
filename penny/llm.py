@@ -103,9 +103,29 @@ _ASK_SYSTEM = (
 )
 
 
-def llm_answer(question: str, findings_json: str, *, deterministic: str) -> str:
-    """Augment the deterministic ask answer with an LLM explanation when available."""
+def _rag_block(retrieved: list[dict] | None) -> str:
+    """Format Mongo vector-search hits as a retrieval context block for the prompt."""
+    if not retrieved:
+        return ""
+    lines = []
+    for item in retrieved:
+        score = item.get("score")
+        score_str = f" (similarity {round(score, 3)})" if isinstance(score, (int, float)) else ""
+        lines.append(f"- [{item.get('detector_id', '?')}] {item.get('title', '')}{score_str}: {item.get('remediation', '')}")
+    return (
+        "RETRIEVED KNOWLEDGE-BASE PATTERNS (from MongoDB vector search; use as background, "
+        "do not contradict the findings):\n" + "\n".join(lines) + "\n\n"
+    )
+
+
+def llm_answer(question: str, findings_json: str, *, deterministic: str, retrieved: list[dict] | None = None) -> str:
+    """Augment the deterministic ask answer with an LLM explanation when available.
+
+    When `retrieved` (Mongo vector-search hits) is provided, this is true RAG: the model
+    generates grounded in patterns recalled from the vector knowledge base.
+    """
     user = (
+        f"{_rag_block(retrieved)}"
         f"REDACTED FINDINGS JSON:\n{findings_json}\n\n"
         f"DETERMINISTIC TOOL ANSWER (ground truth, do not contradict):\n{deterministic}\n\n"
         f"USER QUESTION:\n{question}\n\n"
@@ -123,9 +143,10 @@ _VERDICT_SYSTEM = (
 )
 
 
-def llm_verdict(findings_json: str, *, deterministic: str) -> str:
+def llm_verdict(findings_json: str, *, deterministic: str, retrieved: list[dict] | None = None) -> str:
     """Replace the one-line template verdict with a richer LLM narrative when available."""
     user = (
+        f"{_rag_block(retrieved)}"
         f"REDACTED FINDINGS JSON:\n{findings_json}\n\n"
         f"DETERMINISTIC ONE-LINE VERDICT (do not contradict):\n{deterministic}\n\n"
         "Write the purple-team verdict paragraph."

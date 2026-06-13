@@ -223,11 +223,15 @@ def generate_report(payload: dict[str, Any]) -> str:
         else "No critical exploit was dynamically confirmed; review suspected issues before release."
     )
     # Upgrade the one-line verdict to a richer LLM narrative when a key is configured.
-    # The LLM only sees already-redacted findings and cannot contradict the ground truth.
+    # True RAG: retrieve related patterns from the Mongo vector KB and ground the verdict
+    # in them. The LLM only sees already-redacted findings and cannot contradict ground truth.
     from .llm import llm_verdict
+    from .mongo import MongoMirror
 
     findings_json = json.dumps({"summary": summary, "findings": findings}, indent=2)
-    verdict = llm_verdict(findings_json, deterministic=verdict)
+    detector_titles = " ".join(f"{f.get('detector_id', '')} {f.get('title', '')}" for f in findings)
+    retrieved, _ = MongoMirror().search_patterns(detector_titles or "security findings", limit=3)
+    verdict = llm_verdict(findings_json, deterministic=verdict, retrieved=retrieved)
     executive = (
         f"Penny found {summary.get('total', len(findings))} issue(s), including "
         f"{len(critical)} critical and {summary.get('high_count', 0)} high finding(s). "

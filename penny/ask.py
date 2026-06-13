@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .guardrails import GuardrailError, TargetGate
 from .llm import llm_answer
+from .mongo import MongoMirror
 from .reporting import load_findings
 
 
@@ -28,10 +29,11 @@ def answer_question(
             target_note = f"\n\nProbe gate: blocked. {error}"
 
     deterministic = _deterministic_answer(question, normalized, payload, findings, findings_path, target_note)
-    # Augment with a live Claude explanation when a key is configured; otherwise return
-    # the deterministic answer unchanged. The LLM only ever sees redacted findings.
+    # True RAG: retrieve semantically-similar patterns from the Mongo vector knowledge base,
+    # then have Claude generate grounded in both the redacted findings and the retrieval.
+    retrieved, _ = MongoMirror().search_patterns(question, limit=3)
     findings_json = json.dumps({"summary": payload.get("summary", {}), "findings": findings}, indent=2)
-    return llm_answer(question, findings_json, deterministic=deterministic)
+    return llm_answer(question, findings_json, deterministic=deterministic, retrieved=retrieved)
 
 
 def _deterministic_answer(question, normalized, payload, findings, findings_path, target_note) -> str:

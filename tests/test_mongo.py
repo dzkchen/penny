@@ -13,6 +13,7 @@ from .conftest import ROOT
 def test_mongo_docs_contain_only_stats_and_generic_patterns(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PENNY_DISABLE_MONGO", "1")
+    monkeypatch.setenv("PENNY_DISABLE_VOYAGE", "1")  # force deterministic hash embeddings
     result = run_scan(ROOT / "planted-app", static_only=True, out_dir=tmp_path, feed=EventFeed(quiet=True))
     finding = result.payload["findings"][0]
     now = datetime.now(UTC)
@@ -26,15 +27,20 @@ def test_mongo_docs_contain_only_stats_and_generic_patterns(tmp_path, monkeypatc
     assert "evidence" not in pattern
     assert "frontend/src" not in encoded
     assert "http://127.0.0.1" not in encoded
-    assert len(pattern["embedding"]) == 64
+    from penny.embeddings import embedding_dimensions
+
+    assert len(pattern["embedding"]) == embedding_dimensions()
 
 
-def test_vector_search_pipeline_targets_atlas_vector_index() -> None:
+def test_vector_search_pipeline_targets_atlas_vector_index(monkeypatch) -> None:
+    monkeypatch.setenv("PENNY_DISABLE_VOYAGE", "1")  # force deterministic hash embeddings
+    from penny.embeddings import embedding_dimensions
+
     pipeline = vector_search_pipeline("service key in client code", limit=3)
 
     assert pipeline[0]["$vectorSearch"]["index"] == "vuln_pattern_vector_index"
     assert pipeline[0]["$vectorSearch"]["path"] == "embedding"
-    assert len(pipeline[0]["$vectorSearch"]["queryVector"]) == 64
+    assert len(pipeline[0]["$vectorSearch"]["queryVector"]) == embedding_dimensions()
     assert pipeline[0]["$vectorSearch"]["limit"] == 3
     assert pipeline[1]["$project"]["score"] == {"$meta": "vectorSearchScore"}
 
