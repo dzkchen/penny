@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from . import llm
 from .agent_fix import run_agent_fix
@@ -30,6 +30,59 @@ def _resolve_findings_path(findings: Path | None, out_dir: Path) -> Path:
     if findings is not None:
         return findings
     return out_dir / ".penny" / "runs" / "latest" / "findings.json"
+
+
+def _run_scan_command(
+    path: str,
+    *,
+    target: str | None,
+    static_only: bool,
+    out: Path,
+    i_own_this: bool,
+    osv: bool,
+    ai: bool,
+    active: bool,
+    fail_on: str | None,
+    diff: str | None,
+    endpoint: list[str] | None,
+    agentic: bool,
+    brute: bool,
+    browser: bool,
+    netscan: bool,
+    load_test: bool,
+    i_accept: bool,
+    wordlist: str | None,
+    pages: int,
+    verbose: bool,
+) -> tuple[Any, LiveScanFeed]:
+    feed = LiveScanFeed()
+    with feed:
+        with resolved_scan_source(path) as resolved:
+            result = run_scan(
+                resolved,
+                target=target,
+                static_only=static_only,
+                out_dir=out,
+                i_own_this=i_own_this,
+                feed=feed,
+                source_label=path,
+                use_osv=osv,
+                use_ai=ai,
+                use_active=active,
+                diff_base=diff,
+                endpoints=endpoint,
+                agentic=agentic,
+                brute=brute,
+                browser=browser,
+                netscan=netscan,
+                load_test=load_test,
+                i_accept=i_accept,
+                wordlist=wordlist,
+                pages=pages,
+            )
+    print_scan_summary(result.payload, out, verbose=verbose)
+    _enforce_fail_on(result.payload, fail_on, feed)
+    return result, feed
 
 
 def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, use_llm: bool = False) -> Path:
@@ -131,9 +184,14 @@ def _github_fix_command(source: str, workdir: Path, branch: str, auto_yes: bool,
     from .github_fix import github_fix_roundtrip
 
     try:
-        github_fix_roundtrip(source, workdir=workdir, branch=branch, auto_yes=auto_yes, push=push, feed=feed)
+        live_feed = LiveScanFeed()
+        with live_feed:
+            result = github_fix_roundtrip(source, workdir=workdir, branch=branch, auto_yes=auto_yes, push=push, feed=live_feed)
     except Exception as error:
         _fail(str(error))
+    payload = result.get("scan_payload")
+    if isinstance(payload, dict):
+        print_scan_summary(payload, workdir)
 
 
 def _build_typer_app():
@@ -164,15 +222,31 @@ def _build_typer_app():
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
         verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
     ) -> None:
-        feed = LiveScanFeed()
         try:
-            with feed:
-                with resolved_scan_source(path) as resolved:
-                    result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
+            _run_scan_command(
+                path,
+                target=target,
+                static_only=static_only,
+                out=out,
+                i_own_this=i_own_this,
+                osv=osv,
+                ai=ai,
+                active=active,
+                fail_on=fail_on,
+                diff=diff,
+                endpoint=endpoint,
+                agentic=agentic,
+                brute=brute,
+                browser=browser,
+                netscan=netscan,
+                load_test=load_test,
+                i_accept=i_accept,
+                wordlist=wordlist,
+                pages=pages,
+                verbose=verbose,
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        print_scan_summary(result.payload, out, verbose=verbose)
-        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command()
     def report(
@@ -306,16 +380,32 @@ def _build_typer_app():
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
         verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
     ) -> None:
-        feed = LiveScanFeed()
         try:
-            with feed:
-                with resolved_scan_source(path) as resolved:
-                    result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, load_test=load_test, i_accept=i_accept, wordlist=wordlist, pages=pages)
+            result, feed = _run_scan_command(
+                path,
+                target=target,
+                static_only=False,
+                out=out,
+                i_own_this=i_own_this,
+                osv=osv,
+                ai=ai,
+                active=active,
+                fail_on=fail_on,
+                diff=diff,
+                endpoint=endpoint,
+                agentic=agentic,
+                brute=brute,
+                browser=browser,
+                netscan=netscan,
+                load_test=load_test,
+                i_accept=i_accept,
+                wordlist=wordlist,
+                pages=pages,
+                verbose=verbose,
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        print_scan_summary(result.payload, out, verbose=verbose)
         _report_command(result.findings_path, out, feed, use_llm=ai)
-        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command("demo-replay")
     def demo_replay(
@@ -428,15 +518,31 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     feed = EventFeed()
     if args.command == "scan":
-        feed = LiveScanFeed()
         try:
-            with feed:
-                with resolved_scan_source(args.path) as resolved:
-                    result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
+            _run_scan_command(
+                args.path,
+                target=args.target,
+                static_only=args.static_only,
+                out=args.out,
+                i_own_this=args.i_own_this,
+                osv=args.osv,
+                ai=args.ai,
+                active=args.active,
+                fail_on=args.fail_on,
+                diff=args.diff,
+                endpoint=args.endpoint,
+                agentic=args.agentic,
+                brute=args.brute,
+                browser=args.browser,
+                netscan=args.netscan,
+                load_test=args.load_test,
+                i_accept=args.i_accept,
+                wordlist=args.wordlist,
+                pages=args.pages,
+                verbose=args.verbose,
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        print_scan_summary(result.payload, args.out, verbose=args.verbose)
-        _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
         _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, use_llm=args.ai)
     elif args.command == "ask":
@@ -484,16 +590,32 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 f"{row['detector_id']}: {row['count']} finding(s), critical={row['critical_count']}, high={row['high_count']}",
             )
     elif args.command == "run":
-        feed = LiveScanFeed()
         try:
-            with feed:
-                with resolved_scan_source(args.path) as resolved:
-                    result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, load_test=args.load_test, i_accept=args.i_accept, wordlist=args.wordlist, pages=args.pages)
+            result, feed = _run_scan_command(
+                args.path,
+                target=args.target,
+                static_only=False,
+                out=args.out,
+                i_own_this=args.i_own_this,
+                osv=args.osv,
+                ai=args.ai,
+                active=args.active,
+                fail_on=args.fail_on,
+                diff=args.diff,
+                endpoint=args.endpoint,
+                agentic=args.agentic,
+                brute=args.brute,
+                browser=args.browser,
+                netscan=args.netscan,
+                load_test=args.load_test,
+                i_accept=args.i_accept,
+                wordlist=args.wordlist,
+                pages=args.pages,
+                verbose=args.verbose,
+            )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        print_scan_summary(result.payload, args.out, verbose=args.verbose)
-        _report_command(result.findings_path, args.out, feed)
-        _enforce_fail_on(result.payload, args.fail_on, feed)
+        _report_command(result.findings_path, args.out, feed, use_llm=args.ai)
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)
 
