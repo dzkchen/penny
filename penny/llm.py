@@ -128,14 +128,26 @@ def complete(
     max_tokens: int = 1024,
     timeout: float = 30.0,
     response_schema: dict | None = None,
+    feed=None,
 ) -> str | None:
-    """Return Claude's text answer, or None if the call cannot be made."""
+    """Return Claude's text answer, or None if the call cannot be made.
+
+    Pass ``feed`` to surface *why* a call produced nothing — a swallowed
+    timeout/HTTP error or a ``max_tokens``/``refusal`` stop reason is otherwise
+    indistinguishable from "the model had nothing to say", which made the AI
+    review report a useless "no usable response".
+    """
+    def _diag(message: str) -> None:
+        if feed is not None:
+            feed.emit("ai", message)
+
     key = api_key()
     if key is None:
         return None
     try:
         import httpx
     except ImportError:
+        _diag("AI call skipped: httpx is not installed")
         return None
 
     body: dict[str, object] = {
@@ -162,10 +174,26 @@ def complete(
         )
         response.raise_for_status()
         data = response.json()
-    except Exception:
+    except httpx.TimeoutException:
+        _diag(f"AI request timed out after {timeout:.0f}s (large input — rerun, raise the timeout, or scan fewer files)")
+        return None
+    except httpx.HTTPStatusError as error:
+        detail = ""
+        try:
+            detail = error.response.json().get("error", {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            detail = (error.response.text or "")[:200]
+        _diag(f"AI API error {error.response.status_code}: {detail or error}")
+        return None
+    except Exception as error:  # noqa: BLE001
+        _diag(f"AI request failed: {error}")
         return None
 
     if not isinstance(data, dict):
+        return None
+    stop_reason = data.get("stop_reason")
+    if stop_reason == "refusal":
+        _diag("AI declined the request (stop_reason=refusal)")
         return None
     blocks = data.get("content", [])
     text = "".join(
@@ -173,6 +201,11 @@ def complete(
         for block in blocks
         if isinstance(block, dict) and block.get("type") == "text"
     ).strip()
+    if stop_reason == "max_tokens" and not text:
+        # Structured-output JSON truncated before any text block closed.
+        _diag(f"AI response hit the {max_tokens}-token limit before returning output; raise max_tokens")
+    elif stop_reason == "max_tokens":
+        _diag(f"AI response hit the {max_tokens}-token limit; output may be truncated")
     return text or None
 
 

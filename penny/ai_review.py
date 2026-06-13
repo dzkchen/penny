@@ -185,10 +185,21 @@ def ai_review(files: list[SourceFile], *, feed: EventFeed | None = None) -> list
         "Audit these source files for security vulnerabilities. Cite the exact file path and line "
         "for each finding.\n\n" + bundle
     )
-    raw = llm.complete(prompt, system=AI_SYSTEM, deep=True, max_tokens=4096, response_schema=RESPONSE_SCHEMA)
+    # A structured-output findings list needs real headroom, and a 60K-char bundle
+    # on a deep model can take well over the old 30s default — both starved the call
+    # and produced an empty "no usable response". feed surfaces the specific reason.
+    raw = llm.complete(
+        prompt,
+        system=AI_SYSTEM,
+        deep=True,
+        max_tokens=8192,
+        timeout=120.0,
+        response_schema=RESPONSE_SCHEMA,
+        feed=feed,
+    )
     if not raw:
         if feed:
-            feed.emit("ai", "AI review returned no usable response")
+            feed.emit("ai", "AI review produced no findings (see the reason above)")
         return []
     by_path = {file.relative_path: file for file in code_files}
     findings = _parse(raw, by_path)
