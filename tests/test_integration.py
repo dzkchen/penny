@@ -27,6 +27,8 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     assert (tmp_path / "report.md").exists()
 
     payload = json.loads(result.findings_path.read_text(encoding="utf-8"))
+    assert payload["scan"]["source"] == str((ROOT / "planted-app").resolve())
+    assert payload["scan"]["file_count"] == 8
     service_finding = next(finding for finding in payload["findings"] if finding["detector_id"] == "D001")
     assert service_finding["status"] == "confirmed"
     assert service_finding["evidence"]["dynamic_probe"]["service_row_count"] == 3
@@ -42,6 +44,8 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     for raw in (SERVICE_KEY, PAYMENT_SECRET, "alice@example.test", "bob@example.test", "carol@example.test"):
         assert raw not in combined_output
     assert "Critical client-exposed service credential confirmed" in combined_output
+    assert "## 3. Scan Scope" in combined_output
+    assert str((ROOT / "planted-app").resolve()) in combined_output
     assert "OWASP" in combined_output
     assert "create policy" in combined_output
     assert "Broken object-level authorization" in combined_output

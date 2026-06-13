@@ -26,12 +26,13 @@ def summarize_findings(findings: list[Finding]) -> dict[str, Any]:
     }
 
 
-def build_findings_payload(session_id: str, findings: list[Finding]) -> dict[str, Any]:
+def build_findings_payload(session_id: str, findings: list[Finding], *, scan: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "session_id": session_id,
         "created_at": datetime.now(UTC).isoformat(),
         "tool": "penny",
+        "scan": scan or {},
         "summary": summarize_findings(findings),
         "findings": [finding.to_public_dict() for finding in findings],
     }
@@ -60,8 +61,8 @@ class FindingsStore:
     def latest_dir(self) -> Path:
         return self.out_dir / ".penny" / "runs" / "latest"
 
-    def write_findings(self, session_id: str, findings: list[Finding]) -> tuple[dict[str, Any], Path]:
-        payload = build_findings_payload(session_id, findings)
+    def write_findings(self, session_id: str, findings: list[Finding], *, scan: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path]:
+        payload = build_findings_payload(session_id, findings, scan=scan)
         run_path = self.run_dir(session_id) / "findings.json"
         latest_path = self.latest_dir() / "findings.json"
         root_path = self.out_dir / "findings.json"

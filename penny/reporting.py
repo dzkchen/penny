@@ -23,6 +23,24 @@ def _severity_rollup(findings: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _scan_scope(payload: dict[str, Any]) -> str:
+    scan = payload.get("scan") or {}
+    if not scan:
+        return "This report was generated from a legacy findings file without scan provenance. Re-run `penny run` or `penny scan` against the intended local source tree before trusting file paths."
+    source = scan.get("source", "unknown")
+    resolved_path = scan.get("resolved_path", "unknown")
+    file_count = scan.get("file_count", "unknown")
+    static_only = scan.get("static_only", False)
+    return "\n".join(
+        [
+            f"- Scan source: `{source}`",
+            f"- Resolved local path: `{resolved_path}`",
+            f"- Source files inspected: {file_count}",
+            f"- Dynamic probes: {'skipped' if static_only else 'enabled when a target was provided'}",
+        ]
+    )
+
+
 def _status_word(finding: dict[str, Any]) -> str:
     if finding["status"] == "confirmed":
         return "confirmed"
@@ -216,15 +234,17 @@ def generate_report(payload: dict[str, Any]) -> str:
             verdict,
             "## 2. Executive Summary",
             executive,
-            "## 3. Severity Rollup",
+            "## 3. Scan Scope",
+            _scan_scope(payload),
+            "## 4. Severity Rollup",
             _severity_rollup(findings),
-            "## 4. Confirmed Attack Path",
+            "## 5. Confirmed Attack Path",
             _confirmed_attack_path(findings),
-            "## 5. Per-Finding Details",
+            "## 6. Per-Finding Details",
             _finding_details(findings) if findings else "No findings.",
-            "## 6. Fixes And Patches",
+            "## 7. Fixes And Patches",
             _fixes(findings),
-            "## 7. Methodology, Guardrails, And Limitations",
+            "## 8. Methodology, Guardrails, And Limitations",
             "\n".join(
                 [
                     "- Static detectors inspect allowlisted source files under size limits.",

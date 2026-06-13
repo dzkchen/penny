@@ -25,10 +25,11 @@ def test_findings_payload_schema_excludes_private_secret_field() -> None:
         secret_value=SERVICE_KEY,
     )
 
-    payload = build_findings_payload("test-session", [finding])
+    payload = build_findings_payload("test-session", [finding], scan={"source": "/tmp/demo", "resolved_path": "/tmp/demo", "file_count": 1})
     encoded = json.dumps(payload)
 
     validate_findings_payload(payload)
+    assert payload["scan"]["source"] == "/tmp/demo"
     assert "secret_value" not in encoded
     assert SERVICE_KEY not in encoded
     assert "[REDACTED:service_key:" in encoded

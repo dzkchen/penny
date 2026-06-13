@@ -27,10 +27,13 @@ def run_scan(
     out_dir: Path = Path("."),
     i_own_this: bool = False,
     feed: EventFeed | None = None,
+    source_label: str | None = None,
 ) -> ScanResult:
     feed = feed or EventFeed()
     session_id = now_session_id()
     repo_path = repo_path.resolve()
+    if not repo_path.exists():
+        raise FileNotFoundError(f"scan path does not exist: {repo_path}")
     feed.emit("scan", f"Walking {repo_path}")
     files = walk_repo(repo_path)
     feed.emit("scan", f"Loaded {len(files)} source file(s)")
@@ -52,7 +55,16 @@ def run_scan(
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
-    payload, findings_path = store.write_findings(session_id, findings)
+    payload, findings_path = store.write_findings(
+        session_id,
+        findings,
+        scan={
+            "source": source_label or str(repo_path),
+            "resolved_path": str(repo_path),
+            "static_only": static_only,
+            "file_count": len(files),
+        },
+    )
     feed.emit("store", f"Wrote {findings_path}")
     mirror_result = mongo.mirror(payload)
     if mirror_result:

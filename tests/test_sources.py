@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from penny.sources import is_git_source, resolved_scan_source
 
 
@@ -16,6 +18,12 @@ def test_is_git_source_detects_common_git_urls() -> None:
 def test_resolved_scan_source_passes_local_paths_through(tmp_path) -> None:
     with resolved_scan_source(tmp_path) as resolved:
         assert resolved == tmp_path
+
+
+def test_resolved_scan_source_rejects_deployed_website_urls() -> None:
+    with pytest.raises(ValueError, match="Do not pass a deployed website URL"):
+        with resolved_scan_source("https://example.com"):
+            pass
 
 
 def test_resolved_scan_source_clones_local_file_git_repo(tmp_path) -> None:

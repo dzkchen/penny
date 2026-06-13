@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,11 @@ def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: b
         feed.emit("report", f"Wrote {paths['html']}")
         feed.emit("report", f"Wrote {paths['csv']}")
     return report_path
+
+
+def _fail(message: str) -> None:
+    print(f"[error] {message}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _ask_loop(findings: Path, target: str | None, i_own_this: bool, feed: EventFeed) -> None:
@@ -73,8 +79,11 @@ def _build_typer_app():
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
     ) -> None:
-        with resolved_scan_source(path) as resolved:
-            run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed())
+        try:
+            with resolved_scan_source(path) as resolved:
+                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path)
+        except (FileNotFoundError, ValueError, RuntimeError) as error:
+            _fail(str(error))
 
     @app.command()
     def report(
@@ -152,8 +161,11 @@ def _build_typer_app():
         i_own_this: bool = typer.Option(False, "--i-own-this"),
     ) -> None:
         feed = EventFeed()
-        with resolved_scan_source(path) as resolved:
-            result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed)
+        try:
+            with resolved_scan_source(path) as resolved:
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path)
+        except (FileNotFoundError, ValueError, RuntimeError) as error:
+            _fail(str(error))
         _report_command(result.findings_path, out, feed)
 
     @app.command("demo-replay")
@@ -220,8 +232,11 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     feed = EventFeed()
     if args.command == "scan":
-        with resolved_scan_source(args.path) as resolved:
-            run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
+        try:
+            with resolved_scan_source(args.path) as resolved:
+                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path)
+        except (FileNotFoundError, ValueError, RuntimeError) as error:
+            _fail(str(error))
     elif args.command == "report":
         _report_command(args.findings, args.out, feed, export=args.export)
     elif args.command == "ask":
@@ -250,8 +265,11 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 f"{row['detector_id']}: {row['count']} finding(s), critical={row['critical_count']}, high={row['high_count']}",
             )
     elif args.command == "run":
-        with resolved_scan_source(args.path) as resolved:
-            result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
+        try:
+            with resolved_scan_source(args.path) as resolved:
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path)
+        except (FileNotFoundError, ValueError, RuntimeError) as error:
+            _fail(str(error))
         _report_command(result.findings_path, args.out, feed)
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)

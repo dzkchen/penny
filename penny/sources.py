@@ -10,10 +10,25 @@ from typing import Iterator
 
 
 GIT_SOURCE_RE = re.compile(r"^(?:https://|git@|ssh://|file://).+\.git(?:#.+)?$|^[^@\s]+@[^:\s]+:.+\.git(?:#.+)?$")
+URL_SOURCE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 
 def is_git_source(source: str) -> bool:
     return bool(GIT_SOURCE_RE.match(source))
+
+
+def is_url_source(source: str) -> bool:
+    return bool(URL_SOURCE_RE.match(source))
+
+
+def validate_scan_source(source: str | Path) -> None:
+    source_text = str(source)
+    if is_url_source(source_text) and not is_git_source(source_text):
+        raise ValueError(
+            "Penny scans local source folders or git repository URLs ending in .git. "
+            "Do not pass a deployed website URL as the scan path. Use a local checkout, "
+            "for example: python3 -m penny run ./my-app --target https://example.com"
+        )
 
 
 def _split_ref(source: str) -> tuple[str, str | None]:
@@ -26,8 +41,14 @@ def _split_ref(source: str) -> tuple[str, str | None]:
 @contextmanager
 def resolved_scan_source(source: str | Path) -> Iterator[Path]:
     source_text = str(source)
+    validate_scan_source(source_text)
     if not is_git_source(source_text):
-        yield Path(source_text)
+        path = Path(source_text)
+        if not path.exists():
+            raise FileNotFoundError(f"scan path does not exist: {path}")
+        if not path.is_dir() and not path.is_file():
+            raise FileNotFoundError(f"scan path is not a file or directory: {path}")
+        yield path
         return
 
     url, ref = _split_ref(source_text)
