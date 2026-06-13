@@ -77,6 +77,15 @@ def _fix_command(findings: Path, repo: Path, auto_yes: bool, feed: EventFeed) ->
         feed.emit("blue", "No fixes applied")
 
 
+def _github_fix_command(source: str, workdir: Path, branch: str, auto_yes: bool, push: bool, feed: EventFeed) -> None:
+    from .github_fix import github_fix_roundtrip
+
+    try:
+        github_fix_roundtrip(source, workdir=workdir, branch=branch, auto_yes=auto_yes, push=push, feed=feed)
+    except Exception as error:
+        _fail(str(error))
+
+
 def _build_typer_app():
     import typer
 
@@ -139,6 +148,16 @@ def _build_typer_app():
         yes: bool = typer.Option(False, "--yes", help="Apply all proposed fixes without prompting (demo/non-interactive)."),
     ) -> None:
         _fix_command(findings, repo, yes, EventFeed())
+
+    @app.command("github-fix")
+    def github_fix(
+        source: str,
+        workdir: Path = typer.Option(Path("penny-workdir"), "--workdir"),
+        branch: str = typer.Option("penny/fixes", "--branch"),
+        yes: bool = typer.Option(False, "--yes", help="Apply all fixes without prompting."),
+        push: bool = typer.Option(False, "--push", help="Push the fix branch to origin."),
+    ) -> None:
+        _github_fix_command(source, workdir, branch, yes, push, EventFeed())
 
     @app.command()
     def knowledge(
@@ -238,6 +257,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     fix_parser.add_argument("--repo", type=Path, default=Path("."))
     fix_parser.add_argument("--yes", action="store_true")
 
+    github_fix_parser = sub.add_parser("github-fix")
+    github_fix_parser.add_argument("source")
+    github_fix_parser.add_argument("--workdir", type=Path, default=Path("penny-workdir"))
+    github_fix_parser.add_argument("--branch", default="penny/fixes")
+    github_fix_parser.add_argument("--yes", action="store_true")
+    github_fix_parser.add_argument("--push", action="store_true")
+
     knowledge_parser = sub.add_parser("knowledge")
     knowledge_parser.add_argument("query")
     knowledge_parser.add_argument("--limit", type=int, default=5)
@@ -275,6 +301,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "fix":
         _fix_command(args.findings, args.repo, args.yes, feed)
+    elif args.command == "github-fix":
+        _github_fix_command(args.source, args.workdir, args.branch, args.yes, args.push, feed)
     elif args.command == "knowledge":
         patterns, message = MongoMirror().search_patterns(args.query, limit=args.limit)
         if message:
