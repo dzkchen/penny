@@ -7,6 +7,7 @@ from typing import Optional
 from .ask import answer_question
 from .exports import write_exports
 from .feed import EventFeed
+from .mongo import MongoMirror
 from .patches import apply_patch_plans, write_patch_file
 from .reporting import generate_report, load_findings
 from .replay import run_demo_replay
@@ -111,6 +112,39 @@ def _build_typer_app():
         _patch_command(findings, repo, out, apply, EventFeed())
 
     @app.command()
+    def knowledge(
+        query: str,
+        limit: int = typer.Option(5, "--limit"),
+    ) -> None:
+        feed = EventFeed()
+        patterns, message = MongoMirror().search_patterns(query, limit=limit)
+        if message:
+            feed.emit("mongo", message)
+        if not patterns:
+            feed.emit("mongo", "No Mongo knowledge patterns returned")
+            return
+        for pattern in patterns:
+            feed.emit("mongo", f"{pattern['detector_id']} {pattern['title']} - {pattern['remediation']}")
+
+    @app.command()
+    def trends(
+        days: int = typer.Option(7, "--days"),
+        limit: int = typer.Option(10, "--limit"),
+    ) -> None:
+        feed = EventFeed()
+        rows, message = MongoMirror().trends(days=days, limit=limit)
+        if message:
+            feed.emit("mongo", message)
+        if not rows:
+            feed.emit("mongo", "No Mongo scan-history trends returned")
+            return
+        for row in rows:
+            feed.emit(
+                "mongo",
+                f"{row['detector_id']}: {row['count']} finding(s), critical={row['critical_count']}, high={row['high_count']}",
+            )
+
+    @app.command()
     def run(
         path: str,
         target: str = typer.Option(..., "--target"),
@@ -165,6 +199,14 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     patch_parser.add_argument("--out", type=Path, default=Path("penny.patch"))
     patch_parser.add_argument("--apply", action="store_true")
 
+    knowledge_parser = sub.add_parser("knowledge")
+    knowledge_parser.add_argument("query")
+    knowledge_parser.add_argument("--limit", type=int, default=5)
+
+    trends_parser = sub.add_parser("trends")
+    trends_parser.add_argument("--days", type=int, default=7)
+    trends_parser.add_argument("--limit", type=int, default=10)
+
     run_parser = sub.add_parser("run")
     run_parser.add_argument("path")
     run_parser.add_argument("--target", required=True)
@@ -188,6 +230,25 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         _ask_loop(args.findings, args.target, args.i_own_this, feed)
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
+    elif args.command == "knowledge":
+        patterns, message = MongoMirror().search_patterns(args.query, limit=args.limit)
+        if message:
+            feed.emit("mongo", message)
+        if not patterns:
+            feed.emit("mongo", "No Mongo knowledge patterns returned")
+        for pattern in patterns:
+            feed.emit("mongo", f"{pattern['detector_id']} {pattern['title']} - {pattern['remediation']}")
+    elif args.command == "trends":
+        rows, message = MongoMirror().trends(days=args.days, limit=args.limit)
+        if message:
+            feed.emit("mongo", message)
+        if not rows:
+            feed.emit("mongo", "No Mongo scan-history trends returned")
+        for row in rows:
+            feed.emit(
+                "mongo",
+                f"{row['detector_id']}: {row['count']} finding(s), critical={row['critical_count']}, high={row['high_count']}",
+            )
     elif args.command == "run":
         with resolved_scan_source(args.path) as resolved:
             result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)

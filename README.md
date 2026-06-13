@@ -23,6 +23,8 @@ python -m penny ask "question" [--findings PATH] [--target URL]
 python -m penny ask-loop [--findings PATH] [--target URL]
 python -m penny run <path> --target URL [--out DIR]
 python -m penny patch [--findings PATH] --repo PATH [--out penny.patch] [--apply]
+python -m penny knowledge "query" [--limit 5]
+python -m penny trends [--days 7] [--limit 10]
 python -m penny demo-replay [--recording PATH] [--out DIR]
 ```
 
@@ -106,6 +108,15 @@ When `MONGODB_URI` is configured, Penny mirrors only safe data:
 - `scan_history`: aggregate counts by severity, status, and detector.
 
 Penny does not write reports, app names, target URLs, source snippets, raw evidence, secrets, or code to Mongo.
+
+The CLI can also query the optional knowledge library:
+
+```bash
+python -m penny knowledge "service key in client code"
+python -m penny trends --days 7
+```
+
+When Mongo is unavailable, scans and reports continue without this lookup.
 
 ## Development
 

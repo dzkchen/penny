@@ -34,6 +34,13 @@ def run_scan(
     feed.emit("scan", f"Walking {repo_path}")
     files = walk_repo(repo_path)
     feed.emit("scan", f"Loaded {len(files)} source file(s)")
+    mongo = MongoMirror()
+    knowledge_query = " ".join(file.relative_path for file in files[:50])
+    patterns, knowledge_message = mongo.search_patterns(knowledge_query, limit=3)
+    if knowledge_message:
+        feed.emit("mongo", knowledge_message)
+    elif patterns:
+        feed.emit("mongo", f"Knowledge search returned {len(patterns)} generic pattern(s)")
     findings = run_detectors(files)
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
@@ -47,7 +54,7 @@ def run_scan(
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(session_id, findings)
     feed.emit("store", f"Wrote {findings_path}")
-    mirror_result = MongoMirror().mirror(payload)
+    mirror_result = mongo.mirror(payload)
     if mirror_result:
         feed.emit("mongo", mirror_result)
     return ScanResult(session_id=session_id, findings_path=findings_path, payload=payload)

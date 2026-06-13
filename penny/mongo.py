@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,50 @@ class MongoMirror:
         client.close()
         return "mirrored redacted stats and generic patterns to Mongo"
 
+    def search_patterns(self, query: str, *, limit: int = 5) -> tuple[list[dict[str, Any]], str | None]:
+        if not self.enabled():
+            return [], None
+        try:
+            from pymongo import MongoClient
+        except Exception:
+            return [], "pymongo is not installed; skipped Mongo knowledge search"
+
+        client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
+        try:
+            db = client[self.database_name]
+            try:
+                docs = list(db.vuln_patterns.aggregate(vector_search_pipeline(query, limit=limit)))
+            except Exception:
+                docs = list(
+                    db.vuln_patterns.find(
+                        {"pattern_text": {"$regex": re.escape(query[:80]), "$options": "i"}},
+                        {"_id": 0, "detector_id": 1, "title": 1, "severity": 1, "remediation": 1, "pattern_text": 1},
+                    ).limit(limit)
+                )
+            return [safe_pattern_result(doc) for doc in docs], None
+        except Exception as error:
+            return [], f"Mongo knowledge search skipped: {error}"
+        finally:
+            client.close()
+
+    def trends(self, *, days: int = 7, limit: int = 10) -> tuple[list[dict[str, Any]], str | None]:
+        if not self.enabled():
+            return [], None
+        try:
+            from pymongo import MongoClient
+        except Exception:
+            return [], "pymongo is not installed; skipped Mongo trends"
+
+        client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
+        try:
+            db = client[self.database_name]
+            rows = list(db.scan_history.aggregate(trend_pipeline(days=days, limit=limit)))
+            return [safe_trend_result(row) for row in rows], None
+        except Exception as error:
+            return [], f"Mongo trends skipped: {error}"
+        finally:
+            client.close()
+
 
 def scan_history_doc(payload: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
     summary = payload.get("summary", {})
@@ -82,6 +126,76 @@ def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) ->
         "embedding": hashed_embedding(pattern_text),
         "updated_at": now or datetime.now(UTC),
     }
+
+
+def safe_pattern_result(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "detector_id": doc.get("detector_id", ""),
+        "title": doc.get("title", ""),
+        "severity": doc.get("severity", ""),
+        "remediation": doc.get("remediation", ""),
+        "pattern_text": doc.get("pattern_text", ""),
+        "score": doc.get("score"),
+    }
+
+
+def safe_trend_result(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "detector_id": str(doc.get("_id", "")),
+        "count": int(doc.get("count", 0)),
+        "critical_count": int(doc.get("critical_count", 0)),
+        "high_count": int(doc.get("high_count", 0)),
+    }
+
+
+def vector_search_pipeline(query: str, *, limit: int = 5, index: str = "vuln_pattern_vector_index") -> list[dict[str, Any]]:
+    return [
+        {
+            "$vectorSearch": {
+                "index": index,
+                "path": "embedding",
+                "queryVector": hashed_embedding(query),
+                "numCandidates": max(limit * 10, 20),
+                "limit": limit,
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "detector_id": 1,
+                "title": 1,
+                "severity": 1,
+                "remediation": 1,
+                "pattern_text": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        },
+    ]
+
+
+def trend_pipeline(*, days: int = 7, limit: int = 10, now: datetime | None = None) -> list[dict[str, Any]]:
+    since = (now or datetime.now(UTC)) - timedelta(days=days)
+    return [
+        {"$match": {"created_at": {"$gte": since}}},
+        {
+            "$project": {
+                "critical_count": 1,
+                "high_count": 1,
+                "detectors": {"$objectToArray": "$by_detector"},
+            }
+        },
+        {"$unwind": "$detectors"},
+        {
+            "$group": {
+                "_id": "$detectors.k",
+                "count": {"$sum": "$detectors.v"},
+                "critical_count": {"$sum": "$critical_count"},
+                "high_count": {"$sum": "$high_count"},
+            }
+        },
+        {"$sort": {"count": -1, "_id": 1}},
+        {"$limit": limit},
+    ]
 
 
 def hashed_embedding(text: str, dimensions: int = 64) -> list[float]:
