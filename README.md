@@ -20,7 +20,9 @@ penny run ./planted-app --target http://127.0.0.1:8787
 python -m penny scan <path> [--target URL] [--static-only] [--out DIR]
 python -m penny report [--findings PATH] [--out DIR]
 python -m penny ask "question" [--findings PATH] [--target URL]
+python -m penny ask-loop [--findings PATH] [--target URL]
 python -m penny run <path> --target URL [--out DIR]
+python -m penny patch [--findings PATH] --repo PATH [--out penny.patch] [--apply]
 python -m penny demo-replay [--recording PATH] [--out DIR]
 ```
 
@@ -39,6 +41,8 @@ Then scan it from another terminal:
 ```bash
 python -m penny run ./planted-app --target http://127.0.0.1:8787
 python -m penny ask "What did Red confirm and what should Blue fix first?" --findings .penny/runs/latest/findings.json
+python -m penny report --findings .penny/runs/latest/findings.json --export
+python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --out penny.patch
 ```
 
 Expected outputs:
@@ -49,6 +53,8 @@ Expected outputs:
 - `.penny/runs/latest/report.md`
 - `findings.json`
 - `report.md`
+- `report.html` and `findings.csv` when `report --export` is used
+- `penny.patch` when `patch` is used
 
 The planted app includes a client-visible service-role key, a committed fake secret, a permissive RLS-style policy, a mock Supabase REST endpoint, a BOLA-style order endpoint, known-vulnerable dependency fixtures, and a permissive CORS header.
 
@@ -70,6 +76,17 @@ Current deterministic checks:
 - `D006`: permissive CORS detector with dynamic header confirmation.
 
 Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers.
+
+## CLI-Only Fix Workflow
+
+Penny does not require or ship a web UI. The P2 fix workflow is CLI-only:
+
+```bash
+python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --out penny.patch
+python -m penny patch --findings .penny/runs/latest/findings.json --repo ./planted-app --apply
+```
+
+Patch previews are redacted so they can be reviewed without writing raw secrets into a patch file. `--apply` is explicit and modifies only the local repo path supplied with `--repo`.
 
 ## Mongo Boundary
 
