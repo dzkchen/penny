@@ -584,6 +584,16 @@ class Session:
                 kwargs["login_url"] = next(tokens, "")
             elif a == "--creds":
                 kwargs["creds"] = next(tokens, "")
+            elif a == "--template":
+                kwargs["template"] = next(tokens, "")
+            elif a == "--start":
+                kwargs["start"] = next(tokens, "1")
+            elif a == "--end":
+                kwargs["end"] = next(tokens, "200")
+            elif a == "--header":
+                kwargs["header"] = next(tokens, "")
+            elif a == "--max-rows":
+                kwargs["max_rows"] = next(tokens, "5000")
             elif not a.startswith("-"):
                 target = a
         if not attack_type:

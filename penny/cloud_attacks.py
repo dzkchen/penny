@@ -308,11 +308,101 @@ def run_cloud_cred_stuffing(
     return CloudResult(findings=findings, raw=redact_text(out + ("\n" + err if err else "")))
 
 
+# ---------------------------------------------------------------------------
+# API mass-enumeration (IDOR at scale): walk an object-id endpoint across many
+# IDs and report how many return data that shouldn't be reachable. Read-only GET.
+# ---------------------------------------------------------------------------
+
+_REMOTE_ENUM = r'''
+import sys, json, urllib.request
+template = sys.argv[1]      # e.g. https://app.com/api/orders/{id}
+start = int(sys.argv[2]); end = int(sys.argv[3])
+header = sys.argv[4] if len(sys.argv) > 4 else ""   # optional "Name: value"
+hdrs = {}
+if header and ":" in header:
+    k,v = header.split(":",1); hdrs[k.strip()] = v.strip()
+ok = 0; sample_cols = []
+for i in range(start, end+1):
+    url = template.replace("{id}", str(i))
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        r = urllib.request.urlopen(req, timeout=8); body = r.read(2048).decode("utf-8","replace")
+        if r.status == 200 and body.strip() and body.strip() not in ("[]","{}","null"):
+            ok += 1
+            try:
+                obj = json.loads(body)
+                if isinstance(obj, dict) and not sample_cols:
+                    sample_cols = sorted(obj.keys())[:15]
+            except Exception:
+                pass
+    except Exception:
+        pass
+print(json.dumps({"reachable": ok, "scanned": end-start+1, "sample_columns": sample_cols}), flush=True)
+'''
+
+
+def run_cloud_api_enum(
+    ip: str,
+    target: str,
+    *,
+    feed: EventFeed,
+    template: str = "",
+    start: str = "1",
+    end: str = "200",
+    header: str = "",
+) -> CloudResult:
+    """Walk an object-id endpoint across a range of IDs; report how many are reachable."""
+    tmpl = template or (target.rstrip("/") + "/api/orders/{id}")
+    if "{id}" not in tmpl:
+        feed.emit("attack", "[cloud] api-enum needs a template containing {id}, e.g. /api/orders/{id}")
+        return CloudResult(findings=[], raw="")
+    feed.emit("attack", f"[cloud] API enumeration on {tmpl} (ids {start}-{end}) from box {ip}")
+    cmd = (
+        f"echo {_b64(_REMOTE_ENUM)} | base64 -d > /tmp/penny_enum.py && "
+        f"python3 /tmp/penny_enum.py {shlex.quote(tmpl)} {shlex.quote(str(start))} {shlex.quote(str(end))} {shlex.quote(header)}"
+    )
+    code, out, err = vultr.ssh_run(ip, cmd, timeout=180)
+    result = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+    findings: list[Finding] = []
+    reachable = result.get("reachable", 0)
+    scanned = result.get("scanned", 0)
+    if reachable > 1:  # >1 distinct object reachable on one identity = likely IDOR at scale
+        findings.append(Finding(
+            title="Mass object access via ID enumeration (IDOR at scale)",
+            severity="High",
+            confidence="high",
+            status="confirmed",
+            source="dynamic",
+            detector_id="C004",
+            owasp=["A01:2021-Broken Access Control"],
+            location=Location(file=f"cloud:{tmpl}", line=1, column=1),
+            snippet=f"{reachable}/{scanned} object IDs returned data on a single identity.",
+            evidence={"dynamic_probe": {"probe": "cloud_api_enumeration", "status": "confirmed",
+                                        "reachable": reachable, "scanned": scanned,
+                                        "sample_columns": result.get("sample_columns", []),
+                                        "stored_response": "counts and column shape only"}},
+            impact="One user can read many other users' objects by changing the ID — bulk data exposure.",
+            remediation="Authorize every object lookup by both object ID and the authenticated user before returning data.",
+        ))
+        feed.emit("attack", f"[cloud] IDOR-at-scale: {reachable}/{scanned} objects reachable")
+    else:
+        feed.emit("attack", f"[cloud] API enum: {reachable}/{scanned} reachable — no mass exposure")
+    return CloudResult(findings=findings, raw=redact_text(out + ("\n" + err if err else "")))
+
+
 # Registry of cloud attack types -> runner.
 CLOUD_ATTACKS = {
     "load": run_cloud_load_test,
     "supabase-dump": run_cloud_supabase_dump,
     "cred-stuffing": run_cloud_cred_stuffing,
+    "api-enum": run_cloud_api_enum,
 }
 
 
