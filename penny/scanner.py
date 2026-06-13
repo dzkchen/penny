@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .active import run_active_probes
 from .advisories import lookup as osv_lookup
-from .ai_review import ai_review
+from .ai_review import ai_review, triage_secret_findings
 from .detectors import detect_dependencies_via_advisories, run_detectors
 from .feed import EventFeed
 from .models import assign_finding_ids, dedupe_cross_detector, now_session_id
@@ -67,6 +67,7 @@ def run_scan(
         feed.emit("osv", f"OSV review: {package_count} vulnerable dependency package(s)")
     if use_ai:
         findings.extend(ai_review(files, feed=feed))
+        findings = triage_secret_findings(findings, files, feed=feed)
         before = len(findings)
         findings = dedupe_cross_detector(findings)
         merged = before - len(findings)
