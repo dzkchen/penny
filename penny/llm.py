@@ -16,9 +16,48 @@ from pathlib import Path
 from .redaction import redact_text
 
 DEFAULT_DEEP_MODEL = "claude-sonnet-4-6"
-DEFAULT_FAST_MODEL = "claude-sonnet-4-6"
+DEFAULT_FAST_MODEL = "claude-haiku-4-5"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+# Model selection mode (set via `/model` in the REPL or `penny model <mode>`):
+#   auto   - Haiku for quick chat, Sonnet for the real work (default)
+#   haiku  - always use the fast model
+#   sonnet - always use the deep model
+VALID_MODEL_MODES = ("auto", "haiku", "sonnet")
+
+
+def model_mode() -> str:
+    _load_dotenv()
+    mode = os.environ.get("PENNY_MODEL_MODE", "").strip().lower()
+    return mode if mode in VALID_MODEL_MODES else "auto"
+
+
+def set_model_mode(mode: str) -> str:
+    mode = mode.strip().lower()
+    if mode not in VALID_MODEL_MODES:
+        raise ValueError(f"model mode must be one of: {', '.join(VALID_MODEL_MODES)}")
+    os.environ["PENNY_MODEL_MODE"] = mode
+    return mode
+
+
+def _resolve_model(deep: bool) -> str:
+    """Apply the model mode: auto honors the caller's deep flag; haiku/sonnet override it."""
+    mode = model_mode()
+    if mode == "haiku":
+        return fast_model()
+    if mode == "sonnet":
+        return deep_model()
+    return deep_model() if deep else fast_model()  # auto
+
+
+def describe_model_mode() -> str:
+    mode = model_mode()
+    if mode == "haiku":
+        return f"model mode: haiku (always {fast_model()})"
+    if mode == "sonnet":
+        return f"model mode: sonnet (always {deep_model()})"
+    return f"model mode: auto (chat: {fast_model()}, work: {deep_model()})"
 
 _DOTENV_LOADED = False
 
@@ -100,7 +139,7 @@ def complete(
         return None
 
     body: dict[str, object] = {
-        "model": deep_model() if deep else fast_model(),
+        "model": _resolve_model(deep),
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
