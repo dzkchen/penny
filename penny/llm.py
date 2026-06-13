@@ -51,7 +51,7 @@ def _model() -> str:
 
 def _fast_model() -> str:
     _load_dotenv()
-    return os.environ.get("PENNY_FAST_MODEL", "").strip() or "claude-haiku-4-5-20251001"
+    return os.environ.get("PENNY_FAST_MODEL", "").strip() or "claude-sonnet-4-6"
 
 
 def llm_available() -> bool:
@@ -130,5 +130,5 @@ def llm_verdict(findings_json: str, *, deterministic: str) -> str:
         f"DETERMINISTIC ONE-LINE VERDICT (do not contradict):\n{deterministic}\n\n"
         "Write the purple-team verdict paragraph."
     )
-    result = _call(_VERDICT_SYSTEM, user, fast=True, max_tokens=512)
+    result = _call(_VERDICT_SYSTEM, user, max_tokens=512)
     return result if result else deterministic
