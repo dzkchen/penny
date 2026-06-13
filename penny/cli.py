@@ -11,6 +11,7 @@ from .patches import apply_patch_plans, write_patch_file
 from .reporting import generate_report, load_findings
 from .replay import run_demo_replay
 from .scanner import run_scan
+from .sources import resolved_scan_source
 from .store import FindingsStore, copy_report_to_findings_dir
 
 
@@ -65,13 +66,14 @@ def _build_typer_app():
 
     @app.command()
     def scan(
-        path: Path,
+        path: str,
         target: Optional[str] = typer.Option(None, "--target"),
         static_only: bool = typer.Option(False, "--static-only"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
     ) -> None:
-        run_scan(path, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed())
+        with resolved_scan_source(path) as resolved:
+            run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed())
 
     @app.command()
     def report(
@@ -110,13 +112,14 @@ def _build_typer_app():
 
     @app.command()
     def run(
-        path: Path,
+        path: str,
         target: str = typer.Option(..., "--target"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
     ) -> None:
         feed = EventFeed()
-        result = run_scan(path, target=target, out_dir=out, i_own_this=i_own_this, feed=feed)
+        with resolved_scan_source(path) as resolved:
+            result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed)
         _report_command(result.findings_path, out, feed)
 
     @app.command("demo-replay")
@@ -134,7 +137,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan_parser = sub.add_parser("scan")
-    scan_parser.add_argument("path", type=Path)
+    scan_parser.add_argument("path")
     scan_parser.add_argument("--target")
     scan_parser.add_argument("--static-only", action="store_true")
     scan_parser.add_argument("--out", type=Path, default=Path("."))
@@ -163,7 +166,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     patch_parser.add_argument("--apply", action="store_true")
 
     run_parser = sub.add_parser("run")
-    run_parser.add_argument("path", type=Path)
+    run_parser.add_argument("path")
     run_parser.add_argument("--target", required=True)
     run_parser.add_argument("--out", type=Path, default=Path("."))
     run_parser.add_argument("--i-own-this", action="store_true")
@@ -175,7 +178,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     feed = EventFeed()
     if args.command == "scan":
-        run_scan(args.path, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
+        with resolved_scan_source(args.path) as resolved:
+            run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
     elif args.command == "report":
         _report_command(args.findings, args.out, feed, export=args.export)
     elif args.command == "ask":
@@ -185,7 +189,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "run":
-        result = run_scan(args.path, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
+        with resolved_scan_source(args.path) as resolved:
+            result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed)
         _report_command(result.findings_path, args.out, feed)
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)

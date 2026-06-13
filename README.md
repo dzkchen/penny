@@ -28,6 +28,14 @@ python -m penny demo-replay [--recording PATH] [--out DIR]
 
 The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available.
 
+`<path>` can be a local directory or a git source URL ending in `.git`, including an optional ref suffix:
+
+```bash
+python -m penny scan https://github.com/owner/repo.git#main --static-only
+```
+
+Git sources are cloned into a temporary local directory and scanned with the same deterministic repo walker as normal local paths.
+
 ## Local Demo
 
 Start the deterministic planted target:
