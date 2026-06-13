@@ -50,13 +50,26 @@ Expected outputs:
 - `findings.json`
 - `report.md`
 
-The planted app includes a client-visible service-role key, a committed fake secret, a permissive RLS-style policy, a mock Supabase REST endpoint, and a BOLA-style order endpoint.
+The planted app includes a client-visible service-role key, a committed fake secret, a permissive RLS-style policy, a mock Supabase REST endpoint, a BOLA-style order endpoint, known-vulnerable dependency fixtures, and a permissive CORS header.
 
 ## Safety Model
 
 Penny only runs read-only HTTP probes. Localhost and private-network targets are allowed by default. Public targets require `--i-own-this`; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
 
 Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, database URLs, emails, and high-entropy token-shaped values before persistence.
+
+## Coverage
+
+Current deterministic checks:
+
+- `D001`: service-role key in client-visible code.
+- `D002`: committed secret using known prefixes and entropy heuristics.
+- `D003`: permissive RLS/access policy.
+- `D004`: dynamic BOLA/IDOR order-read probe.
+- `D005`: vulnerable dependency detector for curated high-signal package/version pairs.
+- `D006`: permissive CORS detector with dynamic header confirmation.
+
+Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers.
 
 ## Mongo Boundary
 

@@ -17,6 +17,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        self.send_header("access-control-allow-origin", "*")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

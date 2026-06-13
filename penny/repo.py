@@ -31,6 +31,7 @@ DEFAULT_EXTENSIONS = {
     ".yml",
     ".ini",
     ".md",
+    ".txt",
 }
 
 

@@ -71,11 +71,25 @@ def _confirmed_attack_path(findings: list[dict[str, Any]]) -> str:
     lines = []
     for finding in confirmed:
         probe = finding.get("evidence", {}).get("dynamic_probe", {})
-        lines.append(
-            f"- {finding['id']}: {finding['title']} was confirmed. "
-            f"Anon status/count: {probe.get('anon_status', 'n/a')}/{probe.get('anon_row_count', 'n/a')}; "
-            f"service status/count: {probe.get('service_status', 'n/a')}/{probe.get('service_row_count', 'n/a')}."
-        )
+        if probe.get("probe") == "service_key_table_read":
+            lines.append(
+                f"- {finding['id']}: {finding['title']} was confirmed. "
+                f"Anon status/count: {probe.get('anon_status', 'n/a')}/{probe.get('anon_row_count', 'n/a')}; "
+                f"service status/count: {probe.get('service_status', 'n/a')}/{probe.get('service_row_count', 'n/a')}."
+            )
+        elif probe.get("probe") == "bola_order_read":
+            lines.append(
+                f"- {finding['id']}: {finding['title']} was confirmed. "
+                f"User `{probe.get('requested_as', 'unknown')}` accessed authorized order `{probe.get('authorized_order_id', 'n/a')}` "
+                f"and cross-user order `{probe.get('cross_user_order_id', 'n/a')}`."
+            )
+        elif probe.get("probe") == "cors_origin_reflection":
+            lines.append(
+                f"- {finding['id']}: {finding['title']} was confirmed. "
+                f"An untrusted Origin received `{probe.get('allow_origin', 'n/a')}`."
+            )
+        else:
+            lines.append(f"- {finding['id']}: {finding['title']} was confirmed by `{probe.get('probe', 'dynamic probe')}`.")
     return "\n".join(lines)
 
 
@@ -83,6 +97,9 @@ def _fixes(findings: list[dict[str, Any]]) -> str:
     has_d001 = any(finding["detector_id"] == "D001" for finding in findings)
     has_d002 = any(finding["detector_id"] == "D002" for finding in findings)
     has_d003 = any(finding["detector_id"] == "D003" for finding in findings)
+    has_d004 = any(finding["detector_id"] == "D004" for finding in findings)
+    has_d005 = any(finding["detector_id"] == "D005" for finding in findings)
+    has_d006 = any(finding["detector_id"] == "D006" for finding in findings)
     sections: list[str] = []
     if has_d001:
         sections.append(
@@ -130,6 +147,48 @@ using (auth.uid() = user_id);
 ```
 
 The important fix is to bind every row predicate to the authenticated user or another explicit authorization rule.
+"""
+        )
+    if has_d004:
+        sections.append(
+            """### Enforce object ownership on reads
+
+```python
+def get_order(order_id: str, current_user_id: str):
+    order = orders.get(order_id)
+    if order is None or order["user_id"] != current_user_id:
+        raise HTTPException(status_code=404)
+    return order
+```
+
+Every object fetch should bind the requested object ID to the authenticated user or an authorization policy before returning data.
+"""
+        )
+    if has_d005:
+        sections.append(
+            """### Upgrade vulnerable dependencies
+
+```text
+jinja2>=2.10.2
+lodash>=4.17.21
+```
+
+Upgrade vulnerable packages to fixed versions or later, regenerate lockfiles, and run dependency tests before release.
+"""
+        )
+    if has_d006:
+        sections.append(
+            """### Restrict CORS origins
+
+```python
+ALLOWED_ORIGINS = {"https://app.example.com"}
+
+origin = request.headers.get("origin")
+if origin in ALLOWED_ORIGINS:
+    response.headers["Access-Control-Allow-Origin"] = origin
+```
+
+Avoid `Access-Control-Allow-Origin: *` on APIs that may return user-specific or credential-adjacent data.
 """
         )
     return "\n\n".join(sections) if sections else "No concrete fixes were generated because there are no findings."

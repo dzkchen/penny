@@ -26,3 +26,9 @@ def test_guardrails_block_unsafe_methods_and_request_overage() -> None:
         gate.validate_method("POST")
     with pytest.raises(GuardrailError, match="request cap"):
         gate.request("GET", "/health")
+
+
+def test_guardrails_allow_read_only_preflight_methods() -> None:
+    gate = TargetGate("http://127.0.0.1:8787")
+    gate.validate_method("HEAD")
+    gate.validate_method("OPTIONS")

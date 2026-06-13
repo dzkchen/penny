@@ -30,7 +30,13 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     service_finding = next(finding for finding in payload["findings"] if finding["detector_id"] == "D001")
     assert service_finding["status"] == "confirmed"
     assert service_finding["evidence"]["dynamic_probe"]["service_row_count"] == 3
-    assert payload["summary"]["total"] == 3
+    bola_finding = next(finding for finding in payload["findings"] if finding["detector_id"] == "D004")
+    assert bola_finding["status"] == "confirmed"
+    assert bola_finding["evidence"]["dynamic_probe"]["cross_user_order_id"] == "1002"
+    cors_finding = next(finding for finding in payload["findings"] if finding["detector_id"] == "D006")
+    assert cors_finding["status"] == "confirmed"
+    assert payload["summary"]["total"] == 7
+    assert payload["summary"]["confirmed_count"] == 3
 
     combined_output = (tmp_path / "findings.json").read_text(encoding="utf-8") + (tmp_path / "report.md").read_text(encoding="utf-8")
     for raw in (SERVICE_KEY, PAYMENT_SECRET, "alice@example.test", "bob@example.test", "carol@example.test"):
@@ -38,6 +44,9 @@ def test_run_scan_confirms_service_key_and_persists_redacted_outputs(tmp_path, p
     assert "Critical client-exposed service credential confirmed" in combined_output
     assert "OWASP" in combined_output
     assert "create policy" in combined_output
+    assert "Broken object-level authorization" in combined_output
+    assert "Upgrade vulnerable dependencies" in combined_output
+    assert "Restrict CORS origins" in combined_output
 
     answer = answer_question(
         "What did Red confirm and what should Blue fix first?",

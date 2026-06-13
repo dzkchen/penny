@@ -74,7 +74,7 @@ class TargetGate:
         self._last_request = 0.0
 
     def validate_method(self, method: str) -> None:
-        if method.upper() != "GET":
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
             raise GuardrailError(f"unsafe HTTP method blocked: {method}")
 
     def build_url(self, path: str) -> str:
