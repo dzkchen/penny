@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -38,30 +40,10 @@ class MongoMirror:
 
         client = MongoClient(self.uri, serverSelectionTimeoutMS=1500)
         db = client[self.database_name]
-        summary = payload.get("summary", {})
         now = datetime.now(UTC)
-        scan_history = {
-            "created_at": now,
-            "schema_version": payload.get("schema_version"),
-            "total_findings": summary.get("total", 0),
-            "critical_count": summary.get("critical_count", 0),
-            "high_count": summary.get("high_count", 0),
-            "confirmed_count": summary.get("confirmed_count", 0),
-            "by_severity": summary.get("by_severity", {}),
-            "by_status": summary.get("by_status", {}),
-            "by_detector": summary.get("by_detector", {}),
-        }
-        db.scan_history.insert_one(scan_history)
+        db.scan_history.insert_one(scan_history_doc(payload, now=now))
         for finding in payload.get("findings", []):
-            pattern_doc = {
-                "detector_id": finding["detector_id"],
-                "title": finding["title"],
-                "severity": finding["severity"],
-                "owasp": finding.get("owasp", []),
-                "remediation": finding["remediation"],
-                "pattern_text": f"{finding['title']} {finding['impact']} {finding['remediation']}",
-                "updated_at": now,
-            }
+            pattern_doc = vuln_pattern_doc(finding, now=now)
             db.vuln_patterns.update_one(
                 {"detector_id": finding["detector_id"], "title": finding["title"]},
                 {"$set": pattern_doc, "$inc": {"observation_count": 1}, "$setOnInsert": {"created_at": now}},
@@ -69,3 +51,50 @@ class MongoMirror:
             )
         client.close()
         return "mirrored redacted stats and generic patterns to Mongo"
+
+
+def scan_history_doc(payload: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    summary = payload.get("summary", {})
+    return {
+        "created_at": now or datetime.now(UTC),
+        "schema_version": payload.get("schema_version"),
+        "total_findings": summary.get("total", 0),
+        "critical_count": summary.get("critical_count", 0),
+        "high_count": summary.get("high_count", 0),
+        "confirmed_count": summary.get("confirmed_count", 0),
+        "by_severity": summary.get("by_severity", {}),
+        "by_status": summary.get("by_status", {}),
+        "by_detector": summary.get("by_detector", {}),
+    }
+
+
+def vuln_pattern_doc(finding: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    pattern_text = f"{finding['title']} {finding['impact']} {finding['remediation']}"
+    return {
+        "detector_id": finding["detector_id"],
+        "title": finding["title"],
+        "severity": finding["severity"],
+        "owasp": finding.get("owasp", []),
+        "remediation": finding["remediation"],
+        "pattern_text": pattern_text,
+        "embedding_text": pattern_text,
+        "embedding_model": "penny-hash-v1",
+        "embedding": hashed_embedding(pattern_text),
+        "updated_at": now or datetime.now(UTC),
+    }
+
+
+def hashed_embedding(text: str, dimensions: int = 64) -> list[float]:
+    vector = [0.0] * dimensions
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return vector
+    for token in tokens:
+        digest = sha256(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:2], "big") % dimensions
+        sign = 1.0 if digest[2] % 2 == 0 else -1.0
+        vector[index] += sign
+    magnitude = sum(value * value for value in vector) ** 0.5
+    if not magnitude:
+        return vector
+    return [round(value / magnitude, 6) for value in vector]

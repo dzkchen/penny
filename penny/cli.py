@@ -15,9 +15,12 @@ from .store import FindingsStore, copy_report_to_findings_dir
 def _report_command(findings: Path, out_dir: Path, feed: EventFeed) -> Path:
     payload = load_findings(findings)
     session_id = payload.get("session_id", "manual-report")
+    feed.emit("blue", "Writing report with concrete fixes")
     report = generate_report(payload)
     report_path = FindingsStore(out_dir).write_report(session_id, report)
     copy_report_to_findings_dir(report_path, findings)
+    verdict = report.split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip()
+    feed.emit("purple", f"Verdict: {verdict}")
     feed.emit("report", f"Wrote {report_path}")
     return report_path
 
@@ -64,7 +67,6 @@ def _build_typer_app():
         feed = EventFeed()
         result = run_scan(path, target=target, out_dir=out, i_own_this=i_own_this, feed=feed)
         _report_command(result.findings_path, out, feed)
-        feed.emit("purple", "Verdict: " + generate_report(result.payload).split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip())
 
     @app.command("demo-replay")
     def demo_replay(
