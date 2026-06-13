@@ -11,10 +11,16 @@ from typing import Iterator
 
 GIT_SOURCE_RE = re.compile(r"^(?:https://|git@|ssh://|file://).+\.git(?:#.+)?$|^[^@\s]+@[^:\s]+:.+\.git(?:#.+)?$")
 URL_SOURCE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+# Common git hosts: accept a bare repo URL without a trailing .git for convenience,
+# e.g. https://github.com/owner/repo or https://gitlab.com/owner/repo[#ref].
+GIT_HOST_RE = re.compile(
+    r"^https://(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/[^/\s]+/[^/\s#]+(?:#.+)?$",
+    re.I,
+)
 
 
 def is_git_source(source: str) -> bool:
-    return bool(GIT_SOURCE_RE.match(source))
+    return bool(GIT_SOURCE_RE.match(source)) or bool(GIT_HOST_RE.match(source))
 
 
 def is_url_source(source: str) -> bool:
@@ -52,6 +58,9 @@ def resolved_scan_source(source: str | Path) -> Iterator[Path]:
         return
 
     url, ref = _split_ref(source_text)
+    # Normalize a bare host URL (no trailing .git) to a clonable URL.
+    if GIT_HOST_RE.match(source_text) and not url.endswith(".git"):
+        url = url + ".git"
     temp_dir = Path(tempfile.mkdtemp(prefix="penny-git-"))
     clone_dir = temp_dir / "repo"
     try:
