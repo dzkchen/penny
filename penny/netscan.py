@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import socket
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 from .feed import EventFeed
 from .guardrails import host_allowed
 from .models import Finding, Location
+
+# Probe every port concurrently. A sequential scan blocks the full `timeout` on
+# each firewalled/dropped port, so N filtered ports cost ~N*timeout; one connect
+# per thread collapses that to ~a single timeout of wall-clock. Capped so a custom
+# port list can't spawn an unbounded number of threads.
+MAX_SCAN_WORKERS = 32
 
 # Curated common-service ports. Kept deliberately small so the scan stays quick
 # and clearly bounded rather than a full 65k sweep.
@@ -119,12 +126,21 @@ def run_port_scan(
     connect = connect or _tcp_connect
     feed.emit("attack", f"Port scan on {host} ({len(ports)} common ports, connect-only)")
 
-    open_ports: dict[int, str] = {}
-    for port in sorted(ports):
+    def probe(port: int) -> tuple[int, bool]:
         try:
-            is_open = connect(host, port, timeout)
+            return port, connect(host, port, timeout)
         except Exception:  # noqa: BLE001 - a flaky socket must never crash the scan
-            continue
+            return port, False
+
+    # `pool.map` yields results in input order, so the "open:" lines below still
+    # emit in ascending port order — same output as the old sequential scan, but
+    # the connects all happen in parallel.
+    scan_ports = sorted(ports)
+    with ThreadPoolExecutor(max_workers=max(1, min(len(scan_ports), MAX_SCAN_WORKERS))) as pool:
+        results = list(pool.map(probe, scan_ports))
+
+    open_ports: dict[int, str] = {}
+    for port, is_open in results:
         if is_open:
             service = ports[port]
             open_ports[port] = service
