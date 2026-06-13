@@ -96,10 +96,12 @@ def _build_typer_app():
         static_only: bool = typer.Option(False, "--static-only"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
+        ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
     ) -> None:
         try:
             with resolved_scan_source(path) as resolved:
-                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path)
+                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path, use_osv=osv, use_ai=ai)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
 
@@ -185,11 +187,13 @@ def _build_typer_app():
         target: str = typer.Option(..., "--target"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
+        ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path)
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed)
@@ -214,6 +218,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--static-only", action="store_true")
     scan_parser.add_argument("--out", type=Path, default=Path("."))
     scan_parser.add_argument("--i-own-this", action="store_true")
+    scan_parser.add_argument("--osv", action="store_true")
+    scan_parser.add_argument("--ai", action="store_true")
 
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=Path("findings.json"))
@@ -252,6 +258,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--target", required=True)
     run_parser.add_argument("--out", type=Path, default=Path("."))
     run_parser.add_argument("--i-own-this", action="store_true")
+    run_parser.add_argument("--osv", action="store_true")
+    run_parser.add_argument("--ai", action="store_true")
 
     replay_parser = sub.add_parser("demo-replay")
     replay_parser.add_argument("--recording", type=Path)
@@ -262,7 +270,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path)
+                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
     elif args.command == "report":
@@ -301,7 +309,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "run":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path)
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)
@@ -310,6 +318,12 @@ def _fallback_main(argv: list[str] | None = None) -> None:
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("repl", "shell"):
+        from .repl import run_repl
+
+        run_repl()
+        return
     try:
         app = _build_typer_app()
     except Exception:

@@ -278,8 +278,18 @@ def detect_permissive_access_policy(files: Iterable[SourceFile]) -> list[Finding
     return findings
 
 
-def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]:
-    findings: list[Finding] = []
+@dataclass(frozen=True)
+class ParsedDependency:
+    ecosystem: str
+    package: str
+    version: str
+    file: SourceFile
+    line_no: int
+    line: str
+
+
+def _iter_dependencies(files: Iterable[SourceFile]) -> Iterable[ParsedDependency]:
+    """Yield every (ecosystem, package, version) pin from supported manifests."""
     for file in files:
         lower_path = file.relative_path.lower()
         if lower_path.endswith("package.json"):
@@ -287,35 +297,15 @@ def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]
                 package_json = json.loads(file.text)
             except json.JSONDecodeError:
                 continue
-            dependency_blocks = [
-                package_json.get("dependencies", {}),
-                package_json.get("devDependencies", {}),
-            ]
             lines = file.text.splitlines()
-            for dependencies in dependency_blocks:
-                if not isinstance(dependencies, dict):
+            for block in (package_json.get("dependencies", {}), package_json.get("devDependencies", {})):
+                if not isinstance(block, dict):
                     continue
-                for package, raw_version in dependencies.items():
-                    key = ("npm", package.lower())
-                    vuln = VULNERABLE_DEPENDENCIES.get(key)
-                    if not vuln:
-                        continue
+                for package, raw_version in block.items():
                     version = str(raw_version).lstrip("^~>=< ")
-                    if not _version_less_than(version, vuln.vulnerable_below):
-                        continue
                     line_no = next((index for index, line in enumerate(lines, start=1) if f'"{package}"' in line), 1)
                     line = lines[line_no - 1] if lines else ""
-                    findings.append(
-                        _dependency_finding(
-                            file=file,
-                            line_no=line_no,
-                            column=_line_column(line, package),
-                            package=package,
-                            version=version,
-                            vuln=vuln,
-                            line=line,
-                        )
-                    )
+                    yield ParsedDependency("npm", package, version, file, line_no, line)
         elif lower_path.endswith("requirements.txt"):
             for line_no, line in enumerate(file.text.splitlines(), start=1):
                 stripped = line.strip()
@@ -324,21 +314,93 @@ def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]
                 match = re.match(r"([A-Za-z0-9_.\-]+)\s*==\s*([A-Za-z0-9_.!+\-]+)", stripped)
                 if not match:
                     continue
-                package, version = match.group(1), match.group(2)
-                vuln = VULNERABLE_DEPENDENCIES.get(("pypi", package.lower()))
-                if vuln and _version_less_than(version, vuln.vulnerable_below):
-                    findings.append(
-                        _dependency_finding(
-                            file=file,
-                            line_no=line_no,
-                            column=_line_column(line, package),
-                            package=package,
-                            version=version,
-                            vuln=vuln,
-                            line=line,
-                        )
-                    )
+                yield ParsedDependency("pypi", match.group(1), match.group(2), file, line_no, line)
+
+
+def detect_vulnerable_dependencies(files: Iterable[SourceFile]) -> list[Finding]:
+    findings: list[Finding] = []
+    for dep in _iter_dependencies(files):
+        vuln = VULNERABLE_DEPENDENCIES.get((dep.ecosystem, dep.package.lower()))
+        if not vuln or not _version_less_than(dep.version, vuln.vulnerable_below):
+            continue
+        findings.append(
+            _dependency_finding(
+                file=dep.file,
+                line_no=dep.line_no,
+                column=_line_column(dep.line, dep.package),
+                package=dep.package,
+                version=dep.version,
+                vuln=vuln,
+                line=dep.line,
+            )
+        )
     return findings
+
+
+def detect_dependencies_via_advisories(files: Iterable[SourceFile], lookup) -> list[Finding]:
+    """Emit D005 findings from a live advisory feed (e.g. OSV.dev).
+
+    ``lookup(ecosystem, package, version) -> list[Advisory]`` is injected so this
+    stays offline-testable; any provider exposing ``advisory_id``, ``cve``,
+    ``severity``, ``summary``, and ``fixed_version`` works.
+    """
+    findings: list[Finding] = []
+    for dep in _iter_dependencies(files):
+        for advisory in lookup(dep.ecosystem, dep.package, dep.version):
+            fixed = getattr(advisory, "fixed_version", "") or ""
+            remediation = (
+                f"Upgrade {dep.package} to {fixed} or later and rerun dependency tests."
+                if fixed
+                else f"Upgrade {dep.package} to a fixed version and rerun dependency tests."
+            )
+            findings.append(
+                Finding(
+                    title=f"Vulnerable dependency: {dep.package} {dep.version}",
+                    severity=getattr(advisory, "severity", "High") or "High",
+                    confidence="high",
+                    status="suspected",
+                    source="static",
+                    detector_id="D005",
+                    owasp=["A06:2021-Vulnerable and Outdated Components"],
+                    location=Location(file=dep.file.relative_path, line=dep.line_no, column=_line_column(dep.line, dep.package)),
+                    snippet=redact_text(dep.line.strip()),
+                    evidence={
+                        "ecosystem": dep.ecosystem,
+                        "package": dep.package,
+                        "detected_version": dep.version,
+                        "advisory": getattr(advisory, "advisory_id", ""),
+                        "cve": getattr(advisory, "cve", ""),
+                        "fixed_version": fixed or "see advisory",
+                        "reason": getattr(advisory, "summary", "") or "A published advisory affects this version.",
+                        "source": "osv.dev",
+                    },
+                    impact="A dependency with a published advisory can reintroduce exploitable behavior even when application code looks safe.",
+                    remediation=remediation,
+                )
+            )
+    return findings
+
+
+def merge_dependency_findings(curated: list[Finding], advisory_findings: list[Finding]) -> list[Finding]:
+    """Combine curated and advisory D005 findings, dropping curated duplicates.
+
+    Advisory results win for any (package, version) they cover, so online scans
+    get rich CVE data while offline scans keep the curated safety net.
+    """
+
+    def key(finding: Finding) -> tuple[str, str]:
+        return (
+            str(finding.evidence.get("package", "")).lower(),
+            str(finding.evidence.get("detected_version", "")),
+        )
+
+    covered = {key(finding) for finding in advisory_findings}
+    kept = [
+        finding
+        for finding in curated
+        if not (finding.detector_id == "D005" and key(finding) in covered)
+    ]
+    return kept + advisory_findings
 
 
 def detect_permissive_cors(files: Iterable[SourceFile]) -> list[Finding]:

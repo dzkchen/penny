@@ -14,18 +14,39 @@ Installable CLI metadata is included, so after installing the package the same c
 penny run ./planted-app --target http://127.0.0.1:8787
 ```
 
-## Commands
+## Interactive mode
+
+Run `penny` with no arguments to launch an interactive session (a styled REPL — no extra dependencies required). Type a question to ask the assistant about the loaded findings, or a `/command` to act:
 
 ```bash
-python -m penny scan <path> [--target URL] [--static-only] [--out DIR]
-python -m penny report [--findings PATH] [--out DIR]
-python -m penny ask "question" [--findings PATH] [--target URL] [--no-ai]
-python -m penny ask-loop [--findings PATH] [--target URL] [--no-ai]
-python -m penny run <path> --target URL [--out DIR]
-python -m penny patch [--findings PATH] --repo PATH [--out penny.patch] [--apply]
+python -m penny            # or: penny
+```
+
+```text
+penny › /scan ./planted-app --osv --ai
+penny › /findings
+penny › /show F-001
+penny › what should Blue fix first?
+penny › /report --export
+penny › /exit
+```
+
+Available commands: `/scan`, `/report`, `/findings`, `/show <id>`, `/target`, `/ai on|off`, `/clear`, `/help`, `/exit`. On startup Penny auto-loads the most recent scan's findings if present, and shows whether AI is enabled. Colour is used on a TTY and disabled automatically when output is piped. The one-shot subcommands below remain available for scripting.
+
+## Commands
+
+Replace the `<...>` placeholders with your own values (e.g. `--target http://localhost:3000`, `--out .`).
+
+```bash
+python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai]
+python -m penny report [--findings <path>] [--out <dir>]
+python -m penny ask "question" [--findings <path>] [--target <url>] [--no-ai]
+python -m penny ask-loop [--findings <path>] [--target <url>] [--no-ai]
+python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai]
+python -m penny patch [--findings <path>] --repo <path> [--out penny.patch] [--apply]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends [--days 7] [--limit 10]
-python -m penny demo-replay [--recording PATH] [--out DIR]
+python -m penny demo-replay [--recording <path>] [--out <dir>]
 ```
 
 The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available.
@@ -39,6 +60,12 @@ cp .env.example .env   # then set ANTHROPIC_API_KEY
 python -m penny ask "What did Red confirm and what should Blue fix first?" --findings .penny/runs/latest/findings.json
 python -m penny ask "Summarize F-001 and how to fix it" --no-ai   # deterministic, no API call
 ```
+
+### AI-assisted detection (`--ai`)
+
+`scan --ai` / `run --ai` add an AI review pass: Penny sends bounded, line-numbered source to Claude (the deep model) and folds back any vulnerabilities it finds — broken auth/authorization, injection through indirect data flow, SSRF, unsafe deserialization, and similar issues the regex detectors can't reason about. These land as `AI001` findings (`source: ai`) alongside the deterministic ones; each finding's snippet is rebuilt from the real source line and redacted, so the model can't smuggle an unredacted secret into persisted output.
+
+Unlike the rest of Penny, `--ai` sends source code to Anthropic, so it is opt-in. It respects the same walker, so gitignored files (e.g. a local `.env`) are never included. Without a key it is a no-op.
 
 `<path>` can be a local directory or a git source URL ending in `.git`, including an optional ref suffix:
 
@@ -82,7 +109,9 @@ The planted app includes a client-visible service-role key, a committed fake sec
 
 Penny only runs read-only HTTP probes. Localhost and private-network targets are allowed by default. Public targets require `--i-own-this`; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
 
-Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, database URLs, emails, and high-entropy token-shaped values before persistence.
+Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, private keys, database URLs, emails, and high-entropy token-shaped values before persistence.
+
+By default Penny only talks to the scan target's localhost. Three features add opt-in outbound calls, and each sends the minimum needed: `ask`/`ask-loop` send the already-redacted findings to the configured Claude model; `--osv` sends only dependency names and versions to OSV.dev; `--ai` sends source code (never gitignored files) to the Claude model. All three degrade to local-only behavior when disabled or unconfigured.
 
 ## Coverage
 
@@ -92,13 +121,14 @@ Current deterministic checks:
 - `D002`: committed secret using known prefixes (Stripe, GitHub, AWS, Google, OpenAI/Anthropic, etc.) and entropy heuristics.
 - `D003`: permissive RLS/access policy.
 - `D004`: dynamic BOLA/IDOR order-read probe.
-- `D005`: vulnerable dependency detector for curated high-signal package/version pairs.
+- `D005`: vulnerable dependency detector. Offline it uses a small curated list; with `--osv` it queries the public [OSV.dev](https://osv.dev) feed for every parsed dependency (npm + PyPI) and reports real advisory IDs, CVEs, severities, and fixed versions. Only package names and versions leave the machine, and OSV results supersede the curated entries they cover.
 - `D006`: permissive CORS detector with dynamic header confirmation.
 - `D007`: committed private key (PEM key material in source control).
 - `D008`: dangerous execution sinks — `os.system`/`subprocess(shell=True)`/`child_process.exec`, `pickle`/`yaml.load` deserialization, and dynamic `eval`/`exec`.
 - `D009`: SQL injection from string-built queries handed to an `execute`/`query` call.
 - `D010`: disabled TLS verification (`verify=False`, `rejectUnauthorized: false`, unverified SSL context).
 - `D011`: production debug mode (`app.run(debug=True)`, `DEBUG = True`).
+- `AI001`: AI-assisted review (opt-in via `--ai`) for issues regex can't catch — see "AI-assisted detection" above.
 
 Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers. The code-pattern detectors (`D008`–`D011`) only scan source files (`.py`, `.js`/`.jsx`, `.ts`/`.tsx`).
 

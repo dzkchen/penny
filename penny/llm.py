@@ -74,11 +74,13 @@ def complete(
     deep: bool = True,
     max_tokens: int = 1024,
     timeout: float = 30.0,
+    response_schema: dict | None = None,
 ) -> str | None:
     """Return Claude's text answer, or ``None`` if the call cannot be made.
 
     Any missing key, missing dependency, network error, or non-2xx response
-    yields ``None`` so callers degrade to deterministic output.
+    yields ``None`` so callers degrade to deterministic output. When
+    ``response_schema`` is given the response is constrained to that JSON schema.
     """
     key = api_key()
     if key is None:
@@ -95,6 +97,8 @@ def complete(
     }
     if system:
         body["system"] = system
+    if response_schema is not None:
+        body["output_config"] = {"format": {"type": "json_schema", "schema": response_schema}}
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
     try:

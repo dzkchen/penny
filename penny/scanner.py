@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .detectors import run_detectors
+from .advisories import lookup as osv_lookup
+from .ai_review import ai_review
+from .detectors import (
+    detect_dependencies_via_advisories,
+    merge_dependency_findings,
+    run_detectors,
+)
 from .feed import EventFeed
 from .models import assign_finding_ids, now_session_id
 from .mongo import MongoMirror
@@ -28,6 +34,8 @@ def run_scan(
     i_own_this: bool = False,
     feed: EventFeed | None = None,
     source_label: str | None = None,
+    use_osv: bool = False,
+    use_ai: bool = False,
 ) -> ScanResult:
     feed = feed or EventFeed()
     session_id = now_session_id()
@@ -45,6 +53,12 @@ def run_scan(
     elif patterns:
         feed.emit("mongo", f"Knowledge search returned {len(patterns)} generic pattern(s)")
     findings = run_detectors(files)
+    if use_osv:
+        advisory_findings = detect_dependencies_via_advisories(files, osv_lookup)
+        findings = merge_dependency_findings(findings, advisory_findings)
+        feed.emit("osv", f"OSV advisories matched {len(advisory_findings)} dependency finding(s)")
+    if use_ai:
+        findings.extend(ai_review(files, feed=feed))
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
