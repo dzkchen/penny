@@ -137,27 +137,104 @@ class Session:
         return True
 
     def _route_intent(self, line: str) -> bool:
-        """Map plain-English requests to actions. Returns True if it handled the line."""
+        """Map plain-English requests to actions. Returns True if it handled the line.
+
+        Lets the user drive everything in natural language so slash-commands are optional.
+        Order matters: more specific intents are checked before broad ones.
+        """
         low = line.lower()
         path = self._extract_path(line)
-        flags = self._extract_flags(line)
-        audit_words = ("pentest", "pen test", "audit", "full scan", "run everything", "test this", "attack")
-        if any(word in low for word in audit_words):
+        url = self._extract_url(line)
+        finding_id = self._extract_finding_id(line)
+
+        # --- model selection ---
+        if "model" in low:
+            for mode in ("auto", "haiku", "sonnet"):
+                if mode in low:
+                    self._set_model([mode])
+                    return True
+            self._set_model([])
+            return True
+
+        # --- ownership ---
+        if ("i own" in low or "own this" in low or "it's mine" in low or "its mine" in low):
+            self._set_own(["on"])
+            # fall through so "i own this, pentest X" also triggers the audit
+
+        # --- set target from a sentence ---
+        if url and ("target" in low or "set" in low or "use" in low) and not any(w in low for w in ("audit", "pentest", "scan", "attack", "test")):
+            self._set_target([url])
+            return True
+
+        # --- show a specific finding ---
+        if finding_id and ("show" in low or "explain" in low or "what is" in low or "detail" in low or "tell me about" in low):
+            self._show([finding_id])
+            return True
+
+        # --- list findings ---
+        if any(w in low for w in ("list findings", "show findings", "what did you find", "what's wrong", "whats wrong", "show me the findings", "findings")):
+            self._findings()
+            return True
+
+        # Questions (start with a question word or end with '?') are NEVER actions —
+        # they go to ask-mode so "what should blue fix first?" stays a question.
+        is_question = low.strip().endswith("?") or low.split()[:1] and low.split()[0] in (
+            "what", "why", "how", "is", "are", "should", "can", "does", "do", "which", "who", "when", "where",
+        )
+
+        # --- fix (imperative only) ---
+        if not is_question and ("fix the" in low or "fix it" in low or "fix them" in low or low.strip() in ("fix", "apply fixes", "fix everything")):
+            self._fix(["--yes"] if ("just" in low or "all" in low or "auto" in low or "everything" in low) else [])
+            return True
+
+        # --- report / export ---
+        if not is_question and ("report" in low or "export" in low):
+            self._report(["--export"] if "export" in low else [])
+            return True
+
+        # --- knowledge base / RAG lookup ---
+        if not is_question and ("knowledge base" in low or "similar findings" in low):
+            self._knowledge([line])
+            return True
+
+        # --- full audit (broad, imperative only) ---
+        flags = self._extract_flags(line) if hasattr(self, "_extract_flags") else []
+        audit_words = ("pentest", "pen test", "audit", "full scan", "run everything", "test this", "attack", "hack")
+        if not is_question and any(word in low for word in audit_words):
+            if url:
+                self._set_target([url])
             self._audit(([path] if path else []) + flags)
             return True
-        if "fix" in low and ("issue" in low or "finding" in low or "vuln" in low or "code" in low or "them" in low):
-            self._fix([])
+
+        # --- plain scan ---
+        if not is_question and ("scan" in low or "check" in low) and (path or url):
+            if url:
+                self._set_target([url])
+            self._scan(([path] if path else []) + flags)
             return True
+
+        # bare keywords
         if low.strip() in ("full", "audit"):
             self._audit([])
             return True
-        if ("scan" in low or "check" in low) and path:
-            self._scan([path] + flags)
-            return True
-        if low.strip() in ("report", "make a report", "write the report"):
-            self._report([])
-            return True
         return False
+
+    def _extract_url(self, line: str) -> str | None:
+        for token in line.split():
+            if token.startswith("http://") or token.startswith("https://"):
+                return token.rstrip(".,;")
+        return None
+
+    def _extract_finding_id(self, line: str) -> str | None:
+        import re
+
+        match = re.search(r"\b([FA]-?\d{1,3}|F\d{3})\b", line, re.I)
+        if not match:
+            return None
+        token = match.group(0).upper().replace(" ", "")
+        if "-" not in token and len(token) >= 2:
+            token = token[0] + "-" + token[1:]
+        return token
 
     def _extract_path(self, line: str) -> str | None:
         """Pull a local path or repo URL token out of a sentence."""
@@ -200,6 +277,8 @@ class Session:
             self._fix(args)
         elif cmd == "report":
             self._report(args)
+        elif cmd == "knowledge":
+            self._knowledge(args)
         elif cmd in ("findings", "ls"):
             self._findings()
         elif cmd == "show":
@@ -452,6 +531,19 @@ class Session:
             return
         self.target = args[0]
         self.out(ui.style(f"Probe target set: {self.target}", "green"))
+
+    def _knowledge(self, args: list[str]) -> None:
+        from .mongo import MongoMirror
+
+        query = " ".join(args).strip() or "common vulnerabilities"
+        patterns, message = MongoMirror().search_patterns(query, limit=5)
+        if message:
+            self.out(ui.dim(message))
+        if not patterns:
+            self.out(ui.dim("No matching patterns in the knowledge base yet (run a scan to populate it)."))
+            return
+        for p in patterns:
+            self.out(ui.dim(f"• {p.get('detector_id','?')} {p.get('title','')} — {p.get('remediation','')}"))
 
     def _ask(self, question: str) -> None:
         if not self.findings_path:
