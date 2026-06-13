@@ -21,9 +21,10 @@ python -m penny scan <path> [--target URL] [--static-only] [--out DIR]
 python -m penny report [--findings PATH] [--out DIR]
 python -m penny ask "question" [--findings PATH] [--target URL]
 python -m penny ask-loop [--findings PATH] [--target URL]
-python -m penny run <path> --target URL [--out DIR]
+python -m penny run <path> --target URL [--agentic] [--out DIR]
 python -m penny patch [--findings PATH] --repo PATH [--out penny.patch] [--apply]
 python -m penny fix [--findings PATH] --repo PATH [--yes]
+python -m penny github-fix <repo-url> [--workdir DIR] [--branch NAME] [--yes] [--push]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends [--days 7] [--limit 10]
 python -m penny demo-replay [--recording PATH] [--out DIR]
@@ -38,6 +39,25 @@ it asks Claude for a corrected version, shows a colored diff, and applies it onl
 after you approve (`--yes` applies all without prompting, for non-interactive demos).
 When no `ANTHROPIC_API_KEY` is configured it falls back to deterministic patch plans,
 still gated by approval. `fix` only ever writes to the local `--repo` path.
+
+`github-fix` does the full round trip on a repo URL: clone, scan, apply approved
+fixes on a new `penny/fixes` branch, commit, and (with `--push`) push so you can open
+a PR. It never touches the default branch and never force-pushes.
+
+`--agentic` adds a Claude-driven probe loop on top of the deterministic probes: Claude
+proposes the next read-only probe (path + headers), Python validates it through the
+same guardrails, runs it, and feeds the redacted result back so Claude can decide the
+next step. It auto-detects Supabase URLs/tables from the scanned source so it adapts to
+any app, not just the planted one.
+
+### Embeddings and RAG
+
+The Mongo `vuln_patterns` collection is vector-searchable. Embeddings come from Voyage
+AI (`VOYAGE_API_KEY`) for real semantic recall, falling back to a deterministic hash
+embedding when no key is set. At report and ask time, Penny runs a Mongo vector search
+and feeds the retrieved patterns into Claude's prompt — retrieval-augmented generation
+grounded in the knowledge base. Recreate the Atlas vector index for the active backend's
+dimensions with `MongoMirror().ensure_vector_index()` (Voyage = 1024 dims, hash = 64).
 
 The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available.
 
