@@ -25,17 +25,21 @@ from .store import FindingsStore, copy_report_to_findings_dir
 SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
 
 HELP = """\
-/scan <path> [--osv] [--ai] [--static-only] [--target <url>]   scan a repo or .git URL
-/report [--export]                                            write report.md (+ html/csv)
-/findings                                                     list the current findings
-/show <F-001>                                                 show one finding in detail
-/target <url|off>                                             set the dynamic-probe target
-/ai <on|off>                                                  toggle AI answers/review
-/clear                                                        clear the screen
-/help                                                         show this help
-/exit                                                         leave
+/audit <path> [--target <url>]    FULL audit: scan + AI + all probes + report
+/full  <path> [--target <url>]    alias for /audit
+/scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--static-only] [--target <url>]
+/report [--export]                write report.md (+ html/csv)
+/fix [--yes]                      fix flagged files with approval (Claude rewrites them)
+/findings                         list the current findings
+/show <F-001>                     show one finding in detail
+/target <url|off>                 set the dynamic-probe target
+/ai <on|off>                      toggle AI answers/review
+/clear                            clear the screen
+/help                             show this help
+/exit                             leave
 
-Type anything else to ask the assistant about the loaded findings."""
+Natural language works too: "pentest this app", "run a full audit on ./planted-app",
+"fix the issues", or just ask a question about the findings."""
 
 
 class PrettyFeed(EventFeed):
@@ -119,8 +123,40 @@ class Session:
             return True
         if line.startswith("/"):
             return self._command(line[1:])
+        # Natural-language routing: let users say "pentest this app" / "audit ./x".
+        if self._route_intent(line):
+            return True
         self._ask(line)
         return True
+
+    def _route_intent(self, line: str) -> bool:
+        """Map plain-English requests to actions. Returns True if it handled the line."""
+        low = line.lower()
+        path = self._extract_path(line)
+        audit_words = ("pentest", "pen test", "audit", "full scan", "run everything", "test this", "attack")
+        if any(word in low for word in audit_words):
+            self._audit([path] if path else [])
+            return True
+        if "fix" in low and ("issue" in low or "finding" in low or "vuln" in low or "code" in low or "them" in low):
+            self._fix([])
+            return True
+        if low.strip() in ("full", "audit"):
+            self._audit([])
+            return True
+        if ("scan" in low or "check" in low) and path:
+            self._scan([path])
+            return True
+        if low.strip() in ("report", "make a report", "write the report"):
+            self._report([])
+            return True
+        return False
+
+    def _extract_path(self, line: str) -> str | None:
+        """Pull a local path or repo URL token out of a sentence."""
+        for token in line.split():
+            if token.startswith("./") or token.startswith("/") or token.endswith(".git") or "github.com" in token or "/" in token and not token.startswith("--"):
+                return token
+        return None
 
     def _command(self, rest: str) -> bool:
         parts = rest.split()
@@ -132,8 +168,12 @@ class Session:
             self._help()
         elif cmd == "clear":
             self.out("\x1b[2J\x1b[H")
+        elif cmd in ("audit", "full"):
+            self._audit(args)
         elif cmd == "scan":
             self._scan(args)
+        elif cmd == "fix":
+            self._fix(args)
         elif cmd == "report":
             self._report(args)
         elif cmd in ("findings", "ls"):
@@ -150,9 +190,10 @@ class Session:
         return True
 
     # ---- commands ---------------------------------------------------------
-    def _scan(self, args: list[str]) -> None:
+    def _scan(self, args: list[str], *, force: dict[str, bool] | None = None) -> None:
         path: str | None = None
         use_osv = use_ai = use_active = static_only = False
+        agentic = brute = browser = False
         target = self.target
         i_own_this = self.i_own_this
         tokens = iter(args)
@@ -163,6 +204,12 @@ class Session:
                 use_ai = True
             elif token == "--active":
                 use_active = True
+            elif token == "--agentic":
+                agentic = True
+            elif token == "--brute":
+                brute = True
+            elif token == "--browser":
+                browser = True
             elif token == "--i-own-this":
                 i_own_this = True
             elif token == "--static-only":
@@ -171,8 +218,15 @@ class Session:
                 target = next(tokens, None)
             elif not token.startswith("-") and path is None:
                 path = token
+        if force:
+            use_osv = force.get("osv", use_osv)
+            use_ai = force.get("ai", use_ai)
+            use_active = force.get("active", use_active)
+            agentic = force.get("agentic", agentic)
+            brute = force.get("brute", brute)
+            browser = force.get("browser", browser)
         if not path:
-            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--i-own-this] [--static-only] [--target <url>]")
+            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--i-own-this] [--static-only] [--target <url>]")
             return
 
         self.out(ui.dim(f"Scanning {path}…"))
@@ -185,6 +239,9 @@ class Session:
                     static_only=static_only,
                     out_dir=self.out_dir,
                     i_own_this=i_own_this,
+                    agentic=agentic,
+                    brute=brute,
+                    browser=browser,
                     feed=feed,
                     source_label=path,
                     use_osv=use_osv,
@@ -199,6 +256,42 @@ class Session:
         self.out()
         self._summary()
         self._findings()
+
+    def _audit(self, args: list[str]) -> None:
+        """Full pipeline: scan + AI + every probe + report, in one command."""
+        path = next((t for t in args if not t.startswith("-")), None)
+        if not path and self.findings_path:
+            path = (self.payload or {}).get("scan", {}).get("source")
+        if not path:
+            self._warn("Usage: /audit <path> [--target <url>]   (e.g. /audit ./planted-app --target http://127.0.0.1:8787)")
+            return
+        # honor an inline --target, else the session target
+        if "--target" in args:
+            self.target = args[args.index("--target") + 1] if args.index("--target") + 1 < len(args) else self.target
+        if not self.target:
+            self.out(ui.dim("No target set — running static + code analysis only. Use --target <url> for live probes."))
+        self.out(ui.style(f"🔎 Running FULL audit on {path}…", "bold", "magenta"))
+        forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True}
+        self._scan([path], force=forced)
+        if self.payload:
+            self._report(["--export"])
+        self.out(ui.style("✅ Full audit complete — findings + report.md written.", "bright_green"))
+
+    def _fix(self, args: list[str]) -> None:
+        if not self.findings_path or not self.payload:
+            self._warn("No findings loaded. Run /scan or /audit first.")
+            return
+        from .agent_fix import run_agent_fix
+
+        repo = (self.payload or {}).get("scan", {}).get("resolved_path") or "."
+        auto_yes = "--yes" in args
+        feed = PrettyFeed(self.printer)
+        self.out(ui.style(f"🔧 Fixing flagged files in {repo} (approval required unless --yes)…", "bold", "cyan"))
+        changed = run_agent_fix(self.payload, Path(repo), feed=feed, auto_yes=auto_yes)
+        if changed:
+            self.out(ui.style(f"Applied {len(changed)} fix(es).", "bright_green"))
+        else:
+            self.out(ui.dim("No fixes applied."))
 
     def _summary(self) -> None:
         summary = (self.payload or {}).get("summary", {})
