@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .agent_fix import run_agent_fix
 from .ask import answer_question
 from .exports import write_exports
 from .feed import EventFeed
@@ -66,6 +67,16 @@ def _patch_command(findings: Path, repo: Path, out: Path, apply: bool, feed: Eve
             feed.emit("blue", "No applicable source changes found")
 
 
+def _fix_command(findings: Path, repo: Path, auto_yes: bool, feed: EventFeed) -> None:
+    payload = load_findings(findings)
+    feed.emit("blue", f"Interactive fix mode on {repo} (LLM-driven, approval required)")
+    changed = run_agent_fix(payload, repo, feed=feed, auto_yes=auto_yes)
+    if changed:
+        feed.emit("blue", f"Applied {len(changed)} fix(es). Review with `git diff` before committing.")
+    else:
+        feed.emit("blue", "No fixes applied")
+
+
 def _build_typer_app():
     import typer
 
@@ -119,6 +130,14 @@ def _build_typer_app():
         apply: bool = typer.Option(False, "--apply", help="Apply generated fixes to the local repo."),
     ) -> None:
         _patch_command(findings, repo, out, apply, EventFeed())
+
+    @app.command()
+    def fix(
+        findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
+        repo: Path = typer.Option(Path("."), "--repo"),
+        yes: bool = typer.Option(False, "--yes", help="Apply all proposed fixes without prompting (demo/non-interactive)."),
+    ) -> None:
+        _fix_command(findings, repo, yes, EventFeed())
 
     @app.command()
     def knowledge(
@@ -211,6 +230,11 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     patch_parser.add_argument("--out", type=Path, default=Path("penny.patch"))
     patch_parser.add_argument("--apply", action="store_true")
 
+    fix_parser = sub.add_parser("fix")
+    fix_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
+    fix_parser.add_argument("--repo", type=Path, default=Path("."))
+    fix_parser.add_argument("--yes", action="store_true")
+
     knowledge_parser = sub.add_parser("knowledge")
     knowledge_parser.add_argument("query")
     knowledge_parser.add_argument("--limit", type=int, default=5)
@@ -245,6 +269,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         _ask_loop(args.findings, args.target, args.i_own_this, feed)
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
+    elif args.command == "fix":
+        _fix_command(args.findings, args.repo, args.yes, feed)
     elif args.command == "knowledge":
         patterns, message = MongoMirror().search_patterns(args.query, limit=args.limit)
         if message:

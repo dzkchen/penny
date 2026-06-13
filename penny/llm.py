@@ -132,3 +132,63 @@ def llm_verdict(findings_json: str, *, deterministic: str) -> str:
     )
     result = _call(_VERDICT_SYSTEM, user, max_tokens=512)
     return result if result else deterministic
+
+
+_FIX_SYSTEM = (
+    "You are Penny's Blue-Team remediation agent. You are given the FULL CONTENTS of one source "
+    "file from a consented security audit, plus the finding(s) located in it. Produce a corrected "
+    "version of the WHOLE file that fixes the security issue while preserving all unrelated code, "
+    "formatting, and behavior. "
+    "Rules: never invent or hardcode real secrets; move credentials to environment variables; "
+    "for access-control issues add explicit ownership/auth checks; make the minimal change that fixes "
+    "the issue. "
+    "Output ONLY the complete corrected file contents between the markers <<<PENNY_FILE_START>>> and "
+    "<<<PENNY_FILE_END>>>, with no commentary, no markdown fences, and nothing outside the markers. "
+    "If you cannot safely fix it, output the two markers with the original contents unchanged between them."
+)
+
+
+def llm_fix_file(relative_path: str, file_contents: str, findings_for_file: str) -> str | None:
+    """Ask Claude for a corrected whole-file version. Returns new contents, or None.
+
+    Note: unlike the redacted findings sent elsewhere, the fix agent needs the REAL file
+    contents to produce a working patch. This runs only on the user's LOCAL files at their
+    explicit request (penny patch), never on third-party data, and its output is shown as a
+    diff for approval before anything is written.
+    """
+    key = _api_key()
+    if key is None:
+        return None
+    try:
+        import anthropic
+    except Exception:
+        return None
+    user = (
+        f"FILE PATH: {relative_path}\n\n"
+        f"FINDINGS IN THIS FILE:\n{findings_for_file}\n\n"
+        f"CURRENT FILE CONTENTS:\n<<<PENNY_FILE_START>>>\n{file_contents}\n<<<PENNY_FILE_END>>>\n\n"
+        "Return the corrected whole file between the markers."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        response = client.messages.create(
+            model=_model(),
+            max_tokens=8192,
+            system=_FIX_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+        )
+        parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
+        text = "\n".join(parts)
+    except Exception:
+        return None
+    start = text.find("<<<PENNY_FILE_START>>>")
+    end = text.find("<<<PENNY_FILE_END>>>")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    fixed = text[start + len("<<<PENNY_FILE_START>>>") : end]
+    # Strip a single leading/trailing newline introduced by the markers.
+    if fixed.startswith("\n"):
+        fixed = fixed[1:]
+    if fixed.endswith("\n"):
+        fixed = fixed[:-1]
+    return fixed if fixed.strip() else None
