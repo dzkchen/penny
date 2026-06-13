@@ -23,10 +23,21 @@ python -m penny ask "question" [--findings PATH] [--target URL]
 python -m penny ask-loop [--findings PATH] [--target URL]
 python -m penny run <path> --target URL [--out DIR]
 python -m penny patch [--findings PATH] --repo PATH [--out penny.patch] [--apply]
+python -m penny fix [--findings PATH] --repo PATH [--yes]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends [--days 7] [--limit 10]
 python -m penny demo-replay [--recording PATH] [--out DIR]
 ```
+
+`<path>` can be a local directory, a git source URL ending in `.git`, or a bare
+GitHub/GitLab/Bitbucket repo URL (e.g. `https://github.com/owner/repo`), with an
+optional `#ref` suffix.
+
+`fix` is the interactive, Claude-Code-style remediation loop: for each flagged file
+it asks Claude for a corrected version, shows a colored diff, and applies it only
+after you approve (`--yes` applies all without prompting, for non-interactive demos).
+When no `ANTHROPIC_API_KEY` is configured it falls back to deterministic patch plans,
+still gated by approval. `fix` only ever writes to the local `--repo` path.
 
 The CLI uses Typer/Rich when installed and falls back to a standard-library CLI/feed when they are not available.
 
