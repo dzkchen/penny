@@ -170,13 +170,14 @@ def _build_typer_app():
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
         brute: bool = typer.Option(False, "--brute", help="Run a wordlist brute-force of paths/logins (owned targets only)."),
         browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
+        netscan: bool = typer.Option(False, "--netscan", help="Run a read-only TCP-connect port scan of the target host for exposed services (owned targets only)."),
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
+                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _emit_scan_summary(result.payload, out, feed)
@@ -307,13 +308,14 @@ def _build_typer_app():
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
         brute: bool = typer.Option(False, "--brute", help="Run a wordlist brute-force of paths/logins (owned targets only)."),
         browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
+        netscan: bool = typer.Option(False, "--netscan", help="Run a read-only TCP-connect port scan of the target host for exposed services (owned targets only)."),
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
     ) -> None:
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, netscan=netscan, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed, use_llm=ai)
@@ -348,6 +350,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--agentic", action="store_true")
     scan_parser.add_argument("--brute", action="store_true")
     scan_parser.add_argument("--browser", action="store_true")
+    scan_parser.add_argument("--netscan", action="store_true")
     scan_parser.add_argument("--wordlist", default=None)
     scan_parser.add_argument("--pages", type=int, default=8)
 
@@ -412,6 +415,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--agentic", action="store_true")
     run_parser.add_argument("--brute", action="store_true")
     run_parser.add_argument("--browser", action="store_true")
+    run_parser.add_argument("--netscan", action="store_true")
     run_parser.add_argument("--wordlist", default=None)
     run_parser.add_argument("--pages", type=int, default=8)
 
@@ -424,7 +428,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
+                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _emit_scan_summary(result.payload, args.out, feed)
@@ -478,7 +482,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "run":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, netscan=args.netscan, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)

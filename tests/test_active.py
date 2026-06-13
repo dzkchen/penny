@@ -142,6 +142,29 @@ def test_http_method_probe_flags_advertised_trace() -> None:
     assert findings[0].evidence["dynamic_probe"]["advertised_methods"][0]["methods"] == ["TRACE"]
 
 
+def test_http_method_probe_flags_state_changing_methods_high() -> None:
+    def handler(method, path):
+        return SafeResponse(204, "", {"allow": "GET, OPTIONS, PUT, DELETE, MKCOL"})
+
+    findings = probe_http_methods(FakeGate(handler), ["/"])
+
+    assert findings[0].severity == "High"
+    high = set(findings[0].evidence["dynamic_probe"]["high_risk_methods"])
+    assert {"PUT", "DELETE", "MKCOL"} <= high
+
+
+def test_http_method_probe_readonly_webdav_is_medium() -> None:
+    # PROPFIND alone is a read-only WebDAV verb: noteworthy but not state-changing.
+    def handler(method, path):
+        return SafeResponse(207, "", {"allow": "GET, OPTIONS, PROPFIND"})
+
+    findings = probe_http_methods(FakeGate(handler), ["/"])
+
+    assert findings[0].severity == "Medium"
+    assert findings[0].evidence["dynamic_probe"]["advertised_methods"][0]["methods"] == ["PROPFIND"]
+    assert findings[0].evidence["dynamic_probe"]["high_risk_methods"] == []
+
+
 def test_exposed_path_probe_flags_environment_file() -> None:
     def handler(method, path):
         if path == "/.env":

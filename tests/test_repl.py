@@ -53,6 +53,29 @@ def test_exit_command_ends_session(tmp_path, monkeypatch) -> None:
     assert session.handle("") is True  # blank line is a no-op
 
 
+def test_natural_language_audit_forwards_target_flag(tmp_path, monkeypatch) -> None:
+    session, _ = _session(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+    session._scan = lambda args, force=None: captured.update(args=args, target=session.target)
+    session._report = lambda args: None
+
+    handled = session._route_intent("run full audit on ../app --target http://localhost:8081 and AI/OSV scan")
+
+    assert handled is True
+    assert session.target == "http://localhost:8081"  # flag survives NL routing
+    assert captured["args"] == ["../app"]
+
+
+def test_natural_language_scan_forwards_flags(tmp_path, monkeypatch) -> None:
+    session, _ = _session(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+    session._scan = lambda args, force=None: captured.update(args=args)
+
+    session._route_intent("scan ./proj --target http://127.0.0.1:8787 --active")
+
+    assert captured["args"] == ["./proj", "--target", "http://127.0.0.1:8787", "--active"]
+
+
 def test_scan_command_loads_and_summarizes(tmp_path, monkeypatch) -> None:
     session, captured = _session(tmp_path, monkeypatch)
     project = tmp_path / "proj"

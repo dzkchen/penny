@@ -224,7 +224,7 @@ Available interactive commands:
 ```text
 /audit <path> [--target <url>]    full audit: scan + AI + probes + report
 /full <path> [--target <url>]     alias for /audit
-/scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--static-only] [--target <url>]
+/scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--static-only] [--target <url>]
 /report                           write report.md to .penny/runs/
 /fix [--yes]                      fix flagged files with approval
 /findings                         list current findings
@@ -243,11 +243,11 @@ Colour is used on a TTY and disabled automatically when output is piped.
 Use these when you need automation outside the interactive shell. They read and write the same `.penny/runs/latest` state that the REPL auto-loads.
 
 ```bash
-python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
+python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] [--osv] [--ai] [--active] [--brute] [--browser] [--netscan] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
 python -m penny report [--findings <path>] [--out <dir>]
 python -m penny ask "question" [--findings <path>] [--target <url>] [--no-ai]
 python -m penny ask-loop [--findings <path>] [--target <url>] [--no-ai]
-python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai] [--active] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
+python -m penny run <path> --target <url> [--out <dir>] [--osv] [--ai] [--active] [--brute] [--browser] [--netscan] [--i-own-this] [--fail-on <severity>] [--diff <ref>] [--endpoint <path?param>]
 python -m penny patch [--findings <path>] --repo <path> [--out penny.patch] [--apply]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends [--days 7] [--limit 10]
@@ -288,7 +288,8 @@ By default Penny's dynamic checks are read-only confirmations against the REPL t
 
 - **SQL injection (`A001`):** appends benign SQL metacharacters (`'`, `' OR '1'='1`, …) to query-string parameters discovered in the source and looks for database error signatures. Read-only `GET` requests only.
 - **Firebase open rules (`A002`):** for Firebase apps, reads the Realtime Database REST endpoint (`/.json?shallow=true`) **without authentication** to prove whether the security rules expose data to anonymous clients — the meaningful "pentest" for a NoSQL/Firebase backend. Only the status code and top-level key count are stored, never the data.
-- **Checklist baseline (`A003`-`A010`):** runs bounded OWASP/API/WSTG-style probes for browser security headers, session cookie attributes, advertised HTTP verbs, exposed deployment files/admin metadata/API schemas, directory listings, verbose errors/stack traces, permissive CORS preflights, and cache controls on sensitive-looking responses.
+- **Checklist baseline (`A003`-`A010`):** runs bounded OWASP/API/WSTG-style probes for browser security headers, session cookie attributes, advertised HTTP verbs (now flagging state-changing PUT/DELETE/PATCH and WebDAV verbs as High, not just TRACE), exposed deployment files/admin metadata/API schemas, directory listings, verbose errors/stack traces, permissive CORS preflights, and cache controls on sensitive-looking responses.
+- **Transport / MitM exposure (`A011`):** a read-only check of what would let a network attacker intercept traffic — a normal TLS handshake inspects the negotiated protocol/cipher and certificate (flagging expired, self-signed, hostname-mismatched, obsolete `< TLS 1.2`, accepted legacy TLS 1.0/1.1, or weak ciphers), HSTS depth (missing/short `max-age`/no `includeSubDomains`), and whether the host still serves cleartext `http://` without redirecting (the SSL-strip foothold). Penny does **not** perform interception — it reports the weaknesses that make MitM possible so you can close them.
 
 ```text
 penny › /target https://my-owned-app.example
@@ -361,7 +362,7 @@ The planted app includes a client-visible service-role key, a committed fake sec
 
 Penny only runs read-only HTTP probes (`GET`/`HEAD`/`OPTIONS`). Localhost and private-network targets are allowed by default. Public targets require `--i-own-this`; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
 
-`--active` probing (SQLi, Firebase open-rules, and the checklist baseline) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. Public hosts still require `--i-own-this`, so active probes against a hosted backend (e.g. Firebase) are blocked unless you explicitly assert ownership.
+`--active` probing (SQLi, Firebase open-rules, the checklist baseline, and the `A011` transport/MitM-exposure check) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. The `--netscan` port scan is a read-only TCP **connect** scan (it opens and immediately closes a socket; it never sends a payload to a service), and the `A011` transport check uses a normal client TLS handshake — both obey the same authorization rule via a shared `host_allowed` gate. Public hosts still require `--i-own-this`, so any of these against a hosted backend are blocked unless you explicitly assert ownership. Penny deliberately stops at *finding* MitM exposure; it does not implement interception (ARP/DNS spoofing, rogue APs, TLS forging), which would target other parties' traffic.
 
 Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, private keys, database URLs, emails, and high-entropy token-shaped values before persistence.
 
@@ -394,6 +395,9 @@ Current deterministic checks:
 - `AI001`: AI-assisted review (opt-in via `--ai`) for issues regex can't catch — including the client/server trust boundary (missing backend / client-trusted mutations), reported as Critical/High. See "AI-assisted detection" above.
 - `A001` / `A002`: active-probe findings (opt-in via `--active`) — confirmed SQL injection and an anonymously-readable Firebase database.
 - `A003`-`A010`: active checklist findings (opt-in via `--active`) — weak security headers, weak cookie attributes, unsafe advertised HTTP methods, exposed files/admin metadata/API schemas, directory listings, verbose errors, permissive CORS preflight, and cacheable sensitive-looking responses. See "Active probing" above.
+- `A011`: transport / MitM-exposure finding (opt-in via `--active`) — weak TLS (version/cipher/certificate), shallow or missing HSTS, and cleartext `http://` that does not redirect to HTTPS. Reports what enables a man-in-the-middle; it does not perform one.
+- `D020` / `D021`: brute-force findings (opt-in via `--brute`) — sensitive paths exposed via a categorized wordlist + editor/backup-file permutations (severity escalates to Critical when a secret/version-control/backup file is reachable), and weak default credentials accepted by a login endpoint. Read-only `GET`/basic-auth checks, catch-all/SPA-aware.
+- `N001` / `N002`: network port-scan findings (opt-in via `--netscan`) — an inventory of reachable common ports on the target host (`N001`, informational), and reachable sensitive services (`N002`) such as unauthenticated datastores/caches (Critical), databases and remote-management daemons (High), or cleartext legacy protocols (Medium). A read-only TCP-connect scan gated exactly like the HTTP probes.
 
 Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers. The code-pattern detectors (`D008`–`D011`, `D014`–`D019`, `D023`) only scan source files (`.py`, `.js`/`.jsx`, `.ts`/`.tsx`); the data-flow-style ones (`D014`/`D015`/`D019`/`D023`) stay high-precision by firing only when a dangerous sink and a request-derived input appear together on the same line.
 

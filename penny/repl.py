@@ -26,7 +26,7 @@ SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
 HELP = """\
 /audit <path> [--target <url>]    FULL audit: scan + AI + all probes + report
 /full  <path> [--target <url>]    alias for /audit
-/scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--static-only] [--target <url>]
+/scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--static-only] [--target <url>]
 /report                           write report.md to .penny/runs/
 /fix [--yes]                      fix flagged files with approval (Claude rewrites them)
 /findings                         list the current findings
@@ -133,9 +133,10 @@ class Session:
         """Map plain-English requests to actions. Returns True if it handled the line."""
         low = line.lower()
         path = self._extract_path(line)
+        flags = self._extract_flags(line)
         audit_words = ("pentest", "pen test", "audit", "full scan", "run everything", "test this", "attack")
         if any(word in low for word in audit_words):
-            self._audit([path] if path else [])
+            self._audit(([path] if path else []) + flags)
             return True
         if "fix" in low and ("issue" in low or "finding" in low or "vuln" in low or "code" in low or "them" in low):
             self._fix([])
@@ -144,7 +145,7 @@ class Session:
             self._audit([])
             return True
         if ("scan" in low or "check" in low) and path:
-            self._scan([path])
+            self._scan([path] + flags)
             return True
         if low.strip() in ("report", "make a report", "write the report"):
             self._report([])
@@ -157,6 +158,22 @@ class Session:
             if token.startswith("./") or token.startswith("/") or token.endswith(".git") or "github.com" in token or "/" in token and not token.startswith("--"):
                 return token
         return None
+
+    def _extract_flags(self, line: str) -> list[str]:
+        """Pull explicit ``--flags`` (and the value following ``--target``) out of a
+        sentence so natural-language audits honour them the same as /commands."""
+        tokens = line.split()
+        flags: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token.startswith("--"):
+                flags.append(token)
+                if token == "--target" and index + 1 < len(tokens):
+                    flags.append(tokens[index + 1])
+                    index += 1
+            index += 1
+        return flags
 
     def _command(self, rest: str) -> bool:
         parts = rest.split()
@@ -195,7 +212,7 @@ class Session:
     def _scan(self, args: list[str], *, force: dict[str, bool] | None = None) -> None:
         path: str | None = None
         use_osv = use_ai = use_active = static_only = False
-        agentic = brute = browser = False
+        agentic = brute = browser = netscan = False
         target = self.target
         i_own_this = self.i_own_this
         tokens = iter(args)
@@ -212,6 +229,8 @@ class Session:
                 brute = True
             elif token == "--browser":
                 browser = True
+            elif token == "--netscan":
+                netscan = True
             elif token == "--i-own-this":
                 i_own_this = True
             elif token == "--static-only":
@@ -227,8 +246,9 @@ class Session:
             agentic = force.get("agentic", agentic)
             brute = force.get("brute", brute)
             browser = force.get("browser", browser)
+            netscan = force.get("netscan", netscan)
         if not path:
-            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--i-own-this] [--static-only] [--target <url>]")
+            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--i-own-this] [--static-only] [--target <url>]")
             return
 
         self.out(ui.dim(f"Scanning {path}…"))
@@ -244,6 +264,7 @@ class Session:
                     agentic=agentic,
                     brute=brute,
                     browser=browser,
+                    netscan=netscan,
                     feed=feed,
                     source_label=path,
                     use_osv=use_osv,
@@ -273,7 +294,7 @@ class Session:
         if not self.target:
             self.out(ui.dim("No target set — running static + code analysis only. Use --target <url> for live probes."))
         self.out(ui.style(f"🔎 Running FULL audit on {path}…", "bold", "magenta"))
-        forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True}
+        forced = {"ai": True, "osv": True, "active": True, "agentic": True, "brute": True, "browser": True, "netscan": True}
         self._scan([path], force=forced)
         if self.payload:
             self._report([])

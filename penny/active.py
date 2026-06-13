@@ -62,7 +62,17 @@ _SQL_ERROR_SIGNATURES = [
 
 FIREBASE_DB_RE = re.compile(r"https://[A-Za-z0-9.\-]+\.(?:firebaseio\.com|firebasedatabase\.app)", re.I)
 _QUERY_ENDPOINT_RE = re.compile(r"""['"`](/[A-Za-z0-9_\-/.]+\?[A-Za-z0-9_\-]+=[^'"`<>\s]*)['"`]""")
-_UNSAFE_HTTP_METHODS = {"CONNECT", "DELETE", "PATCH", "PUT", "TRACE"}
+# State-changing or diagnostic verbs that should not be broadly reachable. WebDAV
+# verbs are included because an unintentionally-enabled WebDAV layer is a classic
+# way to upload/move files on a server that only meant to serve static content.
+_STATE_CHANGING_METHODS = {"PUT", "DELETE", "PATCH"}
+_WEBDAV_WRITE_METHODS = {"MKCOL", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK"}
+_WEBDAV_READ_METHODS = {"PROPFIND"}
+# TRACE enables Cross-Site Tracing; CONNECT can turn a server into a proxy.
+_DIAGNOSTIC_METHODS = {"TRACE", "CONNECT"}
+# High-risk = anything that writes/changes state or is a known attack primitive.
+_HIGH_RISK_HTTP_METHODS = _STATE_CHANGING_METHODS | _WEBDAV_WRITE_METHODS | _DIAGNOSTIC_METHODS
+_UNSAFE_HTTP_METHODS = _HIGH_RISK_HTTP_METHODS | _WEBDAV_READ_METHODS
 _MISSING_CACHE_DIRECTIVES = {"no-store", "no-cache", "private"}
 _ATTACKER_ORIGIN = "https://attacker.example"
 _CHECKLIST_BASE_PATHS = ("/", "/api", "/health")
@@ -451,7 +461,8 @@ def probe_cookie_attributes(gate, target: str, *, feed: EventFeed | None = None)
 
 def probe_http_methods(gate, paths: Iterable[str], *, feed: EventFeed | None = None) -> list[Finding]:
     exposures: list[dict[str, Any]] = []
-    for path in _dedupe(paths)[:8]:
+    high_risk_seen: set[str] = set()
+    for path in _dedupe(paths)[:12]:
         try:
             response = gate.request("OPTIONS", path)
         except Exception:  # noqa: BLE001
@@ -459,12 +470,23 @@ def probe_http_methods(gate, paths: Iterable[str], *, feed: EventFeed | None = N
         methods = _parse_methods(_header(response, "allow")) | _parse_methods(_header(response, "access-control-allow-methods"))
         risky = sorted(methods & _UNSAFE_HTTP_METHODS)
         if risky:
-            exposures.append({"path": path, "status": response.status_code, "methods": risky})
+            high = sorted(methods & _HIGH_RISK_HTTP_METHODS)
+            high_risk_seen.update(high)
+            exposures.append(
+                {
+                    "path": path,
+                    "status": response.status_code,
+                    "methods": risky,
+                    "high_risk": high,
+                }
+            )
     if not exposures:
         if feed:
             feed.emit("red", "HTTP-method probe found no advertised unsafe methods")
         return []
-    severity = "High" if any("TRACE" in exposure["methods"] for exposure in exposures) else "Medium"
+    # Any write/diagnostic verb (PUT/DELETE/PATCH, WebDAV writes, TRACE, CONNECT)
+    # is High; a read-only WebDAV PROPFIND alone is Medium.
+    severity = "High" if high_risk_seen else "Medium"
     return [
         Finding(
             title="Unsafe HTTP methods advertised by live target",
@@ -479,18 +501,21 @@ def probe_http_methods(gate, paths: Iterable[str], *, feed: EventFeed | None = N
                 "WSTG-CONF-06",
             ],
             location=Location(file="dynamic:OPTIONS", line=1, column=1),
-            snippet=f"OPTIONS responses advertised unsafe methods on {len(exposures)} path(s).",
+            snippet=f"OPTIONS responses advertised unsafe methods on {len(exposures)} path(s)"
+            + (f" (high-risk: {', '.join(sorted(high_risk_seen))})" if high_risk_seen else "")
+            + ".",
             evidence={
                 "dynamic_probe": {
                     "probe": "http_methods",
                     "status": "confirmed",
                     "advertised_methods": exposures,
+                    "high_risk_methods": sorted(high_risk_seen),
                     "stored_response": "paths, status codes, and advertised methods only",
                 },
-                "attack_path": "Attackers can target state-changing or diagnostic methods if the server, proxy, or CORS layer exposes them unintentionally.",
+                "attack_path": "Attackers can target state-changing (PUT/DELETE/PATCH, WebDAV) or diagnostic (TRACE/CONNECT) methods if the server, proxy, or CORS layer exposes them unintentionally.",
             },
-            impact="Unexpected HTTP verbs expand the attack surface and can enable verb tampering or unsafe proxy behavior.",
-            remediation="Disable TRACE and any state-changing methods that are not required on each route; allow only the verbs each endpoint actually needs.",
+            impact="Unexpected HTTP verbs expand the attack surface and can enable verb tampering, file upload/overwrite via WebDAV, Cross-Site Tracing, or unsafe proxy behavior.",
+            remediation="Disable TRACE/CONNECT and any state-changing or WebDAV methods that are not required on each route; allow only the verbs each endpoint actually needs.",
         )
     ]
 
@@ -861,6 +886,9 @@ def run_active_probes(
         else:
             feed.emit("attack", "Running checklist-style live probes (headers, cookies, methods, exposures, errors, CORS, cache)")
             findings.extend(probe_checklist_baseline(gate, target, endpoints, feed=feed))
+            from .transport import run_transport_probes
+
+            findings.extend(run_transport_probes(target, i_own_this=i_own_this, feed=feed))
             if endpoints:
                 feed.emit("attack", f"Probing {len(endpoints)} endpoint(s) for SQL injection")
                 findings.extend(probe_sql_injection(gate, endpoints, feed=feed))
