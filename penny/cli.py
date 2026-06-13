@@ -7,6 +7,7 @@ from typing import Optional
 
 from . import llm
 from .ask import answer_question
+from .models import SEVERITY_ORDER
 from .exports import write_exports
 from .feed import EventFeed
 from .mongo import MongoMirror
@@ -53,12 +54,36 @@ def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: b
         paths = write_exports(payload, report, out_dir)
         feed.emit("report", f"Wrote {paths['html']}")
         feed.emit("report", f"Wrote {paths['csv']}")
+        feed.emit("report", f"Wrote {paths['sarif']}")
     return report_path
 
 
 def _fail(message: str) -> None:
     print(f"[error] {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def _enforce_fail_on(payload: dict, threshold: str | None, feed: EventFeed) -> None:
+    """Exit non-zero (code 1) if any finding meets/exceeds the severity threshold.
+
+    Lets Penny gate CI/PRs: `penny scan . --fail-on high`. Usage/scan errors stay
+    on exit code 2 (raised by `_fail`); the gate uses 1 so callers can tell them apart.
+    """
+    if not threshold:
+        return
+    threshold = threshold.capitalize()
+    if threshold not in SEVERITY_ORDER:
+        _fail(f"--fail-on must be one of: {', '.join(SEVERITY_ORDER)}")
+    limit = SEVERITY_ORDER[threshold]
+    tripped = [
+        finding
+        for finding in payload.get("findings", [])
+        if SEVERITY_ORDER.get(finding.get("severity", ""), 99) <= limit
+    ]
+    if tripped:
+        feed.emit("gate", f"{len(tripped)} finding(s) at or above {threshold}; failing (--fail-on {threshold})")
+        raise SystemExit(1)
+    feed.emit("gate", f"No findings at or above {threshold}; passing (--fail-on {threshold})")
 
 
 def _ask_loop(
@@ -120,12 +145,15 @@ def _build_typer_app():
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
         active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
     ) -> None:
+        feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path, use_osv=osv, use_ai=ai, use_active=active)
+                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command()
     def report(
@@ -212,6 +240,7 @@ def _build_typer_app():
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
         active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
     ) -> None:
         feed = EventFeed()
         try:
@@ -220,6 +249,7 @@ def _build_typer_app():
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed)
+        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command("demo-replay")
     def demo_replay(
@@ -244,6 +274,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--osv", action="store_true")
     scan_parser.add_argument("--ai", action="store_true")
     scan_parser.add_argument("--active", action="store_true")
+    scan_parser.add_argument("--fail-on", default=None)
 
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=None)
@@ -285,6 +316,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--osv", action="store_true")
     run_parser.add_argument("--ai", action="store_true")
     run_parser.add_argument("--active", action="store_true")
+    run_parser.add_argument("--fail-on", default=None)
 
     replay_parser = sub.add_parser("demo-replay")
     replay_parser.add_argument("--recording", type=Path)
@@ -295,9 +327,10 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active)
+                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
         _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, export=args.export)
     elif args.command == "ask":
@@ -338,6 +371,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)
+        _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)
 

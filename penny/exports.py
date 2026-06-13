@@ -2,8 +2,18 @@ from __future__ import annotations
 
 import csv
 import html
+import json
 from pathlib import Path
 from typing import Any
+
+# SARIF severity levels keyed by Penny severity.
+_SARIF_LEVEL = {
+    "Critical": "error",
+    "High": "error",
+    "Medium": "warning",
+    "Low": "note",
+    "Info": "note",
+}
 
 
 def findings_to_html(payload: dict[str, Any], report_markdown: str) -> str:
@@ -74,10 +84,67 @@ def findings_to_csv(payload: dict[str, Any]) -> str:
     return buffer.getvalue()
 
 
+def findings_to_sarif(payload: dict[str, Any]) -> str:
+    """Render findings as SARIF 2.1.0 so CI (e.g. GitHub code scanning) can ingest them."""
+    rules: dict[str, dict[str, Any]] = {}
+    results: list[dict[str, Any]] = []
+    for finding in payload.get("findings", []):
+        detector_id = str(finding.get("detector_id", "PENNY"))
+        if detector_id not in rules:
+            rules[detector_id] = {
+                "id": detector_id,
+                "name": finding.get("title", detector_id),
+                "shortDescription": {"text": finding.get("title", detector_id)},
+                "helpUri": "https://github.com/dzkchen/penny",
+                "properties": {"owasp": finding.get("owasp", [])},
+            }
+        location = finding.get("location", {})
+        results.append(
+            {
+                "ruleId": detector_id,
+                "level": _SARIF_LEVEL.get(finding.get("severity", ""), "warning"),
+                "message": {"text": f"{finding.get('id', '')} {finding.get('title', '')}: {finding.get('impact', '')}".strip()},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": str(location.get("file", ""))},
+                            "region": {"startLine": max(int(location.get("line", 1) or 1), 1)},
+                        }
+                    }
+                ],
+                "properties": {
+                    "severity": finding.get("severity", ""),
+                    "status": finding.get("status", ""),
+                    "confidence": finding.get("confidence", ""),
+                },
+            }
+        )
+    document = {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Penny",
+                        "informationUri": "https://github.com/dzkchen/penny",
+                        "version": payload.get("schema_version", "0"),
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
 def write_exports(payload: dict[str, Any], report_markdown: str, out_dir: Path) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     html_path = out_dir / "report.html"
     csv_path = out_dir / "findings.csv"
+    sarif_path = out_dir / "findings.sarif"
     html_path.write_text(findings_to_html(payload, report_markdown), encoding="utf-8")
     csv_path.write_text(findings_to_csv(payload), encoding="utf-8")
-    return {"html": html_path, "csv": csv_path}
+    sarif_path.write_text(findings_to_sarif(payload), encoding="utf-8")
+    return {"html": html_path, "csv": csv_path, "sarif": sarif_path}
