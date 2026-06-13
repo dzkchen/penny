@@ -288,6 +288,7 @@ By default Penny's dynamic checks are read-only confirmations against the REPL t
 
 - **SQL injection (`A001`):** appends benign SQL metacharacters (`'`, `' OR '1'='1`, …) to query-string parameters discovered in the source and looks for database error signatures. Read-only `GET` requests only.
 - **Firebase open rules (`A002`):** for Firebase apps, reads the Realtime Database REST endpoint (`/.json?shallow=true`) **without authentication** to prove whether the security rules expose data to anonymous clients — the meaningful "pentest" for a NoSQL/Firebase backend. Only the status code and top-level key count are stored, never the data.
+- **Checklist baseline (`A003`-`A010`):** runs bounded OWASP/API/WSTG-style probes for browser security headers, session cookie attributes, advertised HTTP verbs, exposed deployment files/admin metadata/API schemas, directory listings, verbose errors/stack traces, permissive CORS preflights, and cache controls on sensitive-looking responses.
 
 ```text
 penny › /target https://my-owned-app.example
@@ -360,7 +361,7 @@ The planted app includes a client-visible service-role key, a committed fake sec
 
 Penny only runs read-only HTTP probes (`GET`/`HEAD`/`OPTIONS`). Localhost and private-network targets are allowed by default. Public targets require `--i-own-this`; unsafe methods, request overages, and redirects away from the approved target are blocked by Python guardrails before any request is made.
 
-`--active` probing (SQLi, Firebase open-rules) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. Public hosts still require `--i-own-this`, so active probes against a hosted backend (e.g. Firebase) are blocked unless you explicitly assert ownership.
+`--active` probing (SQLi, Firebase open-rules, and the checklist baseline) is more intrusive but stays within these guardrails: read-only methods only, rate-limited, same-origin, and detection-only payloads — Penny never sends destructive input or writes. Public hosts still require `--i-own-this`, so active probes against a hosted backend (e.g. Firebase) are blocked unless you explicitly assert ownership.
 
 Reports and findings are written locally. Store-layer redaction masks service keys, JWTs, API keys, private keys, database URLs, emails, and high-entropy token-shaped values before persistence.
 
@@ -391,7 +392,8 @@ Current deterministic checks:
 - `D019`: open redirect — a redirect target (`res.redirect`/`redirect`/`window.location`) taken directly from request input.
 - `D023`: prompt injection (OWASP LLM01) — request-controlled input concatenated/interpolated into an LLM prompt or system message (High when it lands in a system prompt). The `--ai` pass reasons about the rest of the LLM Top 10.
 - `AI001`: AI-assisted review (opt-in via `--ai`) for issues regex can't catch — including the client/server trust boundary (missing backend / client-trusted mutations), reported as Critical/High. See "AI-assisted detection" above.
-- `A001` / `A002`: active-probe findings (opt-in via `--active`) — confirmed SQL injection and an anonymously-readable Firebase database. See "Active probing" above.
+- `A001` / `A002`: active-probe findings (opt-in via `--active`) — confirmed SQL injection and an anonymously-readable Firebase database.
+- `A003`-`A010`: active checklist findings (opt-in via `--active`) — weak security headers, weak cookie attributes, unsafe advertised HTTP methods, exposed files/admin metadata/API schemas, directory listings, verbose errors, permissive CORS preflight, and cacheable sensitive-looking responses. See "Active probing" above.
 
 Dynamic probes are still read-only. `D004` stores only status codes, object IDs, and ownership comparison results; `D006` stores only CORS headers. The code-pattern detectors (`D008`–`D011`, `D014`–`D019`, `D023`) only scan source files (`.py`, `.js`/`.jsx`, `.ts`/`.tsx`); the data-flow-style ones (`D014`/`D015`/`D019`/`D023`) stay high-precision by firing only when a dangerous sink and a request-derived input appear together on the same line.
 

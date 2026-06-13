@@ -10,7 +10,7 @@ from .detectors import detect_dependencies_via_advisories, run_detectors
 from .feed import EventFeed
 from .models import assign_finding_ids, dedupe_cross_detector, now_session_id
 from .mongo import MongoMirror
-from .probes import confirm_bola_order_access, confirm_cors_policy, confirm_service_key_read
+from .probes import confirm_bola_order_access, confirm_cors_policy, confirm_service_key_read, preflight_target
 from .repo import changed_files, walk_repo
 from .store import FindingsStore
 
@@ -81,8 +81,9 @@ def run_scan(
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
+        preflight_target(target, i_own_this=i_own_this, feed=feed)
         confirm_service_key_read(findings, target, i_own_this=i_own_this, feed=feed)
-        confirm_bola_order_access(findings, target, i_own_this=i_own_this, feed=feed)
+        confirm_bola_order_access(findings, target, i_own_this=i_own_this, feed=feed, endpoints=endpoints)
         confirm_cors_policy(findings, target, i_own_this=i_own_this, feed=feed)
         if agentic:
             from .agentic import run_agentic_probe_from_files

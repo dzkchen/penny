@@ -357,7 +357,7 @@ class Session:
             self._warn("No findings loaded. Run /scan <path> first.")
             return
         payload = self.payload
-        report = generate_report(payload)
+        report = generate_report(payload, use_llm=self.use_ai)
         store = FindingsStore(self.out_dir)
         report_path = store.write_report(payload.get("session_id", "manual-report"), report)
         copy_report_to_findings_dir(report_path, self.findings_path)

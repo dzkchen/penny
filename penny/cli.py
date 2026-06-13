@@ -31,11 +31,11 @@ def _resolve_findings_path(findings: Path | None, out_dir: Path) -> Path:
     return out_dir / ".penny" / "runs" / "latest" / "findings.json"
 
 
-def _report_command(findings: Path, out_dir: Path, feed: EventFeed) -> Path:
+def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, use_llm: bool = False) -> Path:
     payload = load_findings(findings)
     session_id = payload.get("session_id", "manual-report")
     feed.emit("blue", "Writing report with concrete fixes")
-    report = generate_report(payload)
+    report = generate_report(payload, use_llm=use_llm)
     report_path = FindingsStore(out_dir).write_report(session_id, report)
     copy_report_to_findings_dir(report_path, findings)
     verdict = report.split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip()
@@ -163,7 +163,7 @@ def _build_typer_app():
         i_own_this: bool = typer.Option(False, "--i-own-this"),
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need --i-own-this."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
         diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
         endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
@@ -186,8 +186,9 @@ def _build_typer_app():
     def report(
         findings: Optional[Path] = typer.Option(None, "--findings", help="Defaults to the latest run under --out."),
         out: Path = typer.Option(Path("."), "--out"),
+        ai: bool = typer.Option(False, "--ai", help="Write the purple-team verdict with the Claude model instead of the deterministic one-liner (sends redacted findings to the API)."),
     ) -> None:
-        _report_command(_resolve_findings_path(findings, out), out, EventFeed())
+        _report_command(_resolve_findings_path(findings, out), out, EventFeed(), use_llm=ai)
 
     @app.command()
     def ask(
@@ -283,7 +284,7 @@ def _build_typer_app():
         i_own_this: bool = typer.Option(False, "--i-own-this"),
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need --i-own-this."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
         diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
         endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
@@ -299,7 +300,7 @@ def _build_typer_app():
                 result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        _report_command(result.findings_path, out, feed)
+        _report_command(result.findings_path, out, feed, use_llm=ai)
         _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command("demo-replay")
@@ -337,6 +338,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     report_parser = sub.add_parser("report")
     report_parser.add_argument("--findings", type=Path, default=None)
     report_parser.add_argument("--out", type=Path, default=Path("."))
+    report_parser.add_argument("--ai", action="store_true")
 
     ask_parser = sub.add_parser("ask")
     ask_parser.add_argument("question")
@@ -409,7 +411,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
         _emit_scan_summary(result.payload, args.out, feed)
         _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
-        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed)
+        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, use_llm=args.ai)
     elif args.command == "ask":
         use_llm = not args.no_ai
         if use_llm:

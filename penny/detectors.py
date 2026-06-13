@@ -744,6 +744,37 @@ def _is_server_path(relative_path: str) -> bool:
     return any(marker in lowered for marker in _SERVER_PATH_MARKERS)
 
 
+# Supabase row-level-security markers used to judge whether the repo even ships
+# database authorization rules, and whether any of them are wide open.
+_RLS_PRESENT_RE = re.compile(r"\b(?:create\s+policy|enable\s+row\s+level\s+security|alter\s+policy)\b", re.I)
+_RLS_PERMISSIVE_RE = re.compile(r"(?:using|with\s+check)\s*\(\s*true\s*\)", re.I)
+
+
+def _db_rules_posture(files: list[SourceFile]) -> tuple[bool, bool]:
+    """Assess whether the scanned repo ships database authorization rules.
+
+    Returns ``(rules_present, rules_permissive)``. ``permissive`` means Penny found
+    a rule that grants unrestricted access (an open Firebase rule, or an RLS policy
+    that evaluates ``true``) — positive evidence that client writes are unguarded.
+    ``present`` means some rules file exists at all. When neither holds the repo
+    ships no visible rules, so a client write cannot be confirmed either way and
+    D012 must not assert a breach. (``_is_firebase_rules_file``/``_RULES_OPEN_RE``/
+    ``_RTDB_OPEN_RE`` are defined with the D013 detector below.)
+    """
+    present = False
+    permissive = False
+    for file in files:
+        if _is_firebase_rules_file(file.relative_path):
+            present = True
+            if _RULES_OPEN_RE.search(file.text) or _RTDB_OPEN_RE.search(file.text):
+                permissive = True
+        elif file.relative_path.lower().endswith(".sql") and _RLS_PRESENT_RE.search(file.text):
+            present = True
+            if _RLS_PERMISSIVE_RE.search(file.text):
+                permissive = True
+    return present, permissive
+
+
 def detect_client_side_db_writes(files: Iterable[SourceFile]) -> list[Finding]:
     """Flag direct database/BaaS mutations in browser-shipped code.
 
@@ -752,38 +783,171 @@ def detect_client_side_db_writes(files: Iterable[SourceFile]) -> list[Finding]:
     route to authorize the operation), access control can only come from backend
     rules — for AI-built apps that "lack a proper backend" this is the core
     trust-boundary risk. Server-side files (api/server/functions paths) excluded.
+
+    Two precision guards keep this from drowning the report:
+    - Severity is driven by ``_db_rules_posture``: ``High`` only when Penny can see
+      a permissive rule confirming the writes are unguarded; otherwise ``Medium``
+      with an explicit "rules not assessable" caveat, so the report never claims a
+      confirmed breach it could not verify.
+    - Findings are collapsed to one per file (every offending line is recorded in
+      the evidence) instead of emitting dozens of near-identical hits.
     """
+    files = list(files)
+    rules_present, rules_permissive = _db_rules_posture(files)
+    if rules_permissive:
+        severity, confidence = "High", "high"
+        posture_note = (
+            "Penny found a permissive database rule in this repo (see D013/D003), so these "
+            "client writes are not authorized server-side — treat as exploitable."
+        )
+    elif rules_present:
+        severity, confidence = "Medium", "low"
+        posture_note = (
+            "Database rules exist in the repo but Penny did not confirm they authorize this "
+            "specific path; review the rules or re-run with --active to probe the live target."
+        )
+    else:
+        severity, confidence = "Medium", "low"
+        posture_note = (
+            "No Firestore/RLS security rules were found in the scanned repo, so Penny cannot "
+            "determine whether these client writes are authorized. Flagged for manual review "
+            "(verify the deployed rules), not confirmed as exploitable."
+        )
+
     findings: list[Finding] = []
     for file in files:
         if file.path.suffix.lower() not in CLIENT_EXTENSIONS:
             continue
         if _is_server_path(file.relative_path):
             continue
+        hits: list[tuple[int, int, str, str]] = []  # (line, column, vendor, stripped text)
+        vendors: list[str] = []
         for line_no, line in enumerate(file.text.splitlines(), start=1):
             for pattern, vendor in CLIENT_WRITE_PATTERNS:
                 match = pattern.search(line)
                 if not match:
                     continue
+                hits.append((line_no, match.start() + 1, vendor, line.strip()))
+                if vendor not in vendors:
+                    vendors.append(vendor)
+                break
+        if not hits:
+            continue
+        first_line, first_col, _, first_text = hits[0]
+        vendor_label = "/".join(vendors)
+        findings.append(
+            Finding(
+                title="Client-side database write without a server-side authorization layer",
+                severity=severity,
+                confidence=confidence,
+                status="suspected",
+                source="static",
+                detector_id="D012",
+                owasp=["A01:2021-Broken Access Control"],
+                location=Location(file=file.relative_path, line=first_line, column=first_col),
+                snippet=redact_text(first_text),
+                evidence={
+                    "reason": f"{vendor_label} data-mutation call(s) run in browser-shipped code; the client is fully attacker-controlled, so it cannot enforce access control.",
+                    "vendor": vendor_label,
+                    "occurrences": len(hits),
+                    "lines": [line_no for line_no, _, _, _ in hits],
+                    "rules_posture": posture_note,
+                },
+                impact="When the browser writes to the database directly, there is no trusted server to authorize the operation. Unless backend rules (e.g. row-level security or Firebase security rules) are airtight, any user can forge, tamper with, or delete other users' data.",
+                remediation="Route privileged reads/writes through a server-side API or serverless/cloud function that authenticates the user and authorizes each operation; treat the client as untrusted and tighten the database security rules.",
+            )
+        )
+    return findings
+
+
+# D020: secrets that get inlined into the client bundle at build time. Frontend
+# build tools (Vite, Next, CRA, …) substitute env vars with a public prefix
+# straight into the JavaScript they ship, so anything sensitive behind such a
+# prefix is readable by anyone who opens DevTools. The variable's *value* never
+# appears in source (only its name), so this is name-based: we flag prefixed env
+# reads whose name looks like a credential. Plain *_API_KEY (e.g. Firebase web
+# keys, which are public by design) is deliberately not treated as sensitive.
+_CLIENT_ENV_RE = re.compile(
+    r"\b(?:import\.meta\.env|process\.env)\.((?:VITE|NEXT_PUBLIC|REACT_APP|GATSBY|VUE_APP|NUXT_PUBLIC|EXPO_PUBLIC|PUBLIC)_[A-Z0-9_]+)"
+)
+# Substring match (not \b-anchored): env names are underscore-delimited, and `_`
+# counts as a word char so word boundaries never fall at `_PASS`/`PASS_`.
+_SENSITIVE_ENV_RE = re.compile(
+    r"PASS|SECRET|PRIVATE|CREDENTIAL|SERVICE_?ROLE|SERVICE_?KEY"
+    r"|ADMIN_?KEY|SIGNING|WEBHOOK|API_?SECRET|CLIENT_?SECRET|ACCESS_?TOKEN|AUTH_?TOKEN|ENCRYPT",
+    re.I,
+)
+# A comparison operator on the same line means the secret is being used as a
+# client-side gate (e.g. `if (input === import.meta.env.VITE_ADMIN_PASSWORD)`),
+# which is both an exposed secret and a trivially-bypassable auth check.
+_ENV_COMPARISON_RE = re.compile(r"===|!==|==|!=")
+EXPOSED_SECRET_EXTENSIONS = CLIENT_EXTENSIONS | {".vue", ".svelte", ".astro", ".html", ".mjs", ".cjs"}
+
+
+def detect_client_exposed_secrets(files: Iterable[SourceFile]) -> list[Finding]:
+    """Flag sensitive env vars that a frontend build inlines into shipped JS.
+
+    One finding per (file, variable): if any reference uses the secret in a
+    comparison it is treated as a client-side auth gate (Critical), otherwise it is
+    a leaked build-time secret (High).
+    """
+    findings: list[Finding] = []
+    for file in files:
+        if file.path.suffix.lower() not in EXPOSED_SECRET_EXTENSIONS:
+            continue
+        # var name -> (first_line, first_col, first_text, used_in_comparison)
+        seen: dict[str, list] = {}
+        for line_no, line in enumerate(file.text.splitlines(), start=1):
+            for match in _CLIENT_ENV_RE.finditer(line):
+                var_name = match.group(1)
+                if not _SENSITIVE_ENV_RE.search(var_name):
+                    continue
+                is_comparison = bool(_ENV_COMPARISON_RE.search(line))
+                if var_name not in seen:
+                    seen[var_name] = [line_no, match.start() + 1, line.strip(), is_comparison]
+                elif is_comparison:
+                    seen[var_name][3] = True
+        for var_name, (line_no, column, text, is_comparison) in seen.items():
+            if is_comparison:
                 findings.append(
                     Finding(
-                        title="Client-side database write without a server-side authorization layer",
-                        severity="High",
-                        confidence="medium",
+                        title="Client-side secret check against a build-time-exposed env var",
+                        severity="Critical",
+                        confidence="high",
                         status="suspected",
                         source="static",
-                        detector_id="D012",
-                        owasp=["A01:2021-Broken Access Control"],
-                        location=Location(file=file.relative_path, line=line_no, column=match.start() + 1),
-                        snippet=redact_text(line.strip()),
+                        detector_id="D020",
+                        owasp=["A07:2021-Identification and Authentication Failures"],
+                        location=Location(file=file.relative_path, line=line_no, column=column),
+                        snippet=redact_text(text),
                         evidence={
-                            "reason": f"A {vendor} data-mutation call runs in browser-shipped code; the client is fully attacker-controlled, so it cannot enforce access control.",
-                            "vendor": vendor,
+                            "reason": f"`{var_name}` has a public build prefix, so its value is inlined into the shipped JavaScript bundle and readable in the browser; comparing against it is an auth check the client can trivially bypass.",
+                            "env_var": var_name,
                         },
-                        impact="When the browser writes to the database directly, there is no trusted server to authorize the operation. Unless backend rules (e.g. row-level security or Firebase security rules) are airtight, any user can forge, tamper with, or delete other users' data.",
-                        remediation="Route privileged reads/writes through a server-side API or serverless/cloud function that authenticates the user and authorizes each operation; treat the client as untrusted and tighten the database security rules.",
+                        impact="The secret is exposed to every visitor in the JS bundle, and the gate it guards can be bypassed by editing client code — so the protected action is effectively unprotected.",
+                        remediation="Never gate access with a client-readable secret. Move the check to a server-side endpoint / cloud function that holds the secret in non-public env, and drop the public build prefix.",
                     )
                 )
-                break
+            else:
+                findings.append(
+                    Finding(
+                        title="Secret exposed in the client bundle via a public build-time env var",
+                        severity="High",
+                        confidence="high",
+                        status="suspected",
+                        source="static",
+                        detector_id="D020",
+                        owasp=["A05:2021-Security Misconfiguration"],
+                        location=Location(file=file.relative_path, line=line_no, column=column),
+                        snippet=redact_text(text),
+                        evidence={
+                            "reason": f"`{var_name}` uses a public build prefix (e.g. VITE_/NEXT_PUBLIC_/REACT_APP_), so the bundler substitutes its value into the browser-shipped JavaScript.",
+                            "env_var": var_name,
+                        },
+                        impact="A credential shipped to the browser is readable by anyone who opens the bundle, so it must be treated as public/compromised.",
+                        remediation="Drop the public build prefix and read the secret only in server-side/edge code; rotate the exposed value.",
+                    )
+                )
     return findings
 
 
@@ -1153,9 +1317,33 @@ _STATIC_LITERAL_RE = re.compile(r"""^\s*(['"])(?:\\.|(?!\1).)*\1\s*;?\s*(?://.*|
 def _is_dynamic_rhs(rhs: str) -> bool:
     """True when the assigned value is not a single static string literal."""
     rhs = rhs.strip()
+    if rhs.startswith("`"):
+        # Template literal (already expanded across lines by _effective_rhs): it is
+        # dynamic only if it actually interpolates a value. A static multi-line
+        # markup template (no ``${``) is not an XSS sink.
+        return "${" in rhs
     if "${" in rhs or "+" in rhs:
         return True
     return not _STATIC_LITERAL_RE.match(rhs)
+
+
+def _effective_rhs(lines: list[str], index: int, rhs: str) -> str:
+    """Expand a multi-line template-literal RHS into its full text.
+
+    When the captured right-hand side opens a backtick template that does not close
+    on the same line, join forward (bounded) until the closing backtick so the
+    static/dynamic check sees the whole literal instead of just a lone opening
+    backtick (which would otherwise be misread as dynamic).
+    """
+    rhs = rhs.strip()
+    if not rhs.startswith("`") or rhs.count("`") >= 2:
+        return rhs
+    collected = [rhs]
+    for follow in lines[index + 1 : index + 60]:
+        collected.append(follow)
+        if "`" in follow:
+            break
+    return "\n".join(collected)
 
 
 def detect_xss_sinks(files: Iterable[SourceFile]) -> list[Finding]:
@@ -1163,22 +1351,24 @@ def detect_xss_sinks(files: Iterable[SourceFile]) -> list[Finding]:
     for file in files:
         if file.path.suffix.lower() not in XSS_EXTENSIONS:
             continue
-        for line_no, line in enumerate(file.text.splitlines(), start=1):
+        lines = file.text.splitlines()
+        for index, line in enumerate(lines):
+            line_no = index + 1
             match = _DANGEROUS_HTML_RE.search(line)
             column = None
             if match:
                 column = match.start() + 1
             else:
                 inner = _INNERHTML_RE.search(line)
-                if inner and _is_dynamic_rhs(inner.group(1)):
+                if inner and _is_dynamic_rhs(_effective_rhs(lines, index, inner.group(1))):
                     column = inner.start() + 1
                 else:
                     jq = _JQUERY_HTML_RE.search(line)
-                    if jq and _is_dynamic_rhs(jq.group(1)):
+                    if jq and _is_dynamic_rhs(_effective_rhs(lines, index, jq.group(1))):
                         column = jq.start() + 1
                     else:
                         docw = _DOCWRITE_RE.search(line)
-                        if docw and docw.group(1).strip() not in {"", "''", '""'}:
+                        if docw and _is_dynamic_rhs(_effective_rhs(lines, index, docw.group(1))):
                             column = docw.start() + 1
             if column is None:
                 continue
@@ -1214,6 +1404,7 @@ def run_detectors(files: list[SourceFile]) -> list[Finding]:
         *detect_disabled_tls_verification(files),
         *detect_debug_mode(files),
         *detect_client_side_db_writes(files),
+        *detect_client_exposed_secrets(files),
         *detect_permissive_firebase_rules(files),
         *detect_ssrf(files),
         *detect_path_traversal(files),

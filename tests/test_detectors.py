@@ -164,7 +164,43 @@ def test_client_side_db_write_flagged_and_server_excluded() -> None:
     d012 = [f for f in findings if f.detector_id == "D012"]
 
     assert {f.location.file for f in d012} == {"src/lib/orders.ts", "src/hooks/useProfile.tsx"}
-    assert all(f.severity == "High" for f in d012)
+    # No security rules ship in these files, so Penny cannot confirm the writes are
+    # unguarded: severity stays Medium with a low-confidence "rules not assessable" caveat
+    # rather than asserting High blindly.
+    assert all(f.severity == "Medium" for f in d012)
+    assert all(f.confidence == "low" for f in d012)
+    assert all("No Firestore/RLS" in f.evidence["rules_posture"] for f in d012)
+
+
+def test_client_side_db_write_collapses_per_file_and_counts_occurrences() -> None:
+    client = _source(
+        "src/lib/orders.ts",
+        "await supabase.from('orders').insert({ a });\n"
+        "await supabase.from('orders').update({ b });\n"
+        "await supabase.from('orders').delete();\n",
+    )
+
+    d012 = [f for f in run_detectors([client]) if f.detector_id == "D012"]
+
+    # Three offending lines, but a single collapsed finding that records all of them.
+    assert len(d012) == 1
+    assert d012[0].evidence["occurrences"] == 3
+    assert d012[0].evidence["lines"] == [1, 2, 3]
+
+
+def test_client_side_db_write_high_when_permissive_rule_present() -> None:
+    client = _source("src/lib/orders.ts", "await supabase.from('orders').insert({ a });\n")
+    open_rule = _source(
+        "firestore.rules",
+        "match /databases/{db}/documents {\n  match /{doc=**} {\n    allow read, write: if true;\n  }\n}\n",
+    )
+
+    d012 = [f for f in run_detectors([client, open_rule]) if f.detector_id == "D012"]
+
+    # A permissive rule is visible in the repo, so the client write is confirmed unguarded.
+    assert len(d012) == 1
+    assert d012[0].severity == "High"
+    assert d012[0].confidence == "high"
 
 
 def test_dataflow_detectors_fire_on_request_derived_sinks() -> None:
@@ -236,6 +272,41 @@ def test_weak_hash_without_security_context_is_not_flagged() -> None:
     assert [f.detector_id for f in run_detectors([source]) if f.detector_id == "D017"] == []
 
 
+def test_client_exposed_secret_gate_is_critical() -> None:
+    source = _source(
+        "src/pages/Admin.tsx",
+        "if (resetPassword === import.meta.env.VITE_FRASERPAY_RESET_PASSWORD) {\n  grant();\n}\n",
+    )
+
+    d020 = [f for f in run_detectors([source]) if f.detector_id == "D020"]
+
+    assert len(d020) == 1
+    assert d020[0].severity == "Critical"
+    assert d020[0].evidence["env_var"] == "VITE_FRASERPAY_RESET_PASSWORD"
+
+
+def test_client_exposed_secret_plain_read_is_high() -> None:
+    source = _source(
+        "src/lib/mailer.ts",
+        "const pass = process.env.NEXT_PUBLIC_EMAIL_PASS;\n",
+    )
+
+    d020 = [f for f in run_detectors([source]) if f.detector_id == "D020"]
+
+    assert len(d020) == 1
+    assert d020[0].severity == "High"
+
+
+def test_public_api_key_is_not_flagged_as_exposed_secret() -> None:
+    # Firebase web API keys are public by design — name-based filtering must not flag them.
+    source = _source(
+        "src/integrations/firebase/client.ts",
+        "const cfg = { apiKey: import.meta.env.VITE_FIREBASE_API_KEY, projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID };\n",
+    )
+
+    assert [f for f in run_detectors([source]) if f.detector_id == "D020"] == []
+
+
 def test_xss_sink_skips_static_markup() -> None:
     source = _source(
         "src/render.tsx",
@@ -251,6 +322,36 @@ def test_xss_sink_skips_static_markup() -> None:
 
     # Only the dynamic assignment is flagged; empty and static-literal markup are not.
     assert [f.location.line for f in d018] == [1]
+
+
+def test_xss_sink_skips_static_multiline_template() -> None:
+    # A multi-line static template (no ${...}) must not be flagged just because the
+    # opening line is a lone backtick.
+    static_tpl = _source(
+        "src/error.tsx",
+        "\n".join(
+            [
+                "el.innerHTML = `",
+                "  <div>Something went wrong</div>",
+                "  <button>Reload</button>",
+                "`;",
+            ]
+        ),
+    )
+    dynamic_tpl = _source(
+        "src/render.tsx",
+        "\n".join(
+            [
+                "el.innerHTML = `",
+                "  <p>Hello ${userName}</p>",
+                "`;",
+            ]
+        ),
+    )
+
+    assert [f for f in run_detectors([static_tpl]) if f.detector_id == "D018"] == []
+    dynamic = [f for f in run_detectors([dynamic_tpl]) if f.detector_id == "D018"]
+    assert [f.location.line for f in dynamic] == [1]
 
 
 def test_jwt_verify_false_is_not_also_a_tls_finding() -> None:

@@ -259,7 +259,7 @@ Avoid `Access-Control-Allow-Origin: *` on APIs that may return user-specific or 
     return "\n\n".join(sections) if sections else "No concrete fixes were generated because there are no findings."
 
 
-def generate_report(payload: dict[str, Any]) -> str:
+def generate_report(payload: dict[str, Any], *, use_llm: bool = False) -> str:
     findings = payload.get("findings", [])
     summary = payload.get("summary", {})
     confirmed = [finding for finding in findings if finding["status"] == "confirmed"]
@@ -269,16 +269,22 @@ def generate_report(payload: dict[str, Any]) -> str:
         if any(finding["detector_id"] == "D001" and finding["status"] == "confirmed" for finding in findings)
         else "No critical exploit was dynamically confirmed; review suspected issues before release."
     )
-    # Upgrade the one-line verdict to a richer LLM narrative when a key is configured.
-    # True RAG: retrieve related patterns from the Mongo vector KB and ground the verdict
-    # in them. The LLM only sees already-redacted findings and cannot contradict ground truth.
-    from .llm import llm_verdict
-    from .mongo import MongoMirror
+    # The default verdict is the deterministic one-liner above — it never overstates
+    # beyond what a probe actually confirmed. Only when the caller explicitly opts in
+    # (e.g. `--ai`, or AI on in the REPL) do we upgrade it to an LLM narrative. This
+    # keeps offline/CI reports deterministic and stops the model from dressing up
+    # unconfirmed static findings as a confirmed breach.
+    if use_llm:
+        # True RAG: retrieve related patterns from the Mongo vector KB and ground the
+        # verdict in them. The LLM only sees already-redacted findings and is told not
+        # to contradict the deterministic verdict.
+        from .llm import llm_verdict
+        from .mongo import MongoMirror
 
-    findings_json = json.dumps({"summary": summary, "findings": findings}, indent=2)
-    detector_titles = " ".join(f"{f.get('detector_id', '')} {f.get('title', '')}" for f in findings)
-    retrieved, _ = MongoMirror().search_patterns(detector_titles or "security findings", limit=3)
-    verdict = llm_verdict(findings_json, deterministic=verdict, retrieved=retrieved)
+        findings_json = json.dumps({"summary": summary, "findings": findings}, indent=2)
+        detector_titles = " ".join(f"{f.get('detector_id', '')} {f.get('title', '')}" for f in findings)
+        retrieved, _ = MongoMirror().search_patterns(detector_titles or "security findings", limit=3)
+        verdict = llm_verdict(findings_json, deterministic=verdict, retrieved=retrieved)
     executive = (
         f"Penny found {summary.get('total', len(findings))} issue(s), including "
         f"{len(critical)} critical and {summary.get('high_count', 0)} high finding(s). "
