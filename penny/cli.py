@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import llm
 from .agent_fix import run_agent_fix
 from .ask import answer_question
+from .models import SEVERITY_ORDER
 from .exports import write_exports
 from .feed import EventFeed
 from .mongo import MongoMirror
@@ -17,6 +18,27 @@ from .replay import run_demo_replay
 from .scanner import run_scan
 from .sources import resolved_scan_source
 from .store import FindingsStore, copy_report_to_findings_dir
+
+
+def _resolve_findings_path(findings: Path | None, out_dir: Path) -> Path:
+    """Resolve which findings file `report` should read.
+
+    When `--findings` is not given explicitly, look inside the `--out` run tree
+    first (`<out>/.penny/runs/latest/findings.json`, then `<out>/findings.json`)
+    so `scan --out X` followed by `report --out X` reports the same run. Falls
+    back to `findings.json` in the current directory for backwards compatibility.
+    """
+    if findings is not None:
+        return findings
+    candidates = [
+        out_dir / ".penny" / "runs" / "latest" / "findings.json",
+        out_dir / "findings.json",
+        Path("findings.json"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: bool = False) -> Path:
@@ -33,12 +55,50 @@ def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, export: b
         paths = write_exports(payload, report, out_dir)
         feed.emit("report", f"Wrote {paths['html']}")
         feed.emit("report", f"Wrote {paths['csv']}")
+        feed.emit("report", f"Wrote {paths['sarif']}")
     return report_path
 
 
 def _fail(message: str) -> None:
     print(f"[error] {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def _emit_scan_summary(payload: dict, out_dir: Path, feed: EventFeed) -> None:
+    """Close the scan loop with a severity rollup and the exact next command."""
+    summary = payload.get("summary", {})
+    by_severity = summary.get("by_severity", {})
+    total = summary.get("total", 0)
+    if not total:
+        feed.emit("scan", "No findings. Nice.")
+        return
+    parts = [f"{by_severity[name]} {name.lower()}" for name in ("Critical", "High", "Medium", "Low", "Info") if by_severity.get(name)]
+    feed.emit("scan", f"Found {total} issue(s): {', '.join(parts)}")
+    hint = "penny report" + ("" if out_dir == Path(".") else f" --out {out_dir}")
+    feed.emit("scan", f"Next: {hint}")
+
+
+def _enforce_fail_on(payload: dict, threshold: str | None, feed: EventFeed) -> None:
+    """Exit non-zero (code 1) if any finding meets/exceeds the severity threshold.
+
+    Lets Penny gate CI/PRs: `penny scan . --fail-on high`. Usage/scan errors stay
+    on exit code 2 (raised by `_fail`); the gate uses 1 so callers can tell them apart.
+    """
+    if not threshold:
+        return
+    threshold = threshold.capitalize()
+    if threshold not in SEVERITY_ORDER:
+        _fail(f"--fail-on must be one of: {', '.join(SEVERITY_ORDER)}")
+    limit = SEVERITY_ORDER[threshold]
+    tripped = [
+        finding
+        for finding in payload.get("findings", [])
+        if SEVERITY_ORDER.get(finding.get("severity", ""), 99) <= limit
+    ]
+    if tripped:
+        feed.emit("gate", f"{len(tripped)} finding(s) at or above {threshold}; failing (--fail-on {threshold})")
+        raise SystemExit(1)
+    feed.emit("gate", f"No findings at or above {threshold}; passing (--fail-on {threshold})")
 
 
 def _ask_loop(
@@ -116,28 +176,34 @@ def _build_typer_app():
         static_only: bool = typer.Option(False, "--static-only"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
-        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories."),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks."),
+        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
+        diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
+        endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
         brute: bool = typer.Option(False, "--brute", help="Run a wordlist brute-force of paths/logins (owned targets only)."),
         browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
     ) -> None:
+        feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=EventFeed(), source_label=path, use_osv=osv, use_ai=ai, use_active=active, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
+                result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _emit_scan_summary(result.payload, out, feed)
+        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command()
     def report(
-        findings: Path = typer.Option(Path("findings.json"), "--findings"),
+        findings: Optional[Path] = typer.Option(None, "--findings", help="Defaults to the latest run under --out."),
         out: Path = typer.Option(Path("."), "--out"),
         export: bool = typer.Option(False, "--export", help="Also write report.html and findings.csv."),
     ) -> None:
-        _report_command(findings, out, EventFeed(), export=export)
+        _report_command(_resolve_findings_path(findings, out), out, EventFeed(), export=export)
 
     @app.command()
     def ask(
@@ -231,9 +297,12 @@ def _build_typer_app():
         target: str = typer.Option(..., "--target"),
         out: Path = typer.Option(Path("."), "--out"),
         i_own_this: bool = typer.Option(False, "--i-own-this"),
-        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories."),
+        osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks."),
+        active: bool = typer.Option(False, "--active", help="Send active (non-destructive) probes: SQLi payloads and Firebase open-rules checks. Public targets need --i-own-this."),
+        fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
+        diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
+        endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
         agentic: bool = typer.Option(False, "--agentic", help="Let Claude drive extra read-only probes (any app)."),
         brute: bool = typer.Option(False, "--brute", help="Run a wordlist brute-force of paths/logins (owned targets only)."),
         browser: bool = typer.Option(False, "--browser", help="Drive a real browser (Playwright) to crawl and probe the live site."),
@@ -243,10 +312,11 @@ def _build_typer_app():
         feed = EventFeed()
         try:
             with resolved_scan_source(path) as resolved:
-                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
+                result = run_scan(resolved, target=target, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active, diff_base=diff, endpoints=endpoint, agentic=agentic, brute=brute, browser=browser, wordlist=wordlist, pages=pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, out, feed)
+        _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command("demo-replay")
     def demo_replay(
@@ -271,14 +341,17 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--osv", action="store_true")
     scan_parser.add_argument("--ai", action="store_true")
     scan_parser.add_argument("--active", action="store_true")
+    scan_parser.add_argument("--fail-on", default=None)
+    scan_parser.add_argument("--diff", default=None)
+    scan_parser.add_argument("--endpoint", action="append", default=None)
     scan_parser.add_argument("--agentic", action="store_true")
     scan_parser.add_argument("--brute", action="store_true")
     scan_parser.add_argument("--browser", action="store_true")
-    scan_parser.add_argument("--wordlist")
+    scan_parser.add_argument("--wordlist", default=None)
     scan_parser.add_argument("--pages", type=int, default=8)
 
     report_parser = sub.add_parser("report")
-    report_parser.add_argument("--findings", type=Path, default=Path("findings.json"))
+    report_parser.add_argument("--findings", type=Path, default=None)
     report_parser.add_argument("--out", type=Path, default=Path("."))
     report_parser.add_argument("--export", action="store_true")
 
@@ -329,10 +402,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--osv", action="store_true")
     run_parser.add_argument("--ai", action="store_true")
     run_parser.add_argument("--active", action="store_true")
+    run_parser.add_argument("--fail-on", default=None)
+    run_parser.add_argument("--diff", default=None)
+    run_parser.add_argument("--endpoint", action="append", default=None)
     run_parser.add_argument("--agentic", action="store_true")
     run_parser.add_argument("--brute", action="store_true")
     run_parser.add_argument("--browser", action="store_true")
-    run_parser.add_argument("--wordlist")
+    run_parser.add_argument("--wordlist", default=None)
     run_parser.add_argument("--pages", type=int, default=8)
 
     replay_parser = sub.add_parser("demo-replay")
@@ -344,11 +420,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     if args.command == "scan":
         try:
             with resolved_scan_source(args.path) as resolved:
-                run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
+                result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _emit_scan_summary(result.payload, args.out, feed)
+        _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
-        _report_command(args.findings, args.out, feed, export=args.export)
+        _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, export=args.export)
     elif args.command == "ask":
         use_llm = not args.no_ai
         if use_llm:
@@ -387,10 +465,11 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "run":
         try:
             with resolved_scan_source(args.path) as resolved:
-                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
+                result = run_scan(resolved, target=args.target, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active, diff_base=args.diff, endpoints=args.endpoint, agentic=args.agentic, brute=args.brute, browser=args.browser, wordlist=args.wordlist, pages=args.pages)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
         _report_command(result.findings_path, args.out, feed)
+        _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)
 

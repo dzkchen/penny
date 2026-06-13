@@ -8,10 +8,10 @@ from .advisories import lookup as osv_lookup
 from .ai_review import ai_review
 from .detectors import detect_dependencies_via_advisories, run_detectors
 from .feed import EventFeed
-from .models import assign_finding_ids, now_session_id
+from .models import assign_finding_ids, dedupe_cross_detector, now_session_id
 from .mongo import MongoMirror
 from .probes import confirm_bola_order_access, confirm_cors_policy, confirm_service_key_read
-from .repo import walk_repo
+from .repo import changed_files, walk_repo
 from .store import FindingsStore
 
 
@@ -39,6 +39,8 @@ def run_scan(
     use_osv: bool = False,
     use_ai: bool = False,
     use_active: bool = False,
+    diff_base: str | None = None,
+    endpoints: list[str] | None = None,
 ) -> ScanResult:
     feed = feed or EventFeed()
     session_id = now_session_id()
@@ -47,6 +49,13 @@ def run_scan(
         raise FileNotFoundError(f"scan path does not exist: {repo_path}")
     feed.emit("scan", f"Walking {repo_path}")
     files = walk_repo(repo_path)
+    if diff_base:
+        changed = changed_files(repo_path, diff_base)
+        if changed is None:
+            feed.emit("scan", f"--diff: could not resolve '{diff_base}' (not a git tree or bad ref); scanning all files")
+        else:
+            files = [file for file in files if file.path.resolve() in changed]
+            feed.emit("scan", f"--diff {diff_base}: {len(files)} changed file(s) in scope")
     feed.emit("scan", f"Loaded {len(files)} source file(s)")
     mongo = MongoMirror()
     knowledge_query = " ".join(file.relative_path for file in files[:50])
@@ -63,6 +72,11 @@ def run_scan(
         feed.emit("osv", f"OSV review: {package_count} vulnerable dependency package(s)")
     if use_ai:
         findings.extend(ai_review(files, feed=feed))
+        before = len(findings)
+        findings = dedupe_cross_detector(findings)
+        merged = before - len(findings)
+        if merged:
+            feed.emit("ai", f"Merged {merged} AI finding(s) duplicating deterministic detectors")
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
@@ -76,7 +90,7 @@ def run_scan(
     elif target and static_only:
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
     if use_active:
-        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed, extra_endpoints=endpoints))
     if target and not static_only and brute:
         from .bruteforce import run_brute_force
 
@@ -95,6 +109,12 @@ def run_scan(
             "resolved_path": str(repo_path),
             "static_only": static_only,
             "file_count": len(files),
+            "coverage": {
+                "osv": use_osv,
+                "ai": use_ai,
+                "active": use_active,
+                "target": bool(target),
+            },
         },
     )
     feed.emit("store", f"Wrote {findings_path}")
