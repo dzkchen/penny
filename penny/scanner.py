@@ -8,7 +8,7 @@ from .advisories import lookup as osv_lookup
 from .ai_review import ai_review
 from .detectors import detect_dependencies_via_advisories, run_detectors
 from .feed import EventFeed
-from .models import assign_finding_ids, now_session_id
+from .models import assign_finding_ids, dedupe_cross_detector, now_session_id
 from .mongo import MongoMirror
 from .probes import confirm_bola_order_access, confirm_cors_policy, confirm_service_key_read
 from .repo import walk_repo
@@ -58,6 +58,11 @@ def run_scan(
         feed.emit("osv", f"OSV review: {package_count} vulnerable dependency package(s)")
     if use_ai:
         findings.extend(ai_review(files, feed=feed))
+        before = len(findings)
+        findings = dedupe_cross_detector(findings)
+        merged = before - len(findings)
+        if merged:
+            feed.emit("ai", f"Merged {merged} AI finding(s) duplicating deterministic detectors")
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
@@ -78,6 +83,12 @@ def run_scan(
             "resolved_path": str(repo_path),
             "static_only": static_only,
             "file_count": len(files),
+            "coverage": {
+                "osv": use_osv,
+                "ai": use_ai,
+                "active": use_active,
+                "target": bool(target),
+            },
         },
     )
     feed.emit("store", f"Wrote {findings_path}")

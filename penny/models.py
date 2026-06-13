@@ -82,6 +82,25 @@ class Finding:
         }
 
 
+def dedupe_cross_detector(findings: list[Finding]) -> list[Finding]:
+    """Drop AI-sourced findings that duplicate a deterministic finding at the same location.
+
+    Deterministic detectors are higher-precision and carry curated remediation, so when
+    `--ai` flags the same `(file, line)` we keep the deterministic finding and discard the
+    AI duplicate. Returns the list unchanged when there are no AI findings.
+    """
+    deterministic = {
+        (finding.location.file, finding.location.line)
+        for finding in findings
+        if finding.source != "ai"
+    }
+    return [
+        finding
+        for finding in findings
+        if not (finding.source == "ai" and (finding.location.file, finding.location.line) in deterministic)
+    ]
+
+
 def assign_finding_ids(findings: list[Finding]) -> list[Finding]:
     ordered = sorted(
         findings,

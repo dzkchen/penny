@@ -63,6 +63,20 @@ def _fail(message: str) -> None:
     raise SystemExit(2)
 
 
+def _emit_scan_summary(payload: dict, out_dir: Path, feed: EventFeed) -> None:
+    """Close the scan loop with a severity rollup and the exact next command."""
+    summary = payload.get("summary", {})
+    by_severity = summary.get("by_severity", {})
+    total = summary.get("total", 0)
+    if not total:
+        feed.emit("scan", "No findings. Nice.")
+        return
+    parts = [f"{by_severity[name]} {name.lower()}" for name in ("Critical", "High", "Medium", "Low", "Info") if by_severity.get(name)]
+    feed.emit("scan", f"Found {total} issue(s): {', '.join(parts)}")
+    hint = "penny report" + ("" if out_dir == Path(".") else f" --out {out_dir}")
+    feed.emit("scan", f"Next: {hint}")
+
+
 def _enforce_fail_on(payload: dict, threshold: str | None, feed: EventFeed) -> None:
     """Exit non-zero (code 1) if any finding meets/exceeds the severity threshold.
 
@@ -153,6 +167,7 @@ def _build_typer_app():
                 result = run_scan(resolved, target=target, static_only=static_only, out_dir=out, i_own_this=i_own_this, feed=feed, source_label=path, use_osv=osv, use_ai=ai, use_active=active)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _emit_scan_summary(result.payload, out, feed)
         _enforce_fail_on(result.payload, fail_on, feed)
 
     @app.command()
@@ -330,6 +345,7 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 result = run_scan(resolved, target=args.target, static_only=args.static_only, out_dir=args.out, i_own_this=args.i_own_this, feed=feed, source_label=args.path, use_osv=args.osv, use_ai=args.ai, use_active=args.active)
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        _emit_scan_summary(result.payload, args.out, feed)
         _enforce_fail_on(result.payload, args.fail_on, feed)
     elif args.command == "report":
         _report_command(_resolve_findings_path(args.findings, args.out), args.out, feed, export=args.export)

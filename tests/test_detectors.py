@@ -6,10 +6,40 @@ from penny.detectors import (
     detect_committed_secrets,
     run_detectors,
 )
-from penny.models import assign_finding_ids
+from penny.models import Finding, Location, assign_finding_ids, dedupe_cross_detector
 from penny.repo import SourceFile, walk_repo
 
 from .conftest import ROOT, SERVICE_KEY
+
+
+def _finding(detector_id: str, source: str, file: str, line: int) -> Finding:
+    return Finding(
+        title=f"{detector_id} finding",
+        severity="High",
+        confidence="high",
+        status="suspected",
+        source=source,
+        detector_id=detector_id,
+        owasp=[],
+        location=Location(file=file, line=line),
+        snippet="",
+        evidence={},
+        impact="",
+        remediation="",
+    )
+
+
+def test_dedupe_drops_ai_finding_colliding_with_detector() -> None:
+    findings = [
+        _finding("D001", "static", "client.ts", 5),
+        _finding("AI001", "ai", "client.ts", 5),
+        _finding("AI001", "ai", "other.ts", 9),
+    ]
+    kept = dedupe_cross_detector(findings)
+    ids = [(f.detector_id, f.source, f.location.file) for f in kept]
+    assert ("D001", "static", "client.ts") in ids
+    assert ("AI001", "ai", "client.ts") not in ids  # deduped
+    assert ("AI001", "ai", "other.ts") in ids  # unique AI finding survives
 
 
 def _source(name: str, text: str) -> SourceFile:

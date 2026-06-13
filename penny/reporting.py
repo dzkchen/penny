@@ -31,11 +31,15 @@ def _scan_scope(payload: dict[str, Any]) -> str:
     resolved_path = scan.get("resolved_path", "unknown")
     file_count = scan.get("file_count", "unknown")
     static_only = scan.get("static_only", False)
+    coverage = scan.get("coverage") or {}
+    enabled = [name for name in ("osv", "ai", "active") if coverage.get(name)]
+    coverage_text = ", ".join(enabled) if enabled else "static detectors only"
     return "\n".join(
         [
             f"- Scan source: `{source}`",
             f"- Resolved local path: `{resolved_path}`",
             f"- Source files inspected: {file_count}",
+            f"- Coverage: {coverage_text}",
             f"- Dynamic probes: {'skipped' if static_only else 'enabled when a target was provided'}",
         ]
     )
