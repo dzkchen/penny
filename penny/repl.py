@@ -64,7 +64,10 @@ class Session:
         self.payload: dict[str, Any] | None = None
         self.findings_path: Path | None = None
         self.target: str | None = None
-        self.i_own_this = False
+        # Default ownership from .env (PENNY_I_OWN_THIS=1) so you never retype it.
+        # Still env-gated, not silently always-on, so it stays a conscious choice.
+        llm._load_dotenv()
+        self.i_own_this = os.environ.get("PENNY_I_OWN_THIS", "").strip() in ("1", "true", "yes")
         self.use_ai = llm.available()
         self._autoload()
 
