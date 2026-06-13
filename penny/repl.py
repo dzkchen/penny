@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from . import __version__, llm, ui
 from .ask import answer_question
 from .feed import Event, EventFeed
+from .live import LiveScanFeed, print_scan_summary
 from .reporting import generate_report, load_findings
 from .scanner import run_scan
 from .sources import resolved_scan_source
@@ -80,6 +82,7 @@ class Session:
     def __init__(self, out_dir: Path | str = Path("."), printer: Callable[[str], None] | None = None) -> None:
         self.out_dir = Path(out_dir)
         self.printer = printer or (lambda text="": print(text))
+        self._interactive_shell = printer is None
         self.payload: dict[str, Any] | None = None
         self.findings_path: Path | None = None
         self.target: str | None = None
@@ -115,6 +118,11 @@ class Session:
 
     def _findings_list(self) -> list[dict[str, Any]]:
         return (self.payload or {}).get("findings", [])
+
+    def _make_scan_feed(self) -> tuple[EventFeed, bool]:
+        if self._interactive_shell:
+            return LiveScanFeed(), True
+        return PrettyFeed(self.printer), False
 
     # ---- greeting / help --------------------------------------------------
     def greet(self) -> None:
@@ -364,35 +372,41 @@ class Session:
             return
 
         self.out(ui.dim(f"Scanning {path}…"))
-        feed = PrettyFeed(self.printer)
+        feed, live_dashboard = self._make_scan_feed()
+        feed_scope = feed if live_dashboard else nullcontext(feed)
         try:
-            with resolved_scan_source(path) as resolved:
-                result = run_scan(
-                    resolved,
-                    target=target,
-                    static_only=static_only,
-                    out_dir=self.out_dir,
-                    i_own_this=i_own_this,
-                    agentic=agentic,
-                    brute=brute,
-                    browser=browser,
-                    netscan=netscan,
-                    load_test=load_test,
-                    i_accept=i_accept,
-                    feed=feed,
-                    source_label=path,
-                    use_osv=use_osv,
-                    use_ai=use_ai,
-                    use_active=use_active,
-                )
+            with feed_scope:
+                with resolved_scan_source(path) as resolved:
+                    result = run_scan(
+                        resolved,
+                        target=target,
+                        static_only=static_only,
+                        out_dir=self.out_dir,
+                        i_own_this=i_own_this,
+                        agentic=agentic,
+                        brute=brute,
+                        browser=browser,
+                        netscan=netscan,
+                        load_test=load_test,
+                        i_accept=i_accept,
+                        feed=feed,
+                        source_label=path,
+                        use_osv=use_osv,
+                        use_ai=use_ai,
+                        use_active=use_active,
+                    )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             self._error(f"Scan failed: {error}")
             return
         self.payload = result.payload
         self.findings_path = result.findings_path
-        self.out()
-        self._summary()
-        self._findings()
+        if live_dashboard:
+            print_scan_summary(result.payload, self.out_dir)
+            self.out(ui.dim("Use /show <id> for details, or ask a question."))
+        else:
+            self.out()
+            self._summary()
+            self._findings()
 
     def _audit(self, args: list[str]) -> None:
         """Full pipeline: scan + AI + every probe + report, in one command."""
