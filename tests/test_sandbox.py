@@ -111,14 +111,25 @@ def test_parse_agent_output_builds_findings() -> None:
     assert finding.evidence["dynamic_probe"]["probe"] == "heretic_sandbox"
 
 
-def _wire_happy_path(monkeypatch, destroyed: list, *, ssh_run) -> None:
+def _wire_happy_path(monkeypatch, destroyed: list, *, output: str = "", stream_raises: Exception | None = None) -> None:
     monkeypatch.setattr(sandbox.vultr, "available", lambda: True)
+    monkeypatch.setattr(sandbox, "_reusable_box", lambda: None)
     monkeypatch.setattr(sandbox, "snapshot_id", lambda: "snap-x")
     monkeypatch.setattr(sandbox.vultr, "provision", lambda **kwargs: _box())
     monkeypatch.setattr(sandbox.vultr, "wait_for_ip", lambda box, **kw: "1.2.3.4")
     monkeypatch.setattr(sandbox.vultr, "wait_for_ssh", lambda ip, **kw: True)
-    monkeypatch.setattr(sandbox, "_wait_for_model", lambda ip, feed, **kw: True)
-    monkeypatch.setattr(sandbox.vultr, "ssh_run", ssh_run)
+    monkeypatch.setattr(sandbox, "_ensure_model_up", lambda ip, feed, **kw: True)
+
+    def _ssh_stream(ip, cmd, *, timeout=0.0, on_line=None):
+        if stream_raises is not None:
+            raise stream_raises
+        for line in output.splitlines():
+            if on_line is not None:
+                on_line(line)
+        return 0, output
+
+    monkeypatch.setattr(sandbox.vultr, "ssh_stream", _ssh_stream)
+    monkeypatch.setattr(sandbox.vultr, "ssh_run", lambda *a, **k: (0, "", ""))
     monkeypatch.setattr(sandbox.vultr, "destroy", lambda box_id: destroyed.append(box_id))
 
 
@@ -127,7 +138,7 @@ def test_sandbox_test_runs_and_destroys(monkeypatch) -> None:
     jsonl = ('{"finding": {"title": "Auth bypass", "severity": "High", "owasp": ["A07"],'
              ' "path": "/admin", "snippet": "got in", "impact": "x", "remediation": "y", "evidence": {}}}\n'
              '{"event": "done", "findings": 1}')
-    _wire_happy_path(monkeypatch, destroyed, ssh_run=lambda ip, cmd, **kw: (0, jsonl, ""))
+    _wire_happy_path(monkeypatch, destroyed, output=jsonl)
     findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed())
     assert len(findings) == 1
     assert findings[0].detector_id == "H001"
@@ -136,11 +147,7 @@ def test_sandbox_test_runs_and_destroys(monkeypatch) -> None:
 
 def test_sandbox_test_destroys_on_error(monkeypatch) -> None:
     destroyed: list[str] = []
-
-    def _raise(ip, cmd, **kw):
-        raise RuntimeError("ssh blew up mid-attack")
-
-    _wire_happy_path(monkeypatch, destroyed, ssh_run=_raise)
+    _wire_happy_path(monkeypatch, destroyed, stream_raises=RuntimeError("ssh blew up mid-attack"))
     findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed())
     assert findings == []
     assert destroyed == ["box-1"]  # teardown still runs in finally
@@ -148,6 +155,55 @@ def test_sandbox_test_destroys_on_error(monkeypatch) -> None:
 
 def test_sandbox_test_keep_alive_skips_destroy(monkeypatch) -> None:
     destroyed: list[str] = []
-    _wire_happy_path(monkeypatch, destroyed, ssh_run=lambda ip, cmd, **kw: (0, '{"event": "done", "findings": 0}', ""))
+    _wire_happy_path(monkeypatch, destroyed, output='{"event": "done", "findings": 0}')
     sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
     assert destroyed == []
+
+
+def test_sandbox_test_reuses_kept_box(monkeypatch) -> None:
+    destroyed: list[str] = []
+    kept = _box()
+    kept.ip = "9.9.9.9"
+    monkeypatch.setattr(sandbox.vultr, "available", lambda: True)
+    monkeypatch.setattr(sandbox, "_reusable_box", lambda: kept)
+
+    def _no_provision(**kwargs):  # reuse must skip provisioning entirely (no restore)
+        raise AssertionError("provision called despite a reusable box")
+
+    monkeypatch.setattr(sandbox.vultr, "provision", _no_provision)
+    monkeypatch.setattr(sandbox.vultr, "wait_for_ssh", lambda ip, **kw: True)
+    monkeypatch.setattr(sandbox, "_ensure_model_up", lambda ip, feed, **kw: True)
+    monkeypatch.setattr(sandbox.vultr, "destroy", lambda box_id: destroyed.append(box_id))
+
+    def _ssh_stream(ip, cmd, *, timeout=0.0, on_line=None):
+        assert ip == "9.9.9.9"  # talks to the reused box
+        for line in '{"event": "done", "findings": 0}'.splitlines():
+            if on_line is not None:
+                on_line(line)
+        return 0, ""
+
+    monkeypatch.setattr(sandbox.vultr, "ssh_stream", _ssh_stream)
+    sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
+    assert destroyed == []  # kept alive for the next run
+
+
+def test_sandbox_test_destroys_unhealable_reused_box(monkeypatch) -> None:
+    # A reused box whose model can't be healed must be destroyed even under --keep-alive, so the
+    # next run restores fresh instead of reusing the same broken box forever.
+    destroyed: list[str] = []
+    kept = _box()
+    kept.ip = "9.9.9.9"
+    monkeypatch.setattr(sandbox.vultr, "available", lambda: True)
+    monkeypatch.setattr(sandbox, "_reusable_box", lambda: kept)
+    monkeypatch.setattr(sandbox.vultr, "wait_for_ssh", lambda ip, **kw: True)
+    monkeypatch.setattr(sandbox, "_ensure_model_up", lambda ip, feed, **kw: False)
+    monkeypatch.setattr(sandbox, "_dump_vllm_logs", lambda ip, feed: None)
+    monkeypatch.setattr(sandbox.vultr, "destroy", lambda box_id: destroyed.append(box_id))
+
+    def _no_stream(*a, **k):
+        raise AssertionError("attack launched despite a dead model")
+
+    monkeypatch.setattr(sandbox.vultr, "ssh_stream", _no_stream)
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
+    assert findings == []
+    assert destroyed == ["box-1"]  # poisoned box torn down despite keep_alive

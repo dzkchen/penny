@@ -172,9 +172,14 @@ def ask_model(endpoint: str, model: str, transcript: list, *, timeout: float = 1
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + transcript,
         # Thinking models spend tokens on a <think> block before the JSON answer, so give
-        # plenty of headroom or the actual action gets truncated away.
-        "max_tokens": 2048,
-        "temperature": 0.7,
+        # plenty of headroom or the actual action gets truncated away (we store only compact
+        # actions in the transcript, so the context stays free for reasoning).
+        "max_tokens": 4096,
+        # Qwen3-Thinking's recommended sampling. Don't drop temperature much below this —
+        # thinking models degrade (repetition, worse reasoning) at near-greedy temps.
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
     }
     request = urllib.request.Request(
         endpoint, data=json.dumps(payload).encode("utf-8"),

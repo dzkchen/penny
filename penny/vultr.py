@@ -360,6 +360,36 @@ def ssh_run(ip: str, command: str, *, timeout: float = 120.0) -> tuple[int, str,
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def ssh_stream(ip: str, command: str, *, timeout: float = 3600.0, on_line=None) -> tuple[int, str]:
+    """Run a remote command, streaming combined stdout/stderr line-by-line to ``on_line``.
+
+    Returns (returncode, full_output). Used for the long-running attack so the user sees
+    live progress and partial findings survive even if it's killed at the deadline (unlike
+    the buffered :func:`ssh_run`, which loses everything on a timeout).
+    """
+    proc = subprocess.Popen(
+        _ssh_base(ip) + [command],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    deadline = time.monotonic() + timeout
+    chunks: list[str] = []
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            chunks.append(line)
+            if on_line is not None:
+                on_line(line.rstrip("\n"))
+            if time.monotonic() > deadline:
+                proc.kill()
+                break
+    finally:
+        try:
+            proc.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+    return (proc.returncode if proc.returncode is not None else -1), "".join(chunks)
+
+
 def wait_for_ssh(ip: str, *, timeout: float = 180.0, poll: float = 6.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
