@@ -166,15 +166,18 @@ def _extract_json(text: str):
         return None
 
 
-def ask_model(endpoint: str, model: str, transcript: list, *, timeout: float = 120.0) -> str:
+def ask_model(endpoint: str, model: str, transcript: list, *, system: str = SYSTEM_PROMPT, timeout: float = 120.0) -> str:
     """Call the local vLLM OpenAI-compatible endpoint; return the reply text."""
     payload = {
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + transcript,
-        # Thinking models spend tokens on a <think> block before the JSON answer, so give
-        # plenty of headroom or the actual action gets truncated away.
-        "max_tokens": 2048,
+        "messages": [{"role": "system", "content": system}] + transcript,
+        # Instruct models answer with the compact JSON action directly (no <think> block), so a
+        # modest completion budget is plenty AND leaves headroom under --max-model-len (8192):
+        # prompt + max_tokens must fit, and a too-large value here is what 400s the request.
+        "max_tokens": 1024,
         "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
     }
     request = urllib.request.Request(
         endpoint, data=json.dumps(payload).encode("utf-8"),
@@ -183,6 +186,14 @@ def ask_model(endpoint: str, model: str, transcript: list, *, timeout: float = 1
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = json.loads(response.read().decode("utf-8", "replace"))
     return body["choices"][0]["message"]["content"]
+
+
+def _trim(transcript: list, *, keep: int = 16) -> list:
+    """Keep the seed message + the last `keep-1` exchanges so context never overflows the
+    model's window (the cause of the mid-run 'HTTP Error 400'). Older turns are dropped."""
+    if len(transcript) <= keep:
+        return transcript
+    return transcript[:1] + transcript[-(keep - 1):]
 
 
 def _finding_from(decision: dict, gate: RemoteGate) -> dict:
@@ -200,16 +211,98 @@ def _finding_from(decision: dict, gate: RemoteGate) -> dict:
     }
 
 
-def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24) -> int:
-    """Drive the model→gate→execute loop. Returns the number of findings emitted."""
-    transcript: list = [{"role": "user", "content": f"Target root: {gate.base_url}\nPropose your first probe."}]
-    findings = 0
-    for turn in range(max_turns):
+def _body_hash(body: str) -> str:
+    import hashlib
+    return hashlib.sha1(body.encode("utf-8", "ignore")).hexdigest()
+
+
+def _ct_family(content_type: str) -> str:
+    ct = (content_type or "").lower()
+    if "json" in ct:
+        return "json"
+    if "html" in ct:
+        return "html"
+    return ct.split(";", 1)[0].strip()
+
+
+def _norm_path(path: str) -> str:
+    p = str(path or "/").split("#", 1)[0].split("?", 1)[0].strip().lower()
+    if len(p) > 1:
+        p = p.rstrip("/")
+    return p or "/"
+
+
+def compute_baseline(gate: RemoteGate) -> list:
+    """Probe known-nonexistent paths to learn how the target answers garbage.
+
+    Many sites (SPAs, catch-all routers) return a generic 200 page for ANY path, so a 200 is NOT
+    evidence an endpoint exists. We record those responses' (status, content-type, length, hash)
+    and later refuse to count a 'finding' whose proof response just matches this baseline.
+    """
+    import os
+    sigs: list = []
+    probes = [f"/penny-nonexistent-{os.getpid()}-zzqq", f"/api/penny-nonexistent-{os.getpid()}/zzqq-9182"]
+    for p in probes:
         try:
-            reply = ask_model(endpoint, model, transcript)
+            r = gate.execute("GET", p, {}, None)
+        except Exception:  # noqa: BLE001
+            continue
+        sigs.append({"status": r["status"], "ct": _ct_family(r["content_type"]),
+                     "len": len(r["body"]), "hash": _body_hash(r["body"])})
+    return sigs
+
+
+def matches_baseline(result: dict, baseline: list) -> bool:
+    """True if `result` looks like the catch-all garbage response (not a real endpoint)."""
+    if not baseline:
+        return False
+    h = _body_hash(result["body"])
+    ct = _ct_family(result["content_type"])
+    ln = len(result["body"])
+    st = result["status"]
+    for s in baseline:
+        if h == s["hash"]:
+            return True
+        # HTML SPAs may vary slightly per path (hash differs) but are still the catch-all page:
+        # same status + html + near-equal length. Never matches a JSON API response.
+        if st == s["status"] and ct == "html" and s["ct"] == "html" and abs(ln - s["len"]) <= max(128, int(0.08 * s["len"])):
+            return True
+    return False
+
+
+def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24, system: str = SYSTEM_PROMPT) -> int:
+    """Drive the model→gate→execute loop. Returns the number of findings emitted."""
+    baseline = compute_baseline(gate)
+    real_hits: dict[str, bool] = {}   # normalized path -> True if it returned a NON-baseline response
+    baseline_note = ""
+    if baseline:
+        b = baseline[0]
+        emit({"event": "baseline", "status": b["status"], "content_type": b["ct"], "bytes": b["len"]})
+        baseline_note = (
+            f"\nIMPORTANT — a probe to a KNOWN-NONEXISTENT path returned HTTP {b['status']} "
+            f"{b['ct']} ~{b['len']} bytes. This target is a CATCH-ALL responder: it serves a generic "
+            "page for ANY path. A 200 that matches this baseline is NOT proof an endpoint exists or "
+            "is vulnerable. Only treat a response as real if it DIFFERS from the baseline (JSON "
+            "content-type, materially different body/length, or a different status). Never report a "
+            "finding backed only by a baseline-matching response."
+        )
+    transcript: list = [{"role": "user", "content": f"Target root: {gate.base_url}{baseline_note}\nPropose your first probe."}]
+    findings = 0
+    consecutive_model_errors = 0
+    for turn in range(max_turns):
+        transcript = _trim(transcript)
+        try:
+            reply = ask_model(endpoint, model, transcript, system=system)
+            consecutive_model_errors = 0
         except Exception as error:  # noqa: BLE001
+            # Don't kill the whole run on one model hiccup (e.g. a transient 400). Trim the
+            # context hard and retry; only give up after several failures in a row.
+            consecutive_model_errors += 1
             emit({"event": "model_error", "msg": str(error)[:200]})
-            break
+            if consecutive_model_errors >= 3:
+                break
+            transcript = transcript[:1] + transcript[-4:]
+            continue
         decision = _extract_json(reply)
         if not decision:
             emit({"event": "no_action", "msg": "model returned no valid JSON action"})
@@ -221,6 +314,14 @@ def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24
             break
 
         if action == "finding":
+            ok, reason = _validate_finding(str(decision.get("path", "")), real_hits, baseline)
+            if not ok:
+                emit({"event": "finding_rejected", "path": decision.get("path", ""), "reason": reason})
+                transcript.append({"role": "assistant", "content": json.dumps(decision)})
+                transcript.append({"role": "user", "content": f"That finding was REJECTED: {reason}. Only "
+                                   "report a finding when a real probe to that exact path returned a response "
+                                   "that DIFFERS from the catch-all baseline. Keep probing or finish."})
+                continue
             finding = _finding_from(decision, gate)
             emit({"finding": finding})
             findings += 1
@@ -253,14 +354,43 @@ def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24
             transcript.append({"role": "user", "content": f"Request errored: {error}. Try another or finish."})
             continue
 
-        emit({"event": "response", "status": result["status"], "bytes": len(result["body"])})
+        is_catch_all = matches_baseline(result, baseline)
+        norm = _norm_path(path)
+        real_hits[norm] = real_hits.get(norm, False) or not is_catch_all
+        emit({"event": "response", "status": result["status"], "bytes": len(result["body"]),
+              "catch_all": is_catch_all})
         result_summary = {"status": result["status"], "content_type": result["content_type"],
-                          "body_preview": result["body"][:600]}
-        transcript.append({"role": "assistant", "content": reply})
+                          "body_preview": result["body"][:600],
+                          # Tell the model when a 200 is just the catch-all page, not a real endpoint.
+                          "matches_catch_all_baseline": is_catch_all}
+        # Store the COMPACT decision (not the raw reply, which may carry extra prose) so the
+        # transcript stays small and the context window doesn't balloon over a long run.
+        transcript.append({"role": "assistant", "content": json.dumps(decision)})
         transcript.append({"role": "user", "content": f"Result: {json.dumps(result_summary)}\n"
-                                                      "If this proves a real flaw, emit a finding; else propose the next probe or finish."})
+                                                      "If this proves a real flaw (and the response is NOT just the "
+                                                      "catch-all baseline), emit a finding; else propose the next probe or finish."})
     emit({"event": "done", "findings": findings, "requests": gate.request_count})
     return findings
+
+
+def _validate_finding(finding_path: str, real_hits: dict, baseline: list) -> tuple:
+    """Reject hallucinated findings: a finding must be backed by a probe whose response DIFFERED
+    from the catch-all baseline. On a pure catch-all target, every finding is rejected."""
+    if not baseline:
+        return True, ""  # couldn't baseline (e.g. localhost test) — don't block
+    if not any(real_hits.values()):
+        return False, ("every probe matched the catch-all baseline — the target returns a generic page "
+                       "for unknown paths, so none of these endpoints are real")
+    norm = _norm_path(finding_path)
+    if real_hits.get(norm):
+        return True, ""
+    # Allow an id-style finding (/api/x/{id}) backed by a real sibling (/api/x/123).
+    parent = norm.rsplit("/", 1)[0]
+    for probed, was_real in real_hits.items():
+        if was_real and (probed == norm or probed.rsplit("/", 1)[0] == parent):
+            return True, ""
+    return False, (f"no real (non-baseline) response backs {finding_path}; its probes matched the "
+                   "catch-all baseline, so the endpoint isn't proven to exist")
 
 
 def main(argv=None) -> int:
@@ -271,13 +401,23 @@ def main(argv=None) -> int:
     parser.add_argument("--max-requests", type=int, default=60)
     parser.add_argument("--max-turns", type=int, default=24)
     parser.add_argument("--allow-destructive", action="store_true", help="permit DELETE (off by default)")
+    # Operator focus for this run, base64-encoded (avoids shell-quoting arbitrary text). Appended
+    # to the system prompt so you can steer WHAT it tests, e.g. "focus on SQLi in /search and
+    # JWT tampering; ignore IDOR".
+    parser.add_argument("--instructions-b64", default="", help="base64-encoded operator focus appended to the system prompt")
     args = parser.parse_args(argv)
+    system = SYSTEM_PROMPT
+    if args.instructions_b64:
+        import base64
+        focus = base64.b64decode(args.instructions_b64).decode("utf-8", "replace").strip()
+        if focus:
+            system = SYSTEM_PROMPT + "\n\nOPERATOR FOCUS FOR THIS RUN (prioritize this over the generic list above):\n" + focus
     try:
         gate = RemoteGate(args.target, max_requests=args.max_requests, allow_destructive=args.allow_destructive)
     except GateError as error:
         emit({"event": "fatal", "msg": str(error)})
         return 2
-    run_loop(gate, args.endpoint, args.model, max_turns=args.max_turns)
+    run_loop(gate, args.endpoint, args.model, max_turns=args.max_turns, system=system)
     return 0
 
 

@@ -21,6 +21,7 @@ from .live import LiveScanFeed, print_scan_summary, render_scan_summary
 from .reporting import generate_report, load_findings
 from .scanner import run_scan
 from .sources import resolved_scan_source
+from .repl_input import autocomplete_enabled, read_line
 from .store import FindingsStore, copy_report_to_findings_dir
 
 SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
@@ -39,7 +40,7 @@ HELP = """\
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
 /cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
 /sandbox-bake                     one-time: build the heretic/gemma-3 GPU snapshot (~$0.70)
-/sandbox-test [target]            ephemeral GPU box runs heretic/gemma-3 active breach, then self-destructs (TXT proof required)
+/sandbox-test [target] [--workers N] [--focus <text>]   ephemeral GPU box runs heretic/gemma-3 active breach (steer with --focus; parallel with --workers), then self-destructs
 /boxes                            list active cloud boxes + auto-destroy timers
 /kill                             stop running cloud attacks (keep boxes)
 /destroy                          destroy all cloud boxes now
@@ -54,16 +55,25 @@ Natural language works too: "pentest this app", "audit ./planted-app", "fix the 
 or just ask a question. For a live site you own:  /target <url>   /own on   /audit ."""
 
 STARTER_EXAMPLE = """\
-Start with natural language or a slash command.
+1. Set a target (optional)     {target}
+2. Run a scan or full audit   {audit}
+3. Review, ask, and fix       {review}
 
 Example
 "Run a full audit on ./file_path --target https://your-app.example --active --osv --ai"
 
-Common commands
-/audit   /scan   /findings   /report   /fix
+Type {slash} for autocomplete · {help} for every command · {exit} to leave"""
 
-/help shows the full command list.
-/exit leaves Penny."""
+
+def _quick_start_text() -> str:
+    return STARTER_EXAMPLE.format(
+        target=ui.command_chip("/target <url>"),
+        audit=ui.command_chip("/audit <path>"),
+        review=f"{ui.command_chip('/findings')}  {ui.command_chip('/report')}  {ui.command_chip('/fix')}",
+        slash=ui.command_chip("/"),
+        help=ui.command_chip("/help"),
+        exit=ui.command_chip("/exit"),
+    )
 
 
 class PrettyFeed(EventFeed):
@@ -131,14 +141,27 @@ class Session:
     # ---- greeting / help --------------------------------------------------
     def greet(self) -> None:
         self.out(ui.banner())
+        self.out(ui.tagline("purple-team assistant for AI-built apps"))
         self.out()
-        lines = [
-            f"{ui.dim('version')} {__version__}    {ui.dim('cwd')} {os.getcwd()}",
-            f"{ui.dim('AI')} " + (f"on · {llm.deep_model()}" if self.use_ai else "off (set ANTHROPIC_API_KEY)"),
+
+        status_lines = [
+            ui.kv("version", __version__),
+            ui.kv("cwd", os.getcwd()),
+            ui.kv(
+                "AI",
+                (ui.status_on() + ui.dim(f"  {llm.deep_model()}") if self.use_ai else ui.status_off() + ui.dim("  set ANTHROPIC_API_KEY")),
+            ),
         ]
-        self.out(ui.panel("\n".join(lines), title="Penny — purple-team assistant for AI-built apps", color="magenta"))
+        if self.payload:
+            total = self.payload.get("summary", {}).get("total", 0)
+            status_lines.append(ui.kv("session", ui.style(f"{total} finding(s) ready", "bright_green")))
+        if self.target:
+            status_lines.append(ui.kv("target", self.target))
+
+        self.out(ui.panel("\n".join(status_lines), title="Session", color="magenta"))
         self.out()
-        self.out(ui.panel(STARTER_EXAMPLE, title="How To Use", color="cyan"))
+        self.out(ui.panel(_quick_start_text(), title="How To Use", color="cyan"))
+        self.out(ui.dim("Natural language works too — just ask a question or say \"audit ./app\""))
         self.out()
 
     def _help(self) -> None:
@@ -456,17 +479,14 @@ class Session:
     def _summary(self) -> None:
         summary = (self.payload or {}).get("summary", {})
         by_sev = summary.get("by_severity", {})
-        parts = [
-            ui.severity_badge(sev).strip() + ui.dim(f" {by_sev[sev]}")
-            for sev in ("Critical", "High", "Medium", "Low", "Info")
-            if by_sev.get(sev)
-        ]
         confirmed = summary.get("confirmed_count", 0)
-        body = (
-            f"{summary.get('total', 0)} finding(s)   " + "   ".join(parts)
-            + (f"\n{ui.style(str(confirmed) + ' dynamically confirmed', 'bright_green')}" if confirmed else "")
-        )
-        self.out(ui.panel(body, title="Scan summary", color="green"))
+        body_lines = [
+            ui.style(f"{summary.get('total', 0)} finding(s)", "bold", "white"),
+            ui.severity_strip(by_sev),
+        ]
+        if confirmed:
+            body_lines.append(ui.style(f"✓ {confirmed} dynamically confirmed", "bright_green"))
+        self.out(ui.panel("\n".join(body_lines), title="Scan summary", color="green"))
 
     def _findings(self) -> None:
         findings = self._findings_list()
@@ -505,15 +525,15 @@ class Session:
         location = finding["location"]
         body = "\n".join(
             [
-                f"{ui.severity_badge(finding['severity'])}  {finding['detector_id']}  {ui.dim(finding['status'])}",
-                f"{ui.dim('where')}  {location['file']}:{location['line']}",
-                f"{ui.dim('owasp')}  {', '.join(finding.get('owasp', [])) or '—'}",
+                f"{ui.severity_badge(finding['severity'])}  {ui.style(finding['detector_id'], 'bold', 'cyan')}  {ui.dim(finding['status'])}",
+                ui.field("where", f"{location['file']}:{location['line']}"),
+                ui.field("owasp", ", ".join(finding.get("owasp", [])) or "—"),
                 "",
-                ui.dim("snippet"),
-                finding.get("snippet", ""),
+                ui.style("snippet", "bold", "bright_black"),
+                ui.dim(finding.get("snippet", "")),
                 "",
-                f"{ui.style('Impact:', 'bold')} {finding['impact']}",
-                f"{ui.style('Fix:', 'bold')} {finding['remediation']}",
+                ui.field("Impact", finding["impact"]),
+                ui.field("Fix", finding["remediation"]),
             ]
         )
         self.out(ui.panel(body, title=f"{finding['id']} — {finding['title']}", color="magenta"))
@@ -637,16 +657,38 @@ class Session:
     def _sandbox_test(self, args: list[str]) -> None:
         from .sandbox import sandbox_test
 
-        target = next((a for a in args if not a.startswith("-")), None) or self.target
+        keep_alive = "--keep-alive" in args
+        allow_destructive = "--allow-destructive" in args
+        # Drop boolean flags, then pull --workers N, then treat everything after --focus/
+        # --instructions as the free-text focus (so the user needn't quote it).
+        toks = [a for a in args if a not in ("--keep-alive", "--allow-destructive")]
+        workers = 1
+        if "--workers" in toks:
+            i = toks.index("--workers")
+            try:
+                workers = max(1, int(toks[i + 1]))
+            except (IndexError, ValueError):
+                self._warn("--workers needs a number, e.g. --workers 4")
+                return
+            del toks[i:i + 2]
+        instructions = ""
+        for flag in ("--focus", "--instructions"):
+            if flag in toks:
+                i = toks.index(flag)
+                instructions = " ".join(toks[i + 1:]).strip()
+                toks = toks[:i]
+                break
+        target = next((a for a in toks if not a.startswith("-")), None) or self.target
         if not target:
-            self._warn("No target set. Use /target <url> first, or /sandbox-test <url>.")
+            self._warn("No target set. Use /target <url> first, or /sandbox-test <url> [--workers N] [--focus <text>].")
             return
         feed = PrettyFeed(self.printer)
         findings = sandbox_test(
             target,
             i_own_this=self.i_own_this, feed=feed,
-            keep_alive="--keep-alive" in args,
-            allow_destructive="--allow-destructive" in args,
+            keep_alive=keep_alive,
+            allow_destructive=allow_destructive,
+            instructions=instructions, workers=workers,
         )
         if findings:
             self._persist_findings(findings, target, source="sandbox-test")
@@ -711,15 +753,25 @@ class Session:
 def run_repl(out_dir: Path | str = Path(".")) -> None:
     session = Session(out_dir=out_dir)
     session.greet()
-    while True:
-        try:
-            line = input(ui.prompt())
-        except EOFError:
-            session.out()
-            break
-        except KeyboardInterrupt:
-            session.out(ui.dim("\n(^C — type /exit to quit)"))
-            continue
-        if not session.handle(line):
-            break
-    session.out(ui.dim("bye 👋"))
+
+    def _loop() -> None:
+        while True:
+            try:
+                line = read_line(ui.prompt())
+            except EOFError:
+                session.out()
+                break
+            except KeyboardInterrupt:
+                session.out(ui.dim("\n(^C — type /exit to quit)"))
+                continue
+            if not session.handle(line):
+                break
+
+    if autocomplete_enabled():
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        with patch_stdout():
+            _loop()
+    else:
+        _loop()
+    session.out(ui.dim("bye"))

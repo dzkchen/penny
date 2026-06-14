@@ -93,6 +93,8 @@ def _sandbox_test_command(
     allow_destructive: bool,
     keep_alive: bool,
     auto_confirm: bool,
+    instructions: str = "",
+    workers: int = 1,
 ) -> None:
     """Run the ephemeral heretic/gemma-3 active-breach sandbox and persist findings."""
     from .models import assign_finding_ids, now_session_id
@@ -103,35 +105,7 @@ def _sandbox_test_command(
         target,
         i_own_this=i_own_this, feed=feed,
         keep_alive=keep_alive, allow_destructive=allow_destructive, auto_confirm=auto_confirm,
-    )
-    if not findings:
-        feed.emit("report", "Sandbox breach produced no findings.")
-        return
-    ordered = assign_finding_ids(findings)
-    payload, run_path = FindingsStore(out).write_findings(
-        now_session_id(), ordered, scan={"source": "sandbox-test", "target": target},
-    )
-    feed.emit("report", f"Wrote {len(ordered)} finding(s) to {run_path}. Run `penny report` to write report.md.")
-
-
-def _sandbox_test_command(
-    target: str,
-    *,
-    out: Path,
-    i_own_this: bool,
-    allow_destructive: bool,
-    keep_alive: bool,
-    auto_confirm: bool,
-) -> None:
-    """Run the ephemeral heretic/gemma-3 active-breach sandbox and persist findings."""
-    from .models import assign_finding_ids, now_session_id
-    from .sandbox import sandbox_test
-
-    feed = EventFeed()
-    findings = sandbox_test(
-        target,
-        i_own_this=i_own_this, feed=feed,
-        keep_alive=keep_alive, allow_destructive=allow_destructive, auto_confirm=auto_confirm,
+        instructions=instructions, workers=workers,
     )
     if not findings:
         feed.emit("report", "Sandbox breach produced no findings.")
@@ -351,12 +325,15 @@ def _build_typer_app():
         i_own_this: bool = typer.Option(False, "--i-own-this"),
         allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit DELETE (off by default)."),
         keep_alive: bool = typer.Option(False, "--keep-alive", help="Keep the box after the run (still auto-destroys in 30m)."),
+        instructions: str = typer.Option("", "--instructions", "-i", help="Free-text focus for what to test, e.g. 'focus on SQLi in /search and JWT tampering; skip IDOR'. Appended to the agent's system prompt."),
+        workers: int = typer.Option(1, "--workers", "-w", help="Run this many agent workers concurrently; with no --instructions they fan out across distinct vuln classes for wider coverage."),
         yes: bool = typer.Option(False, "--yes", help="Skip the cost-confirm prompt."),
     ) -> None:
         """Ephemeral GPU box runs a heretic/gemma-3 ACTIVE breach against an owned target, then self-destructs."""
         _sandbox_test_command(
             target, out=out, i_own_this=i_own_this,
             allow_destructive=allow_destructive, keep_alive=keep_alive, auto_confirm=yes,
+            instructions=instructions, workers=workers,
         )
 
     @app.command()
