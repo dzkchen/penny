@@ -224,20 +224,30 @@ def provision(
     return box
 
 
-def wait_for_ip(box: Box, *, timeout: float = 180.0, poll: float = 6.0) -> str:
-    """Poll until the box has an IP and is active. Returns the IP."""
+def wait_for_ip(box: Box, *, timeout: float = 180.0, poll: float = 6.0, feed=None) -> str:
+    """Poll until the box has an IP and is active. Returns the IP.
+
+    Pass ``feed`` to stream the live status/power/server state — useful for diagnosing slow
+    or stuck snapshot restores instead of a blind timeout.
+    """
     deadline = time.monotonic() + timeout
+    last = ""
     while time.monotonic() < deadline:
         info = _request("GET", f"/instances/{box.id}").get("instance", {})
         ip = info.get("main_ip", "")
         status = info.get("status", "")
         power = info.get("power_status", "")
+        server = info.get("server_status", "")
         if ip and ip != "0.0.0.0" and status == "active" and power == "running":
             box.ip = ip
             _save_state(_load_state_replacing(box))
             return ip
+        snap = f"status={status or '-'} power={power or '-'} server={server or '-'} ip={ip or '-'}"
+        if feed is not None and snap != last:
+            feed.emit("attack", f"[sandbox] booting: {snap}")
+            last = snap
         time.sleep(poll)
-    raise VultrError(f"box {box.id} did not become ready within {timeout:.0f}s")
+    raise VultrError(f"box {box.id} did not become ready within {timeout:.0f}s (last: {last or 'no status'})")
 
 
 # ---------------------------------------------------------------------------

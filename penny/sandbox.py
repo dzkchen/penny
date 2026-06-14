@@ -58,6 +58,14 @@ def _vllm_spec() -> str:
     return os.environ.get("PENNY_VLLM_SPEC", "").strip() or "vllm==0.8.5.post1"
 
 
+def _transformers_spec() -> str:
+    """pip spec for transformers, installed AFTER vLLM to override its (too-old) pin. The
+    cu124-compatible vLLM ships a transformers that can't load newer model tokenizers
+    (e.g. Qwen3-2507 -> 'Qwen2Tokenizer has no attribute all_special_tokens_extended').
+    Override with PENNY_TRANSFORMERS_SPEC. Empty string skips the override."""
+    return os.environ.get("PENNY_TRANSFORMERS_SPEC", "transformers==4.53.3").strip()
+
+
 def _load_sandbox_state() -> dict[str, Any]:
     if not SANDBOX_STATE.exists():
         return {}
@@ -128,6 +136,8 @@ def _serve_script(model: str) -> str:
         # Pin vLLM to a torch+cu124 build so it matches the box's CUDA 12.4 driver. The latest
         # vLLM bundles a torch built for CUDA 12.8+, which this driver is too old to run.
         f"/opt/penny/venv/bin/pip install {_vllm_spec()} huggingface_hub",
+        # Bump transformers past vLLM's old pin so newer model tokenizers load.
+        (f"/opt/penny/venv/bin/pip install {_transformers_spec()}" if _transformers_spec() else "true"),
         "cat >/etc/systemd/system/penny-vllm.service <<EOF",
         "[Unit]",
         "Description=Penny sandbox vLLM (heretic gemma-3)",
@@ -370,7 +380,9 @@ def sandbox_test(
     feed.emit("attack", f"[sandbox] box {box.id} provisioning from snapshot (auto-destroys in 30m)...")
     findings: list[Finding] = []
     try:
-        ip = vultr.wait_for_ip(box)
+        # Restoring a snapshot (tens of GB) is much slower than a fresh OS install, so allow
+        # well past the 180s default before giving up, and stream the boot status.
+        ip = vultr.wait_for_ip(box, timeout=900, feed=feed)
         feed.emit("attack", f"[sandbox] box up at {ip}; waiting for SSH...")
         if not vultr.wait_for_ssh(ip):
             feed.emit("attack", "[sandbox] SSH never came up; destroying box")
