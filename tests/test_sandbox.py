@@ -3,9 +3,25 @@ from __future__ import annotations
 import pytest
 
 from penny import guardrails, sandbox
+from penny import sandbox_agent as agent
 from penny.feed import EventFeed
 from penny.sandbox_agent import GateError, RemoteGate
 from penny.vultr import Box
+
+
+class _FakeGate:
+    """Stand-in for RemoteGate: returns a catch-all page for unknown paths, JSON for `real_paths`."""
+
+    def __init__(self, real_paths=()):
+        self.base_url = "http://target"
+        self.request_count = 0
+        self._real = set(real_paths)
+
+    def execute(self, method, path, headers, body, *, timeout=12.0):
+        self.request_count += 1
+        if path in self._real:
+            return {"status": 200, "body": '{"id": 1, "amount": 99}', "content_type": "application/json"}
+        return {"status": 200, "body": "<html>generic catch-all page</html>", "content_type": "text/html"}
 
 
 def _feed() -> EventFeed:
@@ -207,3 +223,111 @@ def test_sandbox_test_destroys_unhealable_reused_box(monkeypatch) -> None:
     findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
     assert findings == []
     assert destroyed == ["box-1"]  # poisoned box torn down despite keep_alive
+
+
+def _wire_for_breach(monkeypatch, ssh_stream) -> None:
+    monkeypatch.setattr(sandbox.vultr, "available", lambda: True)
+    monkeypatch.setattr(sandbox, "_reusable_box", lambda: None)
+    monkeypatch.setattr(sandbox, "snapshot_id", lambda: "snap-x")
+    monkeypatch.setattr(sandbox.vultr, "provision", lambda **kw: _box())
+    monkeypatch.setattr(sandbox.vultr, "wait_for_ip", lambda box, **kw: "1.2.3.4")
+    monkeypatch.setattr(sandbox.vultr, "wait_for_ssh", lambda ip, **kw: True)
+    monkeypatch.setattr(sandbox, "_ensure_model_up", lambda ip, feed, **kw: True)
+    monkeypatch.setattr(sandbox.vultr, "ssh_run", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(sandbox.vultr, "destroy", lambda box_id: None)
+    monkeypatch.setattr(sandbox.vultr, "ssh_stream", ssh_stream)
+
+
+def test_sandbox_test_passes_instructions_to_agent(monkeypatch) -> None:
+    import base64
+
+    captured: dict[str, str] = {}
+
+    def _ssh_stream(ip, cmd, *, timeout=0.0, on_line=None):
+        captured["cmd"] = cmd
+        return 0, ""
+
+    _wire_for_breach(monkeypatch, _ssh_stream)
+    sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(),
+                         instructions="focus on SQLi in /search")
+    assert "--instructions-b64" in captured["cmd"]
+    b64 = captured["cmd"].split("--instructions-b64", 1)[1].split()[0]
+    assert "focus on SQLi in /search" in base64.b64decode(b64).decode("utf-8")
+
+
+def test_sandbox_test_parallel_workers_dedup(monkeypatch) -> None:
+    calls: list[str] = []
+    dup = ('{"finding": {"title": "IDOR", "severity": "High", "owasp": ["A01"], "path": "/api/orders/1",'
+           ' "snippet": "s", "impact": "i", "remediation": "r", "evidence": {}}}')
+
+    def _ssh_stream(ip, cmd, *, timeout=0.0, on_line=None):
+        calls.append(cmd)
+        if on_line is not None:
+            on_line(dup)  # every worker reports the same finding
+        return 0, dup
+
+    _wire_for_breach(monkeypatch, _ssh_stream)
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), workers=3)
+    assert len(calls) == 3       # one stream per worker
+    assert len(findings) == 1    # identical findings deduped across workers
+
+
+# ---------------------------------------------------------------------------
+# Anti-hallucination: catch-all (SPA) responders must not yield phantom findings
+# ---------------------------------------------------------------------------
+
+def test_matches_baseline_distinguishes_json_from_catch_all() -> None:
+    baseline = [{"status": 200, "ct": "html", "len": 30, "hash": agent._body_hash("<html>x</html>")}]
+    # Identical body -> matches the catch-all.
+    assert agent.matches_baseline({"status": 200, "body": "<html>x</html>", "content_type": "text/html"}, baseline)
+    # A real JSON API response never matches an html baseline.
+    assert not agent.matches_baseline({"status": 200, "body": '{"id":1}', "content_type": "application/json"}, baseline)
+
+
+def test_validate_finding_rejects_on_pure_catch_all() -> None:
+    baseline = [{"status": 200, "ct": "html", "len": 30, "hash": "abc"}]
+    ok, reason = agent._validate_finding("/api/invoices/1", {"/api/invoices/1": False}, baseline)
+    assert not ok and "catch-all" in reason
+
+
+def test_validate_finding_accepts_real_hit() -> None:
+    baseline = [{"status": 200, "ct": "html", "len": 30, "hash": "abc"}]
+    assert agent._validate_finding("/api/invoices/1", {"/api/invoices/1": True}, baseline)[0]
+    # an id-style finding is backed by a real sibling probe
+    assert agent._validate_finding("/api/invoices/{id}", {"/api/invoices/7": True}, baseline)[0]
+
+
+def _run_agent(monkeypatch, gate, replies):
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    it = iter(replies)
+    monkeypatch.setattr(agent, "ask_model", lambda *a, **k: next(it))
+    count = agent.run_loop(gate, "ep", "m", max_turns=6)
+    return count, emitted
+
+
+def test_run_loop_rejects_phantom_finding_on_catch_all(monkeypatch) -> None:
+    # Every path returns the catch-all page, so the IDOR "finding" is a hallucination.
+    replies = [
+        '{"action":"request","method":"GET","path":"/api/invoices/1","reason":"idor"}',
+        '{"action":"finding","title":"IDOR","severity":"High","owasp":["A01"],"path":"/api/invoices/1",'
+        '"snippet":"s","impact":"i","remediation":"r","evidence":{}}',
+        '{"action":"finish","summary":"done"}',
+    ]
+    count, emitted = _run_agent(monkeypatch, _FakeGate(), replies)
+    assert count == 0
+    assert any(e.get("event") == "finding_rejected" for e in emitted)
+    assert not any("finding" in e and "event" not in e for e in emitted)  # no finding emitted
+
+
+def test_run_loop_accepts_finding_on_real_json_endpoint(monkeypatch) -> None:
+    # /api/invoices/1 returns JSON (differs from the html catch-all) -> a real, accepted finding.
+    replies = [
+        '{"action":"request","method":"GET","path":"/api/invoices/1","reason":"idor"}',
+        '{"action":"finding","title":"IDOR","severity":"High","owasp":["A01"],"path":"/api/invoices/1",'
+        '"snippet":"s","impact":"i","remediation":"r","evidence":{}}',
+        '{"action":"finish","summary":"done"}',
+    ]
+    count, emitted = _run_agent(monkeypatch, _FakeGate(real_paths={"/api/invoices/1"}), replies)
+    assert count == 1
+    assert any("finding" in e and "event" not in e for e in emitted)

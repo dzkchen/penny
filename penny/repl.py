@@ -39,7 +39,7 @@ HELP = """\
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
 /cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
 /sandbox-bake                     one-time: build the heretic/gemma-3 GPU snapshot (~$0.70)
-/sandbox-test [target]            ephemeral GPU box runs heretic/gemma-3 active breach, then self-destructs (TXT proof required)
+/sandbox-test [target] [--workers N] [--focus <text>]   ephemeral GPU box runs heretic/gemma-3 active breach (steer with --focus; parallel with --workers), then self-destructs
 /boxes                            list active cloud boxes + auto-destroy timers
 /kill                             stop running cloud attacks (keep boxes)
 /destroy                          destroy all cloud boxes now
@@ -637,16 +637,38 @@ class Session:
     def _sandbox_test(self, args: list[str]) -> None:
         from .sandbox import sandbox_test
 
-        target = next((a for a in args if not a.startswith("-")), None) or self.target
+        keep_alive = "--keep-alive" in args
+        allow_destructive = "--allow-destructive" in args
+        # Drop boolean flags, then pull --workers N, then treat everything after --focus/
+        # --instructions as the free-text focus (so the user needn't quote it).
+        toks = [a for a in args if a not in ("--keep-alive", "--allow-destructive")]
+        workers = 1
+        if "--workers" in toks:
+            i = toks.index("--workers")
+            try:
+                workers = max(1, int(toks[i + 1]))
+            except (IndexError, ValueError):
+                self._warn("--workers needs a number, e.g. --workers 4")
+                return
+            del toks[i:i + 2]
+        instructions = ""
+        for flag in ("--focus", "--instructions"):
+            if flag in toks:
+                i = toks.index(flag)
+                instructions = " ".join(toks[i + 1:]).strip()
+                toks = toks[:i]
+                break
+        target = next((a for a in toks if not a.startswith("-")), None) or self.target
         if not target:
-            self._warn("No target set. Use /target <url> first, or /sandbox-test <url>.")
+            self._warn("No target set. Use /target <url> first, or /sandbox-test <url> [--workers N] [--focus <text>].")
             return
         feed = PrettyFeed(self.printer)
         findings = sandbox_test(
             target,
             i_own_this=self.i_own_this, feed=feed,
-            keep_alive="--keep-alive" in args,
-            allow_destructive="--allow-destructive" in args,
+            keep_alive=keep_alive,
+            allow_destructive=allow_destructive,
+            instructions=instructions, workers=workers,
         )
         if findings:
             self._persist_findings(findings, target, source="sandbox-test")

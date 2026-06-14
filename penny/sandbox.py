@@ -467,10 +467,17 @@ def sandbox_test(
     keep_alive: bool = False,
     auto_confirm: bool = False,
     allow_destructive: bool = False,
+    instructions: str = "",
+    workers: int = 1,
     max_requests: int = 60,
     max_turns: int = 24,
 ) -> list[Finding]:
-    """Spin an ephemeral heretic/gemma-3 GPU box, actively breach `target`, then destroy it."""
+    """Spin an ephemeral heretic/gemma-3 GPU box, actively breach `target`, then destroy it.
+
+    ``instructions`` is free-text operator focus appended to the agent's system prompt (steer
+    WHAT it tests). ``workers`` runs that many agent processes against the box concurrently —
+    when no instructions are given they fan out across distinct focus areas for wider coverage.
+    """
     if not vultr.available():
         feed.emit("attack", "VULTR_API_KEY not set in .env — cannot use the sandbox tier")
         return []
@@ -539,23 +546,17 @@ def sandbox_test(
             vultr.destroy(box.id)
             box_destroyed = True
             return []
-        feed.emit("attack", f"[sandbox] model ready; launching active breach against {target} (live)")
-        cmd = (
-            f"echo {_b64(_agent_source())} | base64 -d > /tmp/penny_agent.py && "
-            f"python3 -u /tmp/penny_agent.py {shlex.quote(target)} "
-            f"--max-requests {int(max_requests)} --max-turns {int(max_turns)}"
-            + (" --allow-destructive" if allow_destructive else "")
+        n = max(1, int(workers))
+        feed.emit("attack", f"[sandbox] model ready; launching active breach against {target} "
+                            f"({n} worker{'s' if n > 1 else ''}, live)")
+        # Push the agent once; every worker runs the same /tmp copy.
+        vultr.ssh_run(ip, f"echo {_b64(_agent_source())} | base64 -d > /tmp/penny_agent.py", timeout=60)
+        found = _run_breach(
+            ip, target, feed,
+            workers=n, instructions=instructions,
+            allow_destructive=allow_destructive, max_requests=max_requests, max_turns=max_turns,
         )
-        # A thinking model on the A16 can take ~30-90s/turn; budget generously so the stream
-        # isn't killed mid-attack (it's also bounded by the box's auto-destroy).
-        attack_timeout = max_turns * 120 + 600
-
-        def _on_line(line: str) -> None:
-            finding = _handle_agent_line(line, target, feed)
-            if finding is not None:
-                findings.append(finding)
-
-        vultr.ssh_stream(ip, cmd, timeout=attack_timeout, on_line=_on_line)
+        findings.extend(found)
         feed.emit("attack", f"[sandbox] breach complete: {len(findings)} finding(s)")
     except Exception as exc:  # noqa: BLE001
         feed.emit("attack", f"[sandbox] error: {exc}")
@@ -585,8 +586,24 @@ def _reusable_box():
     return None
 
 
-def _handle_agent_line(line: str, target: str, feed: EventFeed) -> Finding | None:
-    """Process one JSONL line from the remote agent: emit live progress, return a Finding if any."""
+# Distinct focus areas the parallel workers fan out across when no operator --instructions are
+# given, so N workers cover different ground instead of duplicating each other.
+DEFAULT_FOCUSES = [
+    "broken access control: IDOR/BOLA via object-id substitution and x-user-id / cookie tampering",
+    "injection: SQLi, NoSQLi, command and template injection in query params and JSON bodies",
+    "authentication & authorization bypass: JWT tampering, missing authz, privilege escalation",
+    "SSRF, open redirect, and exposed admin/debug/actuator/.git/backup endpoints",
+    "mass assignment & business-logic abuse (price/quantity/role fields) via POST/PUT/PATCH",
+    "sensitive data exposure & security misconfiguration (stack traces, verbose errors, CORS)",
+]
+
+
+def _handle_agent_line(line: str, target: str, feed: EventFeed, *, prefix: str = "") -> Finding | None:
+    """Process one JSONL line from the remote agent: emit live progress, return a Finding if any.
+
+    ``prefix`` labels the line with its worker id (e.g. ``w2``) when running in parallel.
+    """
+    tag = f"[sandbox{('/' + prefix) if prefix else ''}]"
     line = line.strip()
     if not line.startswith("{"):
         return None
@@ -595,20 +612,99 @@ def _handle_agent_line(line: str, target: str, feed: EventFeed) -> Finding | Non
     except json.JSONDecodeError:
         return None
     if "finding" in obj and isinstance(obj["finding"], dict):
-        feed.emit("attack", f"[sandbox] FINDING: {redact_text(obj['finding'].get('title', ''))}")
+        feed.emit("attack", f"{tag} FINDING: {redact_text(obj['finding'].get('title', ''))}")
         return _finding_from_jsonl(obj["finding"], target)
     event = obj.get("event")
-    if event == "request":
-        feed.emit("attack", f"[sandbox] {obj.get('method', '')} {obj.get('path', '')} — {redact_text(obj.get('reason', ''))}")
+    if event == "baseline":
+        feed.emit("attack", f"{tag} catch-all baseline: HTTP {obj.get('status')} {obj.get('content_type')} "
+                            f"~{obj.get('bytes')} bytes (a matching 200 is NOT a real endpoint)")
+    elif event == "request":
+        feed.emit("attack", f"{tag} {obj.get('method', '')} {obj.get('path', '')} — {redact_text(obj.get('reason', ''))}")
     elif event == "response":
-        feed.emit("attack", f"[sandbox]   -> {obj.get('status')} ({obj.get('bytes')} bytes)")
+        suffix = " [catch-all]" if obj.get("catch_all") else ""
+        feed.emit("attack", f"{tag}   -> {obj.get('status')} ({obj.get('bytes')} bytes){suffix}")
+    elif event == "finding_rejected":
+        feed.emit("gate", f"{tag} finding rejected ({obj.get('path', '')}): {redact_text(obj.get('reason', ''))}")
     elif event == "blocked":
-        feed.emit("gate", f"[sandbox] blocked: {obj.get('msg', '')}")
+        feed.emit("gate", f"{tag} blocked: {obj.get('msg', '')}")
     elif event == "finish":
-        feed.emit("attack", f"[sandbox] agent concluded: {redact_text(obj.get('msg', ''))}")
+        feed.emit("attack", f"{tag} agent concluded: {redact_text(obj.get('msg', ''))}")
     elif event in ("model_error", "request_error", "no_action", "fatal"):
-        feed.emit("attack", f"[sandbox] {event}: {redact_text(str(obj.get('msg', '')))}")
+        feed.emit("attack", f"{tag} {event}: {redact_text(str(obj.get('msg', '')))}")
     return None
+
+
+def _worker_cmd(target: str, focus: str, *, allow_destructive: bool, max_requests: int, max_turns: int) -> str:
+    cmd = (f"python3 -u /tmp/penny_agent.py {shlex.quote(target)} "
+           f"--max-requests {int(max_requests)} --max-turns {int(max_turns)}")
+    if allow_destructive:
+        cmd += " --allow-destructive"
+    if focus:
+        cmd += f" --instructions-b64 {_b64(focus)}"
+    return cmd
+
+
+def _run_breach(
+    ip: str,
+    target: str,
+    feed: EventFeed,
+    *,
+    workers: int,
+    instructions: str,
+    allow_destructive: bool,
+    max_requests: int,
+    max_turns: int,
+) -> list[Finding]:
+    """Run one or more agent workers against the box, streaming + de-duplicating findings.
+
+    Workers run concurrently (vLLM batches their requests); each is an independent agent with its
+    own gate + transcript. Findings are de-duplicated across workers by (title, location).
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    attack_timeout = max_turns * 120 + 600
+    findings: list[Finding] = []
+    seen: set[tuple[str, str]] = set()
+    lock = threading.Lock()
+
+    def collect(line: str, label: str) -> None:
+        finding = _handle_agent_line(line, target, feed, prefix=label)
+        if finding is None:
+            return
+        key = (finding.title, finding.location.file)
+        with lock:
+            if key in seen:
+                return
+            seen.add(key)
+            findings.append(finding)
+
+    if workers <= 1:
+        vultr.ssh_stream(
+            ip, _worker_cmd(target, instructions, allow_destructive=allow_destructive,
+                            max_requests=max_requests, max_turns=max_turns),
+            timeout=attack_timeout, on_line=lambda l: collect(l, ""),
+        )
+        return findings
+
+    def run_one(i: int) -> None:
+        if instructions:
+            focus = (instructions + f"\n(You are worker {i + 1} of {workers}; pursue different "
+                     "endpoints and payload variants than the other workers to avoid duplicate work.)")
+        else:
+            focus = DEFAULT_FOCUSES[i % len(DEFAULT_FOCUSES)]
+        label = f"w{i + 1}"
+        feed.emit("attack", f"[sandbox/{label}] focus: {redact_text(focus.splitlines()[0][:90])}")
+        cmd = _worker_cmd(target, focus, allow_destructive=allow_destructive,
+                          max_requests=max_requests, max_turns=max_turns)
+        try:
+            vultr.ssh_stream(ip, cmd, timeout=attack_timeout, on_line=lambda l, lab=label: collect(l, lab))
+        except Exception as error:  # noqa: BLE001
+            feed.emit("attack", f"[sandbox/{label}] error: {error}")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(run_one, range(workers)))
+    return findings
 
 
 def _parse_agent_output(out: str, target: str, feed: EventFeed) -> list[Finding]:
