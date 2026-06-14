@@ -85,6 +85,64 @@ def _run_scan_command(
     return result, feed
 
 
+def _sandbox_test_command(
+    target: str,
+    *,
+    out: Path,
+    i_own_this: bool,
+    allow_destructive: bool,
+    keep_alive: bool,
+    auto_confirm: bool,
+) -> None:
+    """Run the ephemeral heretic/gemma-3 active-breach sandbox and persist findings."""
+    from .models import assign_finding_ids, now_session_id
+    from .sandbox import sandbox_test
+
+    feed = EventFeed()
+    findings = sandbox_test(
+        target,
+        i_own_this=i_own_this, feed=feed,
+        keep_alive=keep_alive, allow_destructive=allow_destructive, auto_confirm=auto_confirm,
+    )
+    if not findings:
+        feed.emit("report", "Sandbox breach produced no findings.")
+        return
+    ordered = assign_finding_ids(findings)
+    payload, run_path = FindingsStore(out).write_findings(
+        now_session_id(), ordered, scan={"source": "sandbox-test", "target": target},
+    )
+    feed.emit("report", f"Wrote {len(ordered)} finding(s) to {run_path}. Run `penny report` to write report.md.")
+
+
+def _sandbox_test_command(
+    target: str,
+    *,
+    out: Path,
+    i_own_this: bool,
+    allow_destructive: bool,
+    keep_alive: bool,
+    auto_confirm: bool,
+) -> None:
+    """Run the ephemeral heretic/gemma-3 active-breach sandbox and persist findings."""
+    from .models import assign_finding_ids, now_session_id
+    from .sandbox import sandbox_test
+
+    feed = EventFeed()
+    findings = sandbox_test(
+        target,
+        i_own_this=i_own_this, feed=feed,
+        keep_alive=keep_alive, allow_destructive=allow_destructive, auto_confirm=auto_confirm,
+    )
+    if not findings:
+        feed.emit("report", "Sandbox breach produced no findings.")
+        return
+    ordered = assign_finding_ids(findings)
+    payload, run_path = FindingsStore(out).write_findings(
+        now_session_id(), ordered, scan={"source": "sandbox-test", "target": target},
+    )
+    feed.emit("report", f"Wrote {len(ordered)} finding(s) to {run_path}. Run `penny report` to write report.md.")
+
+
 def _report_command(
     findings: Path,
     out_dir: Path,
@@ -230,6 +288,8 @@ def _build_typer_app():
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
         verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
+        sandbox_test: bool = typer.Option(False, "--sandbox-test", help="After the scan, spin an ephemeral Vultr GPU box that serves a heretic-decensored gemma-3 and runs ACTIVE breach attempts against the target, then self-destructs. Requires --i-own-this plus a matching DNS TXT proof record (strict; never bypassed). Run `penny sandbox-bake` once first."),
+        allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit the sandbox to issue DELETE (off by default; the one destructive-verb floor)."),
     ) -> None:
         try:
             _run_scan_command(
@@ -256,6 +316,13 @@ def _build_typer_app():
             )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
+        if sandbox_test:
+            if not target:
+                _fail("--sandbox-test requires --target <url>")
+            _sandbox_test_command(
+                target, out=out, i_own_this=i_own_this,
+                allow_destructive=allow_destructive, keep_alive=False, auto_confirm=False,
+            )
 
     @app.command()
     def report(
@@ -264,6 +331,33 @@ def _build_typer_app():
         ai: bool = typer.Option(False, "--ai", help="Write the purple-team verdict with the Claude model instead of the deterministic one-liner (sends redacted findings to the API)."),
     ) -> None:
         _report_command(_resolve_findings_path(findings, out), out, EventFeed(), use_llm=ai)
+
+    @app.command("sandbox-bake")
+    def sandbox_bake_cmd(
+        out: Path = typer.Option(Path("."), "--out"),
+        yes: bool = typer.Option(False, "--yes", help="Skip the cost-confirm prompt."),
+    ) -> None:
+        """One-time: build the heretic/gemma-3 GPU snapshot used by `sandbox-test` (~$0.70)."""
+        from .sandbox import sandbox_bake
+
+        snap = sandbox_bake(feed=EventFeed(), auto_confirm=yes)
+        if not snap:
+            _fail("sandbox bake did not produce a snapshot (see output above)")
+
+    @app.command("sandbox-test")
+    def sandbox_test_cmd(
+        target: str = typer.Option(..., "--target", help="Target root URL (must have a matching DNS TXT proof record)."),
+        out: Path = typer.Option(Path("."), "--out"),
+        i_own_this: bool = typer.Option(False, "--i-own-this"),
+        allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit DELETE (off by default)."),
+        keep_alive: bool = typer.Option(False, "--keep-alive", help="Keep the box after the run (still auto-destroys in 30m)."),
+        yes: bool = typer.Option(False, "--yes", help="Skip the cost-confirm prompt."),
+    ) -> None:
+        """Ephemeral GPU box runs a heretic/gemma-3 ACTIVE breach against an owned target, then self-destructs."""
+        _sandbox_test_command(
+            target, out=out, i_own_this=i_own_this,
+            allow_destructive=allow_destructive, keep_alive=keep_alive, auto_confirm=yes,
+        )
 
     @app.command()
     def ask(
