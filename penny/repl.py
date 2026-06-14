@@ -21,7 +21,7 @@ from .live import LiveScanFeed, print_scan_summary, render_scan_summary
 from .reporting import generate_report, load_findings
 from .scanner import run_scan
 from .sources import resolved_scan_source
-from .repl_input import autocomplete_enabled, read_line
+from .repl_input import autocomplete_enabled, clear_screen, read_line
 from .store import FindingsStore, copy_report_to_findings_dir
 
 SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
@@ -40,7 +40,7 @@ HELP = """\
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
 /cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
 /sandbox-bake                     one-time: build the heretic/gemma-3 GPU snapshot (~$0.70)
-/sandbox-test [target] [--workers N] [--focus <text>]   ephemeral GPU box runs heretic/gemma-3 active breach (steer with --focus; parallel with --workers), then self-destructs
+/sandbox-test [target] [--workers N] [--timing N] [--focus <text>]   ephemeral GPU box runs heretic/gemma-3 active breach (steer with --focus; parallel with --workers; --timing N = run the model N minutes), then self-destructs
 /boxes                            list active cloud boxes + auto-destroy timers
 /kill                             stop running cloud attacks (keep boxes)
 /destroy                          destroy all cloud boxes now
@@ -313,7 +313,7 @@ class Session:
         if cmd in ("help", "h", "?"):
             self._help()
         elif cmd == "clear":
-            self.out("\x1b[2J\x1b[H")
+            clear_screen()
         elif cmd in ("audit", "full"):
             self._audit(args)
         elif cmd == "scan":
@@ -662,15 +662,35 @@ class Session:
         # Drop boolean flags, then pull --workers N, then treat everything after --focus/
         # --instructions as the free-text focus (so the user needn't quote it).
         toks = [a for a in args if a not in ("--keep-alive", "--allow-destructive")]
-        workers = 1
-        if "--workers" in toks:
-            i = toks.index("--workers")
-            try:
-                workers = max(1, int(toks[i + 1]))
-            except (IndexError, ValueError):
-                self._warn("--workers needs a number, e.g. --workers 4")
-                return
-            del toks[i:i + 2]
+
+        def _take_number(flag: str, default: float) -> float | None:
+            # Supports "--flag 5" and the glued "--flag-5" form.
+            nonlocal toks
+            if flag in toks:
+                i = toks.index(flag)
+                try:
+                    val = float(toks[i + 1])
+                except (IndexError, ValueError):
+                    self._warn(f"{flag} needs a number, e.g. {flag} 5")
+                    return None
+                del toks[i:i + 2]
+                return val
+            for t in list(toks):  # glued form: --workers-3 / --timing-5
+                if t.startswith(flag + "-"):
+                    try:
+                        val = float(t[len(flag) + 1:])
+                    except ValueError:
+                        continue
+                    toks.remove(t)
+                    return val
+            return default
+
+        workers = _take_number("--workers", 1)
+        if workers is None:
+            return
+        timing_minutes = _take_number("--timing", 0.0)
+        if timing_minutes is None:
+            return
         instructions = ""
         for flag in ("--focus", "--instructions"):
             if flag in toks:
@@ -680,7 +700,7 @@ class Session:
                 break
         target = next((a for a in toks if not a.startswith("-")), None) or self.target
         if not target:
-            self._warn("No target set. Use /target <url> first, or /sandbox-test <url> [--workers N] [--focus <text>].")
+            self._warn("No target set. Use /target <url> first, or /sandbox-test <url> [--workers N] [--timing N] [--focus <text>].")
             return
         feed = PrettyFeed(self.printer)
         findings = sandbox_test(
@@ -688,13 +708,15 @@ class Session:
             i_own_this=self.i_own_this, feed=feed,
             keep_alive=keep_alive,
             allow_destructive=allow_destructive,
-            instructions=instructions, workers=workers,
+            instructions=instructions, workers=max(1, int(workers)), timing_minutes=timing_minutes,
         )
+        # Always persist + write a report, even with 0 findings, so the run leaves an artifact.
+        self._persist_findings(findings, target, source="sandbox-test")
+        color = "bright_green" if findings else "yellow"
+        self.out(ui.style(f"Sandbox breach produced {len(findings)} finding(s).", color))
+        self._report([])
         if findings:
-            self._persist_findings(findings, target, source="sandbox-test")
-            self.out(ui.style(f"Sandbox breach produced {len(findings)} finding(s). /findings to view, /report to write.", "bright_green"))
-        else:
-            self.out(ui.dim("No findings from the sandbox breach."))
+            self.out(ui.dim("/findings to view, /show <id> for detail."))
 
     def _persist_findings(self, findings: list, target: str, *, source: str) -> None:
         """Write attack-tier findings into the run store so /findings, /show, /report work."""

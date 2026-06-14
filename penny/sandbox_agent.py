@@ -29,11 +29,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 MODEL_ENDPOINT_DEFAULT = "http://127.0.0.1:8000/v1/chat/completions"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"}
@@ -92,14 +93,23 @@ class RemoteGate:
         self.max_requests = max_requests
         self.min_interval_seconds = min_interval_seconds
         self.allow_destructive = allow_destructive
+        # Backend hosts (Firebase/Supabase/etc.) discovered in the TARGET'S OWN client bundle are
+        # in-scope — they're the app's own backend. Only recon (not the model) may add to this, so
+        # the anti-pivot guarantee holds: the model still can't reach a host the app doesn't use.
+        self.extra_hosts: set = set()
         self.request_count = 0
         self._last_request = 0.0
+
+    def allow_backend_host(self, host: str) -> None:
+        if host:
+            self.extra_hosts.add(host.lower())
 
     def build_url(self, path: str) -> str:
         candidate = urljoin(f"{self.base_url}/", str(path).lstrip("/"))
         parsed = urlparse(candidate)
-        # Host-pin: the uncensored model cannot redirect firepower off the approved host.
-        if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() != self.host:
+        host = (parsed.hostname or "").lower()
+        # Host-pin: stay on the approved host OR a backend host found in the app's own bundle.
+        if parsed.scheme not in {"http", "https"} or (host != self.host and host not in self.extra_hosts):
             raise GateError("request left the approved target host (host-pin)")
         return candidate
 
@@ -113,19 +123,21 @@ class RemoteGate:
             raise GateError(f"unknown method: {m}")
         return m
 
-    def _pace(self) -> None:
+    def _pace(self, *, pace: bool = True) -> None:
         if self.request_count >= self.max_requests:
             raise GateError("request cap reached")
-        elapsed = time.monotonic() - self._last_request
-        if self._last_request and elapsed < self.min_interval_seconds:
-            time.sleep(self.min_interval_seconds - elapsed)
+        if pace:  # the rate-limit probe sends a deliberate (still cap-bounded) burst with pace=False
+            elapsed = time.monotonic() - self._last_request
+            if self._last_request and elapsed < self.min_interval_seconds:
+                time.sleep(self.min_interval_seconds - elapsed)
         self._last_request = time.monotonic()
         self.request_count += 1
 
-    def execute(self, method: str, path: str, headers, body, *, timeout: float = 12.0) -> dict:
+    def execute(self, method: str, path: str, headers, body, *, timeout: float = 12.0, pace: bool = True,
+                max_bytes: int = 4096) -> dict:
         m = self.check_method(method)
         url = self.build_url(path)
-        self._pace()
+        self._pace(pace=pace)
         data = None
         send_headers = {str(k): str(v) for k, v in (headers or {}).items()}
         if body is not None and m in {"POST", "PUT", "PATCH"}:
@@ -135,13 +147,15 @@ class RemoteGate:
             else:
                 data = str(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=m, headers=send_headers)
+        # max_bytes is large for recon (JS bundles are 100s of KB and hold the Firebase config /
+        # endpoint strings) and small (4 KB) for ordinary probes where a sample is enough.
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read(4096)
+                raw = response.read(max_bytes)
                 return {"status": int(response.status), "body": raw.decode("utf-8", "replace"),
                         "content_type": response.headers.get("content-type", "")}
         except urllib.error.HTTPError as error:
-            raw = error.read(4096)
+            raw = error.read(max_bytes)
             return {"status": int(error.code), "body": raw.decode("utf-8", "replace"),
                     "content_type": error.headers.get("content-type", "") if error.headers else ""}
 
@@ -270,10 +284,364 @@ def matches_baseline(result: dict, baseline: list) -> bool:
     return False
 
 
-def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24, system: str = SYSTEM_PROMPT) -> int:
-    """Drive the model→gate→execute loop. Returns the number of findings emitted."""
+# ---------------------------------------------------------------------------
+# Client-side recon: read the SPA/JS bundle to find real endpoints + backend config,
+# then deterministically probe the backend (Firebase RTDB / Supabase) for open rules.
+# This is what catches the "no Firebase rules" class of bug — blind HTTP path-guessing
+# against a catch-all SPA never will, because the data lives in a backend on another host
+# that the app's own bundle reveals.
+# ---------------------------------------------------------------------------
+
+_SCRIPT_SRC_RE = re.compile(r'<(?:script|link)[^>]+(?:src|href)=["\']([^"\']+\.js[^"\']*)["\']', re.I)
+_RTDB_URL_RE = re.compile(r'https://[A-Za-z0-9.\-]+\.(?:firebaseio\.com|firebasedatabase\.app)', re.I)
+_PROJECT_ID_RE = re.compile(r'projectId["\']?\s*[:=]\s*["\']([A-Za-z0-9\-]+)["\']')
+_SUPABASE_URL_RE = re.compile(r'https://[a-z0-9]{16,30}\.supabase\.co', re.I)
+_JWT_RE = re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}')
+_ENDPOINT_RE = re.compile(
+    r'["\'`](/(?:api|v1|v2|rest|graphql|auth|account|admin|users?|orders?|payments?|invoices?|'
+    r'transactions?|profiles?|cart|checkout|products?|items?|messages?|posts?)[A-Za-z0-9_\-/]*)["\'`]')
+_SB_TABLES = ["users", "profiles", "accounts", "orders", "payments", "invoices",
+              "transactions", "messages", "posts", "cart", "items", "products"]
+
+
+def _safe_exec(gate: RemoteGate, method: str, path: str, headers=None, body=None, *, pace: bool = True, max_bytes: int = 4096):
+    try:
+        return gate.execute(method, path, headers or {}, body, pace=pace, max_bytes=max_bytes)
+    except TypeError:
+        # Tolerate gates/fakes whose execute() predates the max_bytes/pace kwargs.
+        try:
+            return gate.execute(method, path, headers or {}, body)
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception:  # noqa: BLE001 - blocked/errored probes are just skipped during recon
+        return None
+
+
+# SQL-error signatures (error-based injection) — case-insensitive substring match on the body.
+_SQL_ERROR_SIGNS = [
+    "sql syntax", "syntax error at or near", "unterminated quoted string", "unclosed quotation mark",
+    "quoted string not properly terminated", "you have an error in your sql", "sqlite", "psql:",
+    "pg::", "ora-0", "mysql", "mariadb", "odbc", "sqlstate",
+]
+_SQLI_PAYLOADS = ["'", "''", "' OR '1'='1", "1 OR 1=1", "%27", "\"", "');--"]
+
+
+def _live_endpoints(gate: RemoteGate, info: dict, baseline: list, limit: int = 6) -> list:
+    """Endpoints from recon that return a NON-catch-all response (i.e. real, worth attacking)."""
+    live = []
+    for ep in sorted(info["endpoints"]):
+        if len(live) >= limit:
+            break
+        r = _safe_exec(gate, "GET", ep)
+        if r and not matches_baseline(r, baseline):
+            live.append(ep)
+    return live
+
+
+def recon(gate: RemoteGate) -> dict:
+    """Fetch the page + same-host JS bundles and extract endpoints + backend (Firebase/Supabase) config."""
+    info = {"endpoints": set(), "rtdb": set(), "project_ids": set(),
+            "supabase_urls": set(), "supabase_keys": set()}
+    texts: list = []
+    big = 3_000_000  # read full HTML/JS (bundles are 100s of KB); the Firebase config lives deep in them
+    root = _safe_exec(gate, "GET", "/", max_bytes=big)
+    if root:
+        texts.append(root["body"])
+    bundles: list = []
+    for body in list(texts):
+        bundles.extend(_SCRIPT_SRC_RE.findall(body))
+    for src in dict.fromkeys(bundles):  # de-dupe, keep order
+        if len(texts) > 12:
+            break
+        r = _safe_exec(gate, "GET", src, max_bytes=big)  # off-host CDN bundles are host-pinned out (skipped)
+        if r and r["body"]:
+            texts.append(r["body"])
+    blob = "\n".join(texts)
+    for m in _RTDB_URL_RE.findall(blob):
+        info["rtdb"].add(m.rstrip("/"))
+    for m in _PROJECT_ID_RE.findall(blob):
+        info["project_ids"].add(m)
+        info["rtdb"].add(f"https://{m}-default-rtdb.firebaseio.com")
+        info["rtdb"].add(f"https://{m}.firebaseio.com")
+    for m in _SUPABASE_URL_RE.findall(blob):
+        info["supabase_urls"].add(m.rstrip("/"))
+    for m in _JWT_RE.findall(blob):
+        info["supabase_keys"].add(m)
+    for m in _ENDPOINT_RE.findall(blob):
+        info["endpoints"].add(m)
+    emit({"event": "recon", "endpoints": sorted(info["endpoints"])[:30], "rtdb": sorted(info["rtdb"]),
+          "supabase": sorted(info["supabase_urls"]), "project_ids": sorted(info["project_ids"])})
+    return info
+
+
+def probe_firebase(gate: RemoteGate, info: dict) -> int:
+    """Check discovered Firebase RTDB URLs for open (no-auth) read rules. Returns findings emitted."""
+    found = 0
+    for db in sorted(info["rtdb"]):
+        host = urlparse(db).hostname
+        gate.allow_backend_host(host)
+        # `?shallow=true` returns only top-level keys (cheap) and still proves readability.
+        for path in ("/.json?shallow=true", "/.json"):
+            r = _safe_exec(gate, "GET", db + path)
+            if not r:
+                continue
+            body = (r["body"] or "").strip()
+            if r["status"] == 200 and "permission denied" not in body.lower():
+                has_data = body not in ("", "null")
+                emit({"finding": {
+                    "title": "Firebase Realtime Database readable without authentication (open rules)",
+                    "severity": "Critical" if has_data else "High",
+                    "confidence": "high",
+                    "owasp": ["A01:2021-Broken Access Control", "A05:2021-Security Misconfiguration"],
+                    "location_file": db + "/.json",
+                    "snippet": ("root returned data with no auth" if has_data else "root readable with no auth (currently empty)"),
+                    "impact": "Anyone can read the database over REST with no credentials — full data exposure.",
+                    "remediation": "Set RTDB security rules to require auth (never .read:true at root); scope reads by uid.",
+                    "evidence": {"status": 200, "probe": db + path, "has_data": has_data, "sample": body[:300]},
+                }})
+                found += 1
+                break
+    # Firestore (the other Firebase database): list documents in common collections over REST.
+    # Open rules return them with no auth (200 + "documents"); locked rules return 403.
+    fs_collections = [
+        # app-specific collections (demo target)
+        "sac_authorized_users", "users", "transactions", "products", "booths", "booth_requests",
+        # common defaults
+        "orders", "payments", "invoices", "profiles", "accounts", "messages", "posts", "carts", "items",
+    ]
+    # Also try collection names derived from endpoint path segments found in the JS bundle, so this
+    # adapts to any app, not just the seeded names.
+    for ep in info.get("endpoints", ()):
+        for seg in ep.strip("/").split("/"):
+            seg = seg.split("?")[0]
+            if re.match(r"^[A-Za-z][A-Za-z0-9_]*$", seg) and seg not in ("api", "v1", "v2", "rest", "graphql"):
+                fs_collections.append(seg)
+    fs_collections = list(dict.fromkeys(fs_collections))[:30]  # de-dupe, bound the request count
+    for pid in sorted(info["project_ids"]):
+        gate.allow_backend_host("firestore.googleapis.com")
+        base = f"https://firestore.googleapis.com/v1/projects/{pid}/databases/(default)/documents"
+        for col in fs_collections:
+            r = _safe_exec(gate, "GET", f"{base}/{col}?pageSize=2")
+            if not r or r["status"] != 200 or '"documents"' not in r["body"]:
+                continue
+            emit({"finding": {
+                "title": f"Firestore collection '{col}' readable without authentication (open rules)",
+                "severity": "Critical", "confidence": "high",
+                "owasp": ["A01:2021-Broken Access Control", "A05:2021-Security Misconfiguration"],
+                "location_file": f"{base}/{col}",
+                "snippet": f"collection '{col}' returned documents with no auth",
+                "impact": "Anyone can read this collection over the Firestore REST API with no credentials.",
+                "remediation": "Set Firestore security rules to require auth and scope reads by request.auth.uid.",
+                "evidence": {"status": 200, "project_id": pid, "collection": col},
+            }})
+            found += 1
+    return found
+
+
+def probe_supabase(gate: RemoteGate, info: dict) -> int:
+    """Check discovered Supabase projects for tables readable with the public anon key (RLS off)."""
+    found = 0
+    key = next(iter(sorted(info["supabase_keys"], key=len, reverse=True)), "")
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"} if key else {}
+    for url in sorted(info["supabase_urls"]):
+        gate.allow_backend_host(urlparse(url).hostname)
+        for table in _SB_TABLES:
+            r = _safe_exec(gate, "GET", f"{url}/rest/v1/{table}?select=*&limit=2", headers=headers)
+            if not r or r["status"] != 200 or not r["body"].strip().startswith("["):
+                continue
+            try:
+                rows = json.loads(r["body"])
+            except Exception:  # noqa: BLE001
+                rows = []
+            if rows:
+                cols = sorted(rows[0].keys())[:20] if isinstance(rows[0], dict) else []
+                emit({"finding": {
+                    "title": f"Supabase table '{table}' readable without authorization (RLS off)",
+                    "severity": "Critical", "confidence": "high",
+                    "owasp": ["A01:2021-Broken Access Control"],
+                    "location_file": f"{url}/rest/v1/{table}",
+                    "snippet": f"{len(rows)} row(s) returned with the public anon key; columns: {cols}",
+                    "impact": "Rows the app meant to protect are readable by anyone holding the public anon key.",
+                    "remediation": "Enable Row Level Security with owner-scoped policies on every table.",
+                    "evidence": {"status": 200, "columns": cols, "row_sample_count": len(rows)},
+                }})
+                found += 1
+    return found
+
+
+def _recon_note(info: dict) -> str:
+    parts = []
+    if info["endpoints"]:
+        parts.append("Real endpoints found in the site's JS bundle (probe THESE — they are not catch-all): "
+                     + ", ".join(sorted(info["endpoints"])[:30]))
+    if info["rtdb"]:
+        parts.append("Firebase RTDB URL(s) (in scope): " + ", ".join(sorted(info["rtdb"]))
+                     + " — append /<path>.json to read; deeper paths may hold data even if root is locked.")
+    if info["project_ids"]:
+        parts.append("Firestore project(s) (in scope): " + ", ".join(sorted(info["project_ids"]))
+                     + " — GET https://firestore.googleapis.com/v1/projects/<id>/databases/(default)/documents/<collection> "
+                       "to test rules; try collection names from the endpoints above.")
+    if info["supabase_urls"]:
+        parts.append("Supabase URL(s) (in scope): " + ", ".join(sorted(info["supabase_urls"]))
+                     + " — GET /rest/v1/<table>?select=* with the apikey header to test RLS.")
+    return ("\nRECON (from the app's own client bundle):\n- " + "\n- ".join(parts)) if parts else ""
+
+
+def probe_rate_limit(gate: RemoteGate, info: dict, baseline: list) -> int:
+    """Send a bounded, unpaced burst at a live endpoint; flag the absence of rate limiting."""
+    live = _live_endpoints(gate, info, baseline, limit=1)
+    if not live:
+        emit({"event": "probe_skipped", "probe": "rate_limit", "reason": "no live (non-catch-all) endpoint"})
+        return 0
+    ep = live[0]
+    burst = 25
+    statuses = []
+    for _ in range(burst):
+        r = _safe_exec(gate, "GET", ep, pace=False)  # cap still bounds total volume; just no inter-request sleep
+        if not r:
+            break
+        statuses.append(r["status"])
+    throttled = sum(1 for s in statuses if s in (429, 503))
+    emit({"event": "rate_limit", "endpoint": ep, "sent": len(statuses), "throttled": throttled})
+    if len(statuses) >= 10 and throttled == 0:
+        emit({"finding": {
+            "title": "No rate limiting on API endpoint",
+            "severity": "Medium", "confidence": "high",
+            "owasp": ["A04:2021-Insecure Design", "A07:2021-Identification and Authentication Failures"],
+            "location_file": gate.base_url + ep,
+            "snippet": f"{len(statuses)} rapid requests, 0 throttled (no 429/503)",
+            "impact": "No throttling enables credential stuffing, brute force, scraping, and trivial DoS.",
+            "remediation": "Add per-IP/per-account rate limiting (return 429 past a threshold) plus lockout/backoff.",
+            "evidence": {"requests": len(statuses), "throttled": 0, "statuses": statuses[:10]},
+        }})
+        return 1
+    return 0
+
+
+def probe_injection(gate: RemoteGate, info: dict, baseline: list) -> int:
+    """Error-based SQL/NoSQL injection: inject payloads into live endpoints, look for DB errors."""
+    found = 0
+    for ep in _live_endpoints(gate, info, baseline, limit=6):
+        base = _safe_exec(gate, "GET", ep)
+        if not base:
+            continue
+        for payload in _SQLI_PAYLOADS:
+            sep = "&" if "?" in ep else "?"
+            r = _safe_exec(gate, "GET", f"{ep}{sep}id={quote(payload)}")
+            if not r:
+                continue
+            low = r["body"].lower()
+            if any(sig in low for sig in _SQL_ERROR_SIGNS):
+                emit({"finding": {
+                    "title": "SQL injection (error-based) in endpoint parameter",
+                    "severity": "Critical", "confidence": "high",
+                    "owasp": ["A03:2021-Injection"],
+                    "location_file": gate.base_url + ep,
+                    "snippet": f"payload {payload!r} triggered a database error in the response",
+                    "impact": "An attacker can read/modify the database via crafted input — full compromise.",
+                    "remediation": "Use parameterized queries / an ORM; never build SQL from user input.",
+                    "evidence": {"payload": payload, "status": r["status"], "error_excerpt": r["body"][:200]},
+                }})
+                found += 1
+                break
+            if r["status"] >= 500 and base["status"] < 500:
+                emit({"finding": {
+                    "title": "Possible injection — endpoint 500s on a crafted parameter",
+                    "severity": "High", "confidence": "medium",
+                    "owasp": ["A03:2021-Injection"],
+                    "location_file": gate.base_url + ep,
+                    "snippet": f"payload {payload!r} changed status {base['status']} -> {r['status']}",
+                    "impact": "Unhandled input reaches a backend query/parser; likely injectable.",
+                    "remediation": "Validate/parameterize input; handle errors without leaking 500s.",
+                    "evidence": {"payload": payload, "baseline_status": base["status"], "status": r["status"]},
+                }})
+                found += 1
+                break
+    return found
+
+
+def probe_writes(gate: RemoteGate, info: dict, baseline: list, *, allow_destructive: bool) -> int:
+    """POST a marked test record to live endpoints (unauth-write + mass-assignment); DELETE it back
+    only when --allow-destructive. Never mutates pre-existing data by default."""
+    import os
+    found = 0
+    marker = f"penny-sec-test-{os.getpid()}"
+    body = {"penny_security_test": True, "marker": marker, "name": marker,
+            "role": "admin", "isAdmin": True, "is_admin": True, "amount": 0, "price": 0}
+    headers = {"Content-Type": "application/json"}
+    for ep in _live_endpoints(gate, info, baseline, limit=6):
+        r = _safe_exec(gate, "POST", ep, headers=headers, body=body)
+        if not r or matches_baseline(r, baseline) or r["status"] not in (200, 201):
+            continue
+        echoed = [k for k in ("role", "isAdmin", "is_admin") if f'"{k}"' in r["body"]]
+        if echoed:
+            emit({"finding": {
+                "title": "Mass assignment — privileged fields accepted on create",
+                "severity": "Critical", "confidence": "high",
+                "owasp": ["A01:2021-Broken Access Control", "A08:2021-Software and Data Integrity Failures"],
+                "location_file": gate.base_url + ep,
+                "snippet": f"POST accepted and echoed privileged field(s): {echoed}",
+                "impact": "Clients can set protected fields (e.g. role/admin/price) the server should control.",
+                "remediation": "Whitelist writable fields server-side; never bind request bodies straight to models.",
+                "evidence": {"status": r["status"], "echoed_fields": echoed, "marker": marker},
+            }})
+        else:
+            emit({"finding": {
+                "title": "Unauthenticated write accepted (POST creates a record without auth)",
+                "severity": "High", "confidence": "high",
+                "owasp": ["A01:2021-Broken Access Control"],
+                "location_file": gate.base_url + ep,
+                "snippet": f"unauthenticated POST returned {r['status']} (record created)",
+                "impact": "Anyone can create records without authentication.",
+                "remediation": "Require authentication + authorization on all write endpoints.",
+                "evidence": {"status": r["status"], "marker": marker},
+            }})
+        found += 1
+        # Clean up our marked record (and prove DELETE authz) only if the operator opted in.
+        if allow_destructive:
+            created_id = ""
+            try:
+                obj = json.loads(r["body"])
+                created_id = str(obj.get("id") or obj.get("_id") or "")
+            except Exception:  # noqa: BLE001
+                created_id = ""
+            if created_id:
+                d = _safe_exec(gate, "DELETE", f"{ep.rstrip('/')}/{quote(created_id)}")
+                if d and d["status"] in (200, 202, 204):
+                    emit({"finding": {
+                        "title": "Unauthenticated DELETE accepted",
+                        "severity": "Critical", "confidence": "high",
+                        "owasp": ["A01:2021-Broken Access Control"],
+                        "location_file": f"{gate.base_url}{ep.rstrip('/')}/{created_id}",
+                        "snippet": f"unauthenticated DELETE of our test record returned {d['status']}",
+                        "impact": "Anyone can delete records without authentication — data loss / integrity.",
+                        "remediation": "Require auth + ownership checks on delete endpoints.",
+                        "evidence": {"status": d["status"], "deleted_marker_id": created_id},
+                    }})
+                    found += 1
+    return found
+
+
+def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24, system: str = SYSTEM_PROMPT,
+             deterministic: bool = True, max_seconds: float | None = None) -> int:
+    """Drive the model→gate→execute loop. Returns the number of findings emitted.
+
+    If ``max_seconds`` is set, the MODEL loop runs until that wall-clock budget elapses (timer
+    starts after the deterministic probes, so the model gets the full requested duration) rather
+    than stopping at ``max_turns``.
+    """
     baseline = compute_baseline(gate)
     real_hits: dict[str, bool] = {}   # normalized path -> True if it returned a NON-baseline response
+    findings = 0
+    # Recon the client bundle, then deterministically probe the backend it points at. These findings
+    # are proven by real backend data (not the model's judgement), so they bypass the catch-all check.
+    recon_info = recon(gate)
+    if deterministic:
+        findings += probe_firebase(gate, recon_info)
+        findings += probe_supabase(gate, recon_info)
+        findings += probe_rate_limit(gate, recon_info, baseline)
+        findings += probe_injection(gate, recon_info, baseline)
+        findings += probe_writes(gate, recon_info, baseline, allow_destructive=gate.allow_destructive)
     baseline_note = ""
     if baseline:
         b = baseline[0]
@@ -286,10 +654,17 @@ def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24
             "content-type, materially different body/length, or a different status). Never report a "
             "finding backed only by a baseline-matching response."
         )
-    transcript: list = [{"role": "user", "content": f"Target root: {gate.base_url}{baseline_note}\nPropose your first probe."}]
-    findings = 0
+    recon_note = _recon_note(recon_info)
+    transcript: list = [{"role": "user", "content": f"Target root: {gate.base_url}{baseline_note}{recon_note}\nPropose your first probe."}]
     consecutive_model_errors = 0
-    for turn in range(max_turns):
+    consecutive_no_action = 0
+    loop_start = time.monotonic()
+    # Time-bounded: a high turn ceiling, stopped by the wall-clock budget. Turn-bounded otherwise.
+    turn_cap = 100000 if max_seconds else max_turns
+    for turn in range(turn_cap):
+        if max_seconds is not None and (time.monotonic() - loop_start) >= max_seconds:
+            emit({"event": "time_up", "seconds": round(time.monotonic() - loop_start), "turns": turn})
+            break
         transcript = _trim(transcript)
         try:
             reply = ask_model(endpoint, model, transcript, system=system)
@@ -305,8 +680,17 @@ def run_loop(gate: RemoteGate, endpoint: str, model: str, *, max_turns: int = 24
             continue
         decision = _extract_json(reply)
         if not decision:
+            # A single unparseable reply must NOT kill the worker (that left parallel workers idle).
+            # Nudge for strict JSON and retry; give up only after several in a row.
+            consecutive_no_action += 1
             emit({"event": "no_action", "msg": "model returned no valid JSON action"})
-            break
+            if consecutive_no_action >= 3:
+                break
+            transcript.append({"role": "assistant", "content": reply[:400]})
+            transcript.append({"role": "user", "content": "That reply had no valid JSON action. Reply with "
+                               "EXACTLY ONE JSON object (action: request | finding | finish) and nothing else."})
+            continue
+        consecutive_no_action = 0
         action = decision.get("action")
 
         if action == "finish":
@@ -398,13 +782,17 @@ def main(argv=None) -> int:
     parser.add_argument("target", help="approved target root URL (host-pinned)")
     parser.add_argument("--endpoint", default=MODEL_ENDPOINT_DEFAULT, help="local vLLM OpenAI-compatible endpoint")
     parser.add_argument("--model", default="heretic", help="served model name (vLLM --served-model-name)")
-    parser.add_argument("--max-requests", type=int, default=60)
+    parser.add_argument("--max-requests", type=int, default=200)  # room for recon + deterministic probes + model loop
     parser.add_argument("--max-turns", type=int, default=24)
+    parser.add_argument("--minutes", type=float, default=0.0, help="run the model loop for this many minutes (0 = use --max-turns)")
     parser.add_argument("--allow-destructive", action="store_true", help="permit DELETE (off by default)")
     # Operator focus for this run, base64-encoded (avoids shell-quoting arbitrary text). Appended
     # to the system prompt so you can steer WHAT it tests, e.g. "focus on SQLi in /search and
     # JWT tampering; ignore IDOR".
     parser.add_argument("--instructions-b64", default="", help="base64-encoded operator focus appended to the system prompt")
+    # Deterministic probes (recon backend + rate-limit + injection + writes) run once; parallel
+    # workers after the first pass --no-deterministic so they only add model-driven coverage.
+    parser.add_argument("--no-deterministic", action="store_true", help="skip the deterministic probe suite (model loop only)")
     args = parser.parse_args(argv)
     system = SYSTEM_PROMPT
     if args.instructions_b64:
@@ -417,7 +805,9 @@ def main(argv=None) -> int:
     except GateError as error:
         emit({"event": "fatal", "msg": str(error)})
         return 2
-    run_loop(gate, args.endpoint, args.model, max_turns=args.max_turns, system=system)
+    run_loop(gate, args.endpoint, args.model, max_turns=args.max_turns, system=system,
+             deterministic=not args.no_deterministic,
+             max_seconds=(args.minutes * 60 if args.minutes and args.minutes > 0 else None))
     return 0
 
 

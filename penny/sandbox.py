@@ -469,7 +469,8 @@ def sandbox_test(
     allow_destructive: bool = False,
     instructions: str = "",
     workers: int = 1,
-    max_requests: int = 60,
+    timing_minutes: float = 0.0,
+    max_requests: int = 200,  # room for recon + deterministic probes (rate-limit/injection/writes) + model loop
     max_turns: int = 24,
 ) -> list[Finding]:
     """Spin an ephemeral heretic/gemma-3 GPU box, actively breach `target`, then destroy it.
@@ -477,7 +478,12 @@ def sandbox_test(
     ``instructions`` is free-text operator focus appended to the agent's system prompt (steer
     WHAT it tests). ``workers`` runs that many agent processes against the box concurrently —
     when no instructions are given they fan out across distinct focus areas for wider coverage.
+    ``timing_minutes`` (>0) runs each worker's model loop for that wall-clock budget instead of
+    stopping at a turn count.
     """
+    if timing_minutes and timing_minutes > 0:
+        # Raise the per-worker request ceiling so the time budget, not the cap, is the limiter.
+        max_requests = max(max_requests, int(timing_minutes * 60 * 5) + 200)
     if not vultr.available():
         feed.emit("attack", "VULTR_API_KEY not set in .env — cannot use the sandbox tier")
         return []
@@ -547,14 +553,16 @@ def sandbox_test(
             box_destroyed = True
             return []
         n = max(1, int(workers))
+        budget = f", ~{timing_minutes:g} min each" if timing_minutes and timing_minutes > 0 else ""
         feed.emit("attack", f"[sandbox] model ready; launching active breach against {target} "
-                            f"({n} worker{'s' if n > 1 else ''}, live)")
+                            f"({n} worker{'s' if n > 1 else ''}{budget}, live)")
         # Push the agent once; every worker runs the same /tmp copy.
         vultr.ssh_run(ip, f"echo {_b64(_agent_source())} | base64 -d > /tmp/penny_agent.py", timeout=60)
         found = _run_breach(
             ip, target, feed,
             workers=n, instructions=instructions,
             allow_destructive=allow_destructive, max_requests=max_requests, max_turns=max_turns,
+            timing_minutes=timing_minutes,
         )
         findings.extend(found)
         feed.emit("attack", f"[sandbox] breach complete: {len(findings)} finding(s)")
@@ -615,7 +623,16 @@ def _handle_agent_line(line: str, target: str, feed: EventFeed, *, prefix: str =
         feed.emit("attack", f"{tag} FINDING: {redact_text(obj['finding'].get('title', ''))}")
         return _finding_from_jsonl(obj["finding"], target)
     event = obj.get("event")
-    if event == "baseline":
+    if event == "recon":
+        eps = obj.get("endpoints") or []
+        rtdb = obj.get("rtdb") or []
+        sb = obj.get("supabase") or []
+        feed.emit("attack", f"{tag} recon: {len(eps)} endpoint(s) in JS bundle"
+                            + (f", Firebase RTDB: {', '.join(rtdb)}" if rtdb else "")
+                            + (f", Supabase: {', '.join(sb)}" if sb else ""))
+        if eps:
+            feed.emit("attack", f"{tag} endpoints: {redact_text(', '.join(eps[:20]))}")
+    elif event == "baseline":
         feed.emit("attack", f"{tag} catch-all baseline: HTTP {obj.get('status')} {obj.get('content_type')} "
                             f"~{obj.get('bytes')} bytes (a matching 200 is NOT a real endpoint)")
     elif event == "request":
@@ -623,6 +640,13 @@ def _handle_agent_line(line: str, target: str, feed: EventFeed, *, prefix: str =
     elif event == "response":
         suffix = " [catch-all]" if obj.get("catch_all") else ""
         feed.emit("attack", f"{tag}   -> {obj.get('status')} ({obj.get('bytes')} bytes){suffix}")
+    elif event == "rate_limit":
+        feed.emit("attack", f"{tag} rate-limit probe: {obj.get('sent')} rapid reqs to {obj.get('endpoint')}, "
+                            f"{obj.get('throttled')} throttled")
+    elif event == "probe_skipped":
+        feed.emit("attack", f"{tag} {obj.get('probe')} probe skipped: {obj.get('reason', '')}")
+    elif event == "time_up":
+        feed.emit("attack", f"{tag} time budget reached ({obj.get('seconds')}s, {obj.get('turns')} turns) — stopping")
     elif event == "finding_rejected":
         feed.emit("gate", f"{tag} finding rejected ({obj.get('path', '')}): {redact_text(obj.get('reason', ''))}")
     elif event == "blocked":
@@ -634,11 +658,16 @@ def _handle_agent_line(line: str, target: str, feed: EventFeed, *, prefix: str =
     return None
 
 
-def _worker_cmd(target: str, focus: str, *, allow_destructive: bool, max_requests: int, max_turns: int) -> str:
+def _worker_cmd(target: str, focus: str, *, allow_destructive: bool, max_requests: int, max_turns: int,
+                deterministic: bool = True, minutes: float = 0.0) -> str:
     cmd = (f"python3 -u /tmp/penny_agent.py {shlex.quote(target)} "
            f"--max-requests {int(max_requests)} --max-turns {int(max_turns)}")
+    if minutes and minutes > 0:
+        cmd += f" --minutes {minutes}"
     if allow_destructive:
         cmd += " --allow-destructive"
+    if not deterministic:
+        cmd += " --no-deterministic"
     if focus:
         cmd += f" --instructions-b64 {_b64(focus)}"
     return cmd
@@ -654,6 +683,7 @@ def _run_breach(
     allow_destructive: bool,
     max_requests: int,
     max_turns: int,
+    timing_minutes: float = 0.0,
 ) -> list[Finding]:
     """Run one or more agent workers against the box, streaming + de-duplicating findings.
 
@@ -663,17 +693,21 @@ def _run_breach(
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
-    attack_timeout = max_turns * 120 + 600
+    # Give the SSH stream enough wall-clock to outlast the model budget (+ recon/probe time).
+    attack_timeout = max(max_turns * 120 + 600, int(timing_minutes * 60) + 900)
     findings: list[Finding] = []
     seen: set[tuple[str, str]] = set()
     lock = threading.Lock()
 
     def collect(line: str, label: str) -> None:
-        finding = _handle_agent_line(line, target, feed, prefix=label)
-        if finding is None:
-            return
-        key = (finding.title, finding.location.file)
+        # Hold the lock across the WHOLE handler, not just the dedup: _handle_agent_line prints to
+        # the shared stdout, and concurrent prints from worker threads interleave mid-escape-
+        # sequence and corrupt the ANSI (the `?[91m`/`[0m` garbage). Serializing keeps lines atomic.
         with lock:
+            finding = _handle_agent_line(line, target, feed, prefix=label)
+            if finding is None:
+                return
+            key = (finding.title, finding.location.file)
             if key in seen:
                 return
             seen.add(key)
@@ -682,7 +716,7 @@ def _run_breach(
     if workers <= 1:
         vultr.ssh_stream(
             ip, _worker_cmd(target, instructions, allow_destructive=allow_destructive,
-                            max_requests=max_requests, max_turns=max_turns),
+                            max_requests=max_requests, max_turns=max_turns, minutes=timing_minutes),
             timeout=attack_timeout, on_line=lambda l: collect(l, ""),
         )
         return findings
@@ -695,8 +729,11 @@ def _run_breach(
             focus = DEFAULT_FOCUSES[i % len(DEFAULT_FOCUSES)]
         label = f"w{i + 1}"
         feed.emit("attack", f"[sandbox/{label}] focus: {redact_text(focus.splitlines()[0][:90])}")
+        # Only the first worker runs the deterministic probe suite (recon/firebase/supabase/
+        # rate-limit/injection/writes); the rest skip it to avoid N× the same probes + traffic.
         cmd = _worker_cmd(target, focus, allow_destructive=allow_destructive,
-                          max_requests=max_requests, max_turns=max_turns)
+                          max_requests=max_requests, max_turns=max_turns,
+                          deterministic=(i == 0), minutes=timing_minutes)
         try:
             vultr.ssh_stream(ip, cmd, timeout=attack_timeout, on_line=lambda l, lab=label: collect(l, lab))
         except Exception as error:  # noqa: BLE001

@@ -15,9 +15,14 @@ class _FakeGate:
     def __init__(self, real_paths=()):
         self.base_url = "http://target"
         self.request_count = 0
+        self.allow_destructive = False
+        self.extra_hosts = set()
         self._real = set(real_paths)
 
-    def execute(self, method, path, headers, body, *, timeout=12.0):
+    def allow_backend_host(self, host):
+        self.extra_hosts.add((host or "").lower())
+
+    def execute(self, method, path, headers=None, body=None, *, timeout=12.0, pace=True):
         self.request_count += 1
         if path in self._real:
             return {"status": 200, "body": '{"id": 1, "amount": 99}', "content_type": "application/json"}
@@ -331,3 +336,206 @@ def test_run_loop_accepts_finding_on_real_json_endpoint(monkeypatch) -> None:
     count, emitted = _run_agent(monkeypatch, _FakeGate(real_paths={"/api/invoices/1"}), replies)
     assert count == 1
     assert any("finding" in e and "event" not in e for e in emitted)
+
+
+# ---------------------------------------------------------------------------
+# Client-side recon + backend (Firebase/Supabase) probing
+# ---------------------------------------------------------------------------
+
+class _ReconGate:
+    """Serves an index that references a bundle; the bundle leaks a Firebase RTDB URL; the RTDB
+    is world-readable. Tracks which backend hosts were allow-listed."""
+
+    INDEX = '<html><script src="/assets/app.js"></script></html>'
+    BUNDLE = ('const cfg={projectId:"penny-demo",databaseURL:"https://penny-demo-default-rtdb.firebaseio.com"};'
+              'fetch("/api/orders/1");')
+
+    def __init__(self):
+        self.base_url = "http://target"
+        self.host = "target"
+        self.request_count = 0
+        self.allow_destructive = False
+        self.extra_hosts = set()
+
+    def allow_backend_host(self, host):
+        if host:
+            self.extra_hosts.add(host.lower())
+
+    def execute(self, method, path, headers=None, body=None, *, timeout=12.0, pace=True):
+        self.request_count += 1
+        if path == "/":
+            return {"status": 200, "body": self.INDEX, "content_type": "text/html"}
+        if path == "/assets/app.js":
+            return {"status": 200, "body": self.BUNDLE, "content_type": "application/javascript"}
+        if "firebaseio.com" in path:
+            host = path.split("/")[2]
+            if host not in self.extra_hosts:  # host-pin would have blocked it
+                raise GateError("host-pin")
+            return {"status": 200, "body": '{"users":{"u1":{"email":"a@b.c"}}}', "content_type": "application/json"}
+        return {"status": 200, "body": "<html>catch-all</html>", "content_type": "text/html"}
+
+
+def test_recon_extracts_endpoints_and_firebase(monkeypatch) -> None:
+    monkeypatch.setattr(agent, "emit", lambda obj: None)
+    info = agent.recon(_ReconGate())
+    assert "/api/orders/1" in info["endpoints"]
+    assert "penny-demo" in info["project_ids"]
+    assert any("penny-demo-default-rtdb.firebaseio.com" in u for u in info["rtdb"])
+
+
+def test_probe_firebase_flags_open_rules_and_allows_backend_host(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    gate = _ReconGate()
+    info = agent.recon(gate)
+    found = agent.probe_firebase(gate, info)
+    assert found >= 1
+    # the firebaseio.com backend host had to be allow-listed for the probe to reach it
+    assert any("firebaseio.com" in h for h in gate.extra_hosts)
+    fb = [e["finding"] for e in emitted if "finding" in e]
+    assert fb and fb[0]["severity"] == "Critical" and "Firebase" in fb[0]["title"]
+
+
+class _FirestoreGate:
+    """Firestore is open only for the 'sac_authorized_users' collection; everything else 403/locked."""
+
+    def __init__(self):
+        self.base_url = "http://target"
+        self.host = "target"
+        self.request_count = 0
+        self.allow_destructive = False
+        self.extra_hosts = set()
+
+    def allow_backend_host(self, host):
+        self.extra_hosts.add((host or "").lower())
+
+    def execute(self, method, path, headers=None, body=None, *, timeout=12.0, pace=True):
+        self.request_count += 1
+        if "firestore.googleapis.com" in path:
+            if "/documents/sac_authorized_users" in path:
+                return {"status": 200, "body": '{"documents":[{"name":"x","fields":{"email":{}}}]}',
+                        "content_type": "application/json"}
+            return {"status": 403, "body": '{"error":{"status":"PERMISSION_DENIED"}}', "content_type": "application/json"}
+        if "firebaseio.com" in path:
+            return {"status": 401, "body": '{"error":"Permission denied"}', "content_type": "application/json"}
+        return {"status": 200, "body": "<html>catch</html>", "content_type": "text/html"}
+
+
+def test_probe_firestore_flags_named_collection(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    gate = _FirestoreGate()
+    info = {"endpoints": set(), "rtdb": set(), "project_ids": {"penny-demo"},
+            "supabase_urls": set(), "supabase_keys": set()}
+    found = agent.probe_firebase(gate, info)
+    assert found >= 1
+    fb = [e["finding"] for e in emitted if "finding" in e]
+    assert any("sac_authorized_users" in f["title"] for f in fb)
+    assert any("firestore.googleapis.com" in h for h in gate.extra_hosts)
+
+
+def test_remote_gate_allows_discovered_backend_host() -> None:
+    gate = RemoteGate("https://app.example")
+    with pytest.raises(GateError):
+        gate.build_url("https://app-default-rtdb.firebaseio.com/.json")  # blocked until discovered
+    gate.allow_backend_host("app-default-rtdb.firebaseio.com")
+    assert gate.build_url("https://app-default-rtdb.firebaseio.com/.json").endswith("/.json")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic active probes: rate-limit, SQL injection, writes
+# ---------------------------------------------------------------------------
+
+class _ProbeGate:
+    """Configurable fake gate: per-(method,path-substring) responses; everything else catch-all."""
+
+    def __init__(self, rules=None):
+        self.base_url = "http://target"
+        self.host = "target"
+        self.request_count = 0
+        self.extra_hosts = set()
+        self.allow_destructive = True
+        self._rules = rules or []  # list of (method, substr, response_dict)
+        self.calls = []
+
+    def allow_backend_host(self, host):
+        self.extra_hosts.add((host or "").lower())
+
+    def execute(self, method, path, headers=None, body=None, *, timeout=12.0, pace=True):
+        self.request_count += 1
+        self.calls.append((method, path))
+        for m, sub, resp in self._rules:
+            if m == method and sub in path:
+                return dict(resp)
+        return {"status": 200, "body": "<html>catch-all</html>", "content_type": "text/html"}
+
+
+_BASE = [{"status": 200, "ct": "html", "len": len("<html>catch-all</html>"),
+          "hash": agent._body_hash("<html>catch-all</html>")}]
+
+
+def test_probe_rate_limit_flags_missing_throttle(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    # /api/orders returns JSON (live, never throttled)
+    gate = _ProbeGate([("GET", "/api/orders", {"status": 200, "body": '{"ok":1}', "content_type": "application/json"})])
+    info = {"endpoints": {"/api/orders"}, "rtdb": set(), "project_ids": set(), "supabase_urls": set(), "supabase_keys": set()}
+    found = agent.probe_rate_limit(gate, info, _BASE)
+    assert found == 1
+    titles = [e["finding"]["title"] for e in emitted if "finding" in e]
+    assert any("rate limiting" in t.lower() for t in titles)
+
+
+def test_probe_injection_flags_sql_error(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    gate = _ProbeGate([
+        ("GET", "id=", {"status": 500, "body": "ERROR: syntax error at or near \"'\"", "content_type": "text/plain"}),
+        ("GET", "/api/search", {"status": 200, "body": '{"results":[]}', "content_type": "application/json"}),
+    ])
+    info = {"endpoints": {"/api/search"}, "rtdb": set(), "project_ids": set(), "supabase_urls": set(), "supabase_keys": set()}
+    found = agent.probe_injection(gate, info, _BASE)
+    assert found == 1
+    assert any("sql injection" in e["finding"]["title"].lower() for e in emitted if "finding" in e)
+
+
+def test_probe_writes_flags_mass_assignment(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    gate = _ProbeGate([
+        ("GET", "/api/users", {"status": 200, "body": '{"users":[]}', "content_type": "application/json"}),
+        ("POST", "/api/users", {"status": 201, "body": '{"id":"9","role":"admin","isAdmin":true}', "content_type": "application/json"}),
+        ("DELETE", "/api/users/9", {"status": 204, "body": "", "content_type": ""}),
+    ])
+    info = {"endpoints": {"/api/users"}, "rtdb": set(), "project_ids": set(), "supabase_urls": set(), "supabase_keys": set()}
+    found = agent.probe_writes(gate, info, _BASE, allow_destructive=True)
+    titles = [e["finding"]["title"] for e in emitted if "finding" in e]
+    assert any("mass assignment" in t.lower() for t in titles)
+    assert any("delete" in t.lower() for t in titles)  # cleaned up our record + flagged open DELETE
+
+
+def test_run_loop_stops_on_time_budget(monkeypatch) -> None:
+    # With max_seconds=0 the loop should stop on the very first time check (no model turns at all).
+    monkeypatch.setattr(agent, "emit", lambda obj: None)
+    calls = {"n": 0}
+
+    def _ask(*a, **k):
+        calls["n"] += 1
+        return '{"action":"request","method":"GET","path":"/x","reason":"r"}'
+
+    monkeypatch.setattr(agent, "ask_model", _ask)
+    # max_seconds=0.0 trips on the first check (elapsed >= 0) before any model call
+    count = agent.run_loop(_FakeGate(), "ep", "m", deterministic=False, max_seconds=0.0, max_turns=99)
+    assert calls["n"] == 0
+
+
+def test_probe_writes_no_delete_without_optin(monkeypatch) -> None:
+    emitted: list = []
+    monkeypatch.setattr(agent, "emit", lambda obj: emitted.append(obj))
+    gate = _ProbeGate([
+        ("GET", "/api/users", {"status": 200, "body": '{"users":[]}', "content_type": "application/json"}),
+        ("POST", "/api/users", {"status": 201, "body": '{"id":"9"}', "content_type": "application/json"}),
+    ])
+    info = {"endpoints": {"/api/users"}, "rtdb": set(), "project_ids": set(), "supabase_urls": set(), "supabase_keys": set()}
+    agent.probe_writes(gate, info, _BASE, allow_destructive=False)
+    assert not any(m == "DELETE" for m, _ in gate.calls)  # DELETE only with --allow-destructive

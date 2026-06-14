@@ -74,7 +74,7 @@ def test_natural_language_audit_forwards_target_flag(tmp_path, monkeypatch) -> N
     session, _ = _session(tmp_path, monkeypatch)
     captured: dict[str, object] = {}
     session._scan = lambda args, force=None: captured.update(args=args, target=session.target)
-    session._report = lambda args: None
+    session._report = lambda args, **kwargs: None  # _audit now passes announce_path=...
 
     handled = session._route_intent("run full audit on ../app --target http://localhost:8081 and AI/OSV scan")
 

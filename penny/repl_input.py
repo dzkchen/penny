@@ -149,3 +149,32 @@ def read_line(prompt: str) -> str:
     except Exception as exc:
         _warn_fallback(str(exc))
         return input(_plain_prompt())
+
+
+def clear_screen() -> None:
+    """Clear the terminal and home the cursor.
+
+    ``run_repl`` runs the loop inside ``prompt_toolkit``'s ``patch_stdout``,
+    whose proxy renders screen-control escapes literally — so a plain
+    ``print("\\x1b[2J")`` shows up as ``?[2J`` instead of clearing. Write
+    through the *real* stdout (bypassing the proxy), preferring
+    ``prompt_toolkit``'s output for cross-platform handling and falling back
+    to raw ANSI.
+    """
+    real = sys.__stdout__ or sys.stdout
+    if _CompleterBase is not None:
+        try:
+            from prompt_toolkit.output import create_output
+
+            output = create_output(stdout=real)
+            output.erase_screen()
+            output.cursor_goto(0, 0)
+            output.flush()
+            return
+        except Exception:
+            pass
+    try:
+        real.write("\x1b[2J\x1b[H")
+        real.flush()
+    except Exception:
+        pass

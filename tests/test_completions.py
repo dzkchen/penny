@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-
 import penny.repl_input as repl_input
 from penny.completions import (
     SLASH_COMPLETIONS,
@@ -115,3 +113,15 @@ def test_autocomplete_disabled_by_env(monkeypatch) -> None:
     monkeypatch.setattr(repl_input.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(repl_input.sys.stdout, "isatty", lambda: True)
     assert repl_input.autocomplete_enabled() is False
+
+
+def test_clear_screen_writes_escape_to_real_stdout(monkeypatch) -> None:
+    import io
+
+    fake = io.StringIO()
+    # Force the raw-ANSI fallback and confirm it targets the real stdout,
+    # not prompt_toolkit's patched proxy (the cause of the /clear regression).
+    monkeypatch.setattr(repl_input, "_CompleterBase", None)
+    monkeypatch.setattr(repl_input.sys, "__stdout__", fake)
+    repl_input.clear_screen()
+    assert "\x1b[2J" in fake.getvalue()
