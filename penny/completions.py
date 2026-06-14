@@ -31,6 +31,8 @@ SLASH_COMPLETIONS: tuple[SlashCompletion, ...] = (
     SlashCompletion("ai", "/ai <on|off>", "toggle AI answers and review"),
     SlashCompletion("model", "/model <auto|haiku|sonnet>", "pick the Claude model"),
     SlashCompletion("cloud-attack", "/cloud-attack <type> [target]", "heavy tier on a cloud box", ("cloud",)),
+    SlashCompletion("sandbox-bake", "/sandbox-bake", "one-time: build the heretic/gemma-3 GPU snapshot"),
+    SlashCompletion("sandbox-test", "/sandbox-test [target] [--workers N] [--focus <text>]", "ephemeral GPU box runs active breach, then self-destructs"),
     SlashCompletion("boxes", "/boxes", "list active cloud boxes", ("attack-status",)),
     SlashCompletion("kill", "/kill", "stop running cloud attacks"),
     SlashCompletion("destroy", "/destroy", "destroy all cloud boxes now"),

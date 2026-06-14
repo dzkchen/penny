@@ -32,6 +32,12 @@ def test_completions_include_aliases() -> None:
     assert matches and matches[0].name == "audit"
 
 
+def test_completions_include_sandbox_commands() -> None:
+    names = {item.name for item in completions_for_buffer("/sandbox")}
+    assert names == {"sandbox-bake", "sandbox-test"}
+    assert [item.name for item in completions_for_buffer("/sandbox-t")] == ["sandbox-test"]
+
+
 def test_tab_completes_unique_command() -> None:
     matches = completions_for_buffer("/sc")
     assert apply_tab_completion("/sc", matches) == "/scan "
