@@ -161,16 +161,22 @@ def _wrap_cell(text: str, width: int) -> list[str]:
     return lines
 
 
-def panel(body: str, *, title: str | None = None, color: str = "cyan") -> str:
-    raw = body.split("\n")
-    if title:
-        raw = [style(title, "bold")] + ([""] if body else []) + raw
+def panel(body: str, *, title: str | None = None, subtitle: str | None = None, color: str = "cyan") -> str:
+    raw = [line for line in body.split("\n") if line or not title]
+    if subtitle:
+        raw = [dim(subtitle)] + ([""] if raw else []) + raw
     width = max(24, min(max((visible_len(line) for line in raw), default=0), _term_width() - 4))
     lines: list[str] = []
     for line in raw:
         lines.extend(_wrap(line, width))
     inner = min(max((visible_len(line) for line in lines), default=0), width)
-    top = style("╭" + "─" * (inner + 2) + "╮", color)
+    if title:
+        title_text = f" {title} "
+        if visible_len(title_text) > inner:
+            title_text = f" {title[: max(0, inner - 2)]} "
+        top = style("╭─", color) + style(title_text, "bold", color) + style("─" * max(0, inner - visible_len(title_text)) + "╮", color)
+    else:
+        top = style("╭" + "─" * (inner + 2) + "╮", color)
     bottom = style("╰" + "─" * (inner + 2) + "╯", color)
     bar = style("│", color)
     rows = [top]
@@ -178,6 +184,44 @@ def panel(body: str, *, title: str | None = None, color: str = "cyan") -> str:
         rows.append(f"{bar} {_pad(line, inner)} {bar}")
     rows.append(bottom)
     return "\n".join(rows)
+
+
+def tagline(text: str) -> str:
+    return dim(text.center(max(visible_len(_LOGO.splitlines()[0]), visible_len(text))))
+
+
+def kv(label: str, value: str) -> str:
+    return f"{style(f'{label:<8}', 'bright_black')} {value}"
+
+
+def command_chip(command: str) -> str:
+    return style(command, "bold", "bright_cyan")
+
+
+def status_on() -> str:
+    return style("●", "bright_green") + dim(" on")
+
+
+def status_off() -> str:
+    return style("○", "bright_black") + dim(" off")
+
+
+def field(label: str, value: str) -> str:
+    return f"{style(label + ':', 'bold', 'bright_black')}  {value}"
+
+
+def severity_strip(by_severity: dict[str, int]) -> str:
+    parts = [
+        f"{severity_badge(severity).strip()}{dim(f' {by_severity[severity]}')}"
+        for severity in ("Critical", "High", "Medium", "Low", "Info")
+        if by_severity.get(severity)
+    ]
+    return "   ".join(parts)
+
+
+def rule(width: int | None = None) -> str:
+    span = min((width or _term_width()) - 4, 72)
+    return dim("─" * max(span, 12))
 
 
 def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = None, *, max_width: int | None = None) -> str:
@@ -234,7 +278,7 @@ def banner() -> str:
 
 
 def prompt() -> str:
-    return style("penny", "bold", "cyan") + style(" › ", "dim")
+    return style("◆ ", "bright_magenta") + style("penny", "bold", "cyan") + style(" › ", "dim")
 
 
 def channel_line(channel: str, message: str) -> str:
