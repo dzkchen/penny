@@ -8,8 +8,9 @@ frequently unauthenticated and is a far bigger problem than any single web bug.
 
 Safety mirrors :class:`~penny.guardrails.TargetGate`:
 
-* localhost/private hosts are allowed by default; any public host requires
-  ``i_own_this`` (enforced via :func:`penny.guardrails.host_allowed`).
+* localhost/private hosts are allowed by default; any public host requires a
+  matching DNS TXT proof record (enforced via
+  :func:`penny.guardrails.host_authorization_error`).
 * It is a plain TCP *connect* scan — it opens a socket and immediately closes it.
   Nothing is written to the port, so it never sends a payload to a service.
 * The port list is a fixed, curated set of common services; short timeouts keep
@@ -238,7 +239,6 @@ def _describe_service(service: str, banner_info: dict[str, str | bool]) -> str:
 def run_port_scan(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     ports: dict[int, str] | None = None,
     timeout: float = 0.6,
@@ -254,7 +254,7 @@ def run_port_scan(
     "Redis 6.2, no auth". The banner grabber is injectable for offline tests.
     """
     host = urlparse(target).hostname or target
-    authorization_error = host_authorization_error(host, i_own_this)
+    authorization_error = host_authorization_error(host)
     if authorization_error:
         feed.emit("gate", f"Port scan blocked for {host}: {authorization_error}")
         return []

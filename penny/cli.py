@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from . import llm
-from .agent_fix import run_agent_fix
 from .ask import answer_question
 from .models import SEVERITY_ORDER
 from .feed import EventFeed
+from .handoff import create_fix_handoff
 from .live import LiveScanFeed, print_scan_summary
 from .mongo import MongoMirror
 from .patches import apply_patch_plans, write_patch_file
@@ -38,7 +38,6 @@ def _run_scan_command(
     target: str | None,
     static_only: bool,
     out: Path,
-    i_own_this: bool,
     osv: bool,
     ai: bool,
     active: bool,
@@ -63,7 +62,6 @@ def _run_scan_command(
                 target=target,
                 static_only=static_only,
                 out_dir=out,
-                i_own_this=i_own_this,
                 feed=feed,
                 source_label=path,
                 use_osv=osv,
@@ -89,7 +87,6 @@ def _sandbox_test_command(
     target: str,
     *,
     out: Path,
-    i_own_this: bool,
     allow_destructive: bool,
     keep_alive: bool,
     auto_confirm: bool,
@@ -104,7 +101,7 @@ def _sandbox_test_command(
     feed = EventFeed()
     findings = sandbox_test(
         target,
-        i_own_this=i_own_this, feed=feed,
+        feed=feed,
         keep_alive=keep_alive, allow_destructive=allow_destructive, auto_confirm=auto_confirm,
         instructions=instructions, workers=workers, timing_minutes=timing_minutes,
     )
@@ -170,7 +167,6 @@ def _enforce_fail_on(payload: dict, threshold: str | None, feed: EventFeed) -> N
 def _ask_loop(
     findings: Path,
     target: str | None,
-    i_own_this: bool,
     feed: EventFeed,
     use_llm: bool = False,
 ) -> None:
@@ -192,7 +188,6 @@ def _ask_loop(
                 question,
                 findings_path=findings,
                 target=target,
-                i_own_this=i_own_this,
                 use_llm=use_llm,
             ),
         )
@@ -211,14 +206,18 @@ def _patch_command(findings: Path, repo: Path, out: Path, apply: bool, feed: Eve
             feed.emit("blue", "No applicable source changes found")
 
 
-def _fix_command(findings: Path, repo: Path, auto_yes: bool, feed: EventFeed) -> None:
+def _handoff_command(findings: Path, repo: Path, out: Path | None, agent: str, feed: EventFeed) -> Path:
     payload = load_findings(findings)
-    feed.emit("blue", f"Interactive fix mode on {repo} (LLM-driven, approval required)")
-    changed = run_agent_fix(payload, repo, feed=feed, auto_yes=auto_yes)
-    if changed:
-        feed.emit("blue", f"Applied {len(changed)} fix(es). Review with `git diff` before committing.")
-    else:
-        feed.emit("blue", "No fixes applied")
+    result = create_fix_handoff(payload, repo, out_path=out, agent=agent)
+    feed.emit("blue", f"Wrote remediation handoff {result.path}")
+    feed.emit("blue", "Open the repo in Codex or Claude Code and use the handoff to apply fixes.")
+    return result.path
+
+
+def _fix_command(findings: Path, repo: Path, auto_yes: bool, feed: EventFeed, out: Path | None = None, agent: str = "codex") -> None:
+    if auto_yes:
+        feed.emit("blue", "--yes is ignored: Penny now creates a handoff instead of editing files directly")
+    _handoff_command(findings, repo, out, agent, feed)
 
 
 def _github_fix_command(source: str, workdir: Path, branch: str, auto_yes: bool, push: bool, feed: EventFeed) -> None:
@@ -246,10 +245,9 @@ def _build_typer_app():
         target: Optional[str] = typer.Option(None, "--target"),
         static_only: bool = typer.Option(False, "--static-only"),
         out: Path = typer.Option(Path("."), "--out"),
-        i_own_this: bool = typer.Option(False, "--i-own-this"),
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need --i-own-this plus a matching DNS TXT proof record."),
+        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need a matching DNS TXT proof record."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
         diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
         endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
@@ -262,7 +260,7 @@ def _build_typer_app():
         wordlist: Optional[str] = typer.Option(None, "--wordlist", help="Path to a custom brute-force wordlist (one path per line)."),
         pages: int = typer.Option(8, "--pages", help="Max pages for the browser crawl."),
         verbose: bool = typer.Option(False, "--verbose", "-v", help="After the scan, print every finding location grouped by detector (the non-interactive form of ctrl-o expand)."),
-        sandbox_test: bool = typer.Option(False, "--sandbox-test", help="After the scan, spin an ephemeral Vultr GPU box that serves a heretic-decensored gemma-3 and runs ACTIVE breach attempts against the target, then self-destructs. Requires --i-own-this plus a matching DNS TXT proof record (strict; never bypassed). Run `penny sandbox-bake` once first."),
+        sandbox_test: bool = typer.Option(False, "--sandbox-test", help="After the scan, spin an ephemeral Vultr GPU box that serves a heretic-decensored gemma-3 and runs ACTIVE breach attempts against the target, then self-destructs. Requires a matching DNS TXT proof record (strict; never bypassed). Run `penny sandbox-bake` once first."),
         allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit the sandbox to issue DELETE (off by default; the one destructive-verb floor)."),
     ) -> None:
         try:
@@ -271,7 +269,6 @@ def _build_typer_app():
                 target=target,
                 static_only=static_only,
                 out=out,
-                i_own_this=i_own_this,
                 osv=osv,
                 ai=ai,
                 active=active,
@@ -294,7 +291,7 @@ def _build_typer_app():
             if not target:
                 _fail("--sandbox-test requires --target <url>")
             _sandbox_test_command(
-                target, out=out, i_own_this=i_own_this,
+                target, out=out,
                 allow_destructive=allow_destructive, keep_alive=False, auto_confirm=False,
             )
 
@@ -322,7 +319,6 @@ def _build_typer_app():
     def sandbox_test_cmd(
         target: str = typer.Option(..., "--target", help="Target root URL (must have a matching DNS TXT proof record)."),
         out: Path = typer.Option(Path("."), "--out"),
-        i_own_this: bool = typer.Option(False, "--i-own-this"),
         allow_destructive: bool = typer.Option(False, "--allow-destructive", help="Permit DELETE (off by default)."),
         keep_alive: bool = typer.Option(False, "--keep-alive", help="Keep the box after the run (still auto-destroys in 30m)."),
         instructions: str = typer.Option("", "--instructions", "-i", help="Free-text focus for what to test, e.g. 'focus on SQLi in /search and JWT tampering; skip IDOR'. Appended to the agent's system prompt."),
@@ -332,7 +328,7 @@ def _build_typer_app():
     ) -> None:
         """Ephemeral GPU box runs a heretic/gemma-3 ACTIVE breach against an owned target, then self-destructs."""
         _sandbox_test_command(
-            target, out=out, i_own_this=i_own_this,
+            target, out=out,
             allow_destructive=allow_destructive, keep_alive=keep_alive, auto_confirm=yes,
             instructions=instructions, workers=workers, timing_minutes=timing,
         )
@@ -342,7 +338,6 @@ def _build_typer_app():
         question: str,
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
-        i_own_this: bool = typer.Option(False, "--i-own-this"),
         no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
         feed = EventFeed()
@@ -351,7 +346,7 @@ def _build_typer_app():
             feed.emit("purple", llm.describe())
         feed.emit(
             "purple",
-            answer_question(question, findings_path=findings, target=target, i_own_this=i_own_this, use_llm=use_llm),
+            answer_question(question, findings_path=findings, target=target, use_llm=use_llm),
         )
 
     @app.command()
@@ -374,10 +369,9 @@ def _build_typer_app():
     def ask_loop(
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         target: Optional[str] = typer.Option(None, "--target"),
-        i_own_this: bool = typer.Option(False, "--i-own-this"),
         no_ai: bool = typer.Option(False, "--no-ai", help="Answer with deterministic logic instead of the Claude model."),
     ) -> None:
-        _ask_loop(findings, target, i_own_this, EventFeed(), use_llm=not no_ai)
+        _ask_loop(findings, target, EventFeed(), use_llm=not no_ai)
 
     @app.command()
     def patch(
@@ -392,17 +386,39 @@ def _build_typer_app():
     def fix(
         findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
         repo: Path = typer.Option(Path("."), "--repo"),
-        yes: bool = typer.Option(False, "--yes", help="Apply all proposed fixes without prompting (demo/non-interactive)."),
+        out: Optional[Path] = typer.Option(None, "--out", help="Path for the generated remediation handoff."),
+        agent: str = typer.Option("codex", "--agent", help="Target coding agent label, e.g. codex or claude-code."),
+        yes: bool = typer.Option(False, "--yes", help="Deprecated; ignored because fix now creates a handoff."),
     ) -> None:
-        _fix_command(findings, repo, yes, EventFeed())
+        _fix_command(findings, repo, yes, EventFeed(), out=out, agent=agent)
+
+    @app.command()
+    def handoff(
+        findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
+        repo: Path = typer.Option(Path("."), "--repo"),
+        out: Optional[Path] = typer.Option(None, "--out", help="Path for the generated remediation handoff."),
+        agent: str = typer.Option("codex", "--agent", help="Target coding agent label, e.g. codex or claude-code."),
+    ) -> None:
+        _handoff_command(findings, repo, out, agent, EventFeed())
+
+    @app.command()
+    def mcp(
+        findings: Path = typer.Option(Path(".penny/runs/latest/findings.json"), "--findings"),
+        repo: Path = typer.Option(Path("."), "--repo"),
+        report: Optional[Path] = typer.Option(None, "--report"),
+        agent: str = typer.Option("codex", "--agent"),
+    ) -> None:
+        from .mcp import build_context, serve
+
+        serve(build_context(repo=repo, findings_path=findings, report_path=report, agent=agent))
 
     @app.command("github-fix")
     def github_fix(
         source: str,
         workdir: Path = typer.Option(Path("penny-workdir"), "--workdir"),
         branch: str = typer.Option("penny/fixes", "--branch"),
-        yes: bool = typer.Option(False, "--yes", help="Apply all fixes without prompting."),
-        push: bool = typer.Option(False, "--push", help="Push the fix branch to origin."),
+        yes: bool = typer.Option(False, "--yes", help="Deprecated; ignored because this command creates a handoff."),
+        push: bool = typer.Option(False, "--push", help="Deprecated; ignored because no fix commit is created."),
     ) -> None:
         _github_fix_command(source, workdir, branch, yes, push, EventFeed())
 
@@ -444,10 +460,9 @@ def _build_typer_app():
         path: str,
         target: str = typer.Option(..., "--target"),
         out: Path = typer.Option(Path("."), "--out"),
-        i_own_this: bool = typer.Option(False, "--i-own-this"),
         osv: bool = typer.Option(False, "--osv", help="Query OSV.dev for real dependency advisories (sends package names + versions)."),
         ai: bool = typer.Option(False, "--ai", help="Run an AI vulnerability review (sends source code to the Claude model)."),
-        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need --i-own-this plus a matching DNS TXT proof record."),
+        active: bool = typer.Option(False, "--active", help="Send active read-only probes: SQLi, Firebase open rules, headers, cookies, HTTP methods, exposed paths, errors, CORS, and cache checks. Public targets need a matching DNS TXT proof record."),
         fail_on: Optional[str] = typer.Option(None, "--fail-on", help="Exit non-zero if any finding is at or above this severity (Critical/High/Medium/Low/Info)."),
         diff: Optional[str] = typer.Option(None, "--diff", help="Only scan files changed versus this git ref, e.g. main."),
         endpoint: Optional[List[str]] = typer.Option(None, "--endpoint", help="Add an endpoint for active SQLi probing, e.g. /api/users?id=1 (repeatable)."),
@@ -467,7 +482,6 @@ def _build_typer_app():
                 target=target,
                 static_only=False,
                 out=out,
-                i_own_this=i_own_this,
                 osv=osv,
                 ai=ai,
                 active=active,
@@ -508,7 +522,6 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     scan_parser.add_argument("--target")
     scan_parser.add_argument("--static-only", action="store_true")
     scan_parser.add_argument("--out", type=Path, default=Path("."))
-    scan_parser.add_argument("--i-own-this", action="store_true")
     scan_parser.add_argument("--osv", action="store_true")
     scan_parser.add_argument("--ai", action="store_true")
     scan_parser.add_argument("--active", action="store_true")
@@ -534,13 +547,11 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     ask_parser.add_argument("question")
     ask_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_parser.add_argument("--target")
-    ask_parser.add_argument("--i-own-this", action="store_true")
     ask_parser.add_argument("--no-ai", action="store_true")
 
     ask_loop_parser = sub.add_parser("ask-loop")
     ask_loop_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     ask_loop_parser.add_argument("--target")
-    ask_loop_parser.add_argument("--i-own-this", action="store_true")
     ask_loop_parser.add_argument("--no-ai", action="store_true")
 
     model_parser = sub.add_parser("model")
@@ -555,7 +566,21 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     fix_parser = sub.add_parser("fix")
     fix_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
     fix_parser.add_argument("--repo", type=Path, default=Path("."))
+    fix_parser.add_argument("--out", type=Path, default=None)
+    fix_parser.add_argument("--agent", default="codex")
     fix_parser.add_argument("--yes", action="store_true")
+
+    handoff_parser = sub.add_parser("handoff")
+    handoff_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
+    handoff_parser.add_argument("--repo", type=Path, default=Path("."))
+    handoff_parser.add_argument("--out", type=Path, default=None)
+    handoff_parser.add_argument("--agent", default="codex")
+
+    mcp_parser = sub.add_parser("mcp")
+    mcp_parser.add_argument("--findings", type=Path, default=Path(".penny/runs/latest/findings.json"))
+    mcp_parser.add_argument("--repo", type=Path, default=Path("."))
+    mcp_parser.add_argument("--report", type=Path, default=None)
+    mcp_parser.add_argument("--agent", default="codex")
 
     github_fix_parser = sub.add_parser("github-fix")
     github_fix_parser.add_argument("source")
@@ -576,7 +601,6 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("path")
     run_parser.add_argument("--target", required=True)
     run_parser.add_argument("--out", type=Path, default=Path("."))
-    run_parser.add_argument("--i-own-this", action="store_true")
     run_parser.add_argument("--osv", action="store_true")
     run_parser.add_argument("--ai", action="store_true")
     run_parser.add_argument("--active", action="store_true")
@@ -606,7 +630,6 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 target=args.target,
                 static_only=args.static_only,
                 out=args.out,
-                i_own_this=args.i_own_this,
                 osv=args.osv,
                 ai=args.ai,
                 active=args.active,
@@ -633,10 +656,10 @@ def _fallback_main(argv: list[str] | None = None) -> None:
             feed.emit("purple", llm.describe())
         feed.emit(
             "purple",
-            answer_question(args.question, findings_path=args.findings, target=args.target, i_own_this=args.i_own_this, use_llm=use_llm),
+            answer_question(args.question, findings_path=args.findings, target=args.target, use_llm=use_llm),
         )
     elif args.command == "ask-loop":
-        _ask_loop(args.findings, args.target, args.i_own_this, feed, use_llm=not args.no_ai)
+        _ask_loop(args.findings, args.target, feed, use_llm=not args.no_ai)
     elif args.command == "model":
         if not args.mode:
             feed.emit("purple", llm.describe_model_mode())
@@ -649,7 +672,13 @@ def _fallback_main(argv: list[str] | None = None) -> None:
     elif args.command == "patch":
         _patch_command(args.findings, args.repo, args.out, args.apply, feed)
     elif args.command == "fix":
-        _fix_command(args.findings, args.repo, args.yes, feed)
+        _fix_command(args.findings, args.repo, args.yes, feed, out=args.out, agent=args.agent)
+    elif args.command == "handoff":
+        _handoff_command(args.findings, args.repo, args.out, args.agent, feed)
+    elif args.command == "mcp":
+        from .mcp import build_context, serve
+
+        serve(build_context(repo=args.repo, findings_path=args.findings, report_path=args.report, agent=args.agent))
     elif args.command == "github-fix":
         _github_fix_command(args.source, args.workdir, args.branch, args.yes, args.push, feed)
     elif args.command == "knowledge":
@@ -678,7 +707,6 @@ def _fallback_main(argv: list[str] | None = None) -> None:
                 target=args.target,
                 static_only=False,
                 out=args.out,
-                i_own_this=args.i_own_this,
                 osv=args.osv,
                 ai=args.ai,
                 active=args.active,

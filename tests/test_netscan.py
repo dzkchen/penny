@@ -13,7 +13,6 @@ def _scan(
     open_ports: set[int],
     *,
     target: str = "http://10.1.2.3:8000",
-    i_own_this: bool = False,
     banners: bool = False,
     grab_banner=None,
 ) -> list:
@@ -24,7 +23,6 @@ def _scan(
 
     return run_port_scan(
         target,
-        i_own_this=i_own_this,
         feed=EventFeed(quiet=True),
         connect=connect,
         banners=banners,
@@ -60,13 +58,10 @@ def test_no_open_ports_yields_nothing() -> None:
     assert _scan(set()) == []
 
 
-def test_public_host_requires_ownership() -> None:
-    # 8.8.8.8 is a public IP literal (no DNS lookup) so the gate must block it.
+def test_public_ip_literal_is_blocked() -> None:
+    # 8.8.8.8 is a public IP literal (no DNS lookup) so the gate must block it: a public
+    # host is reachable only via a DNS hostname with a matching TXT proof record.
     assert _scan({6379}, target="http://8.8.8.8") == []
-
-
-def test_public_ip_literal_stays_blocked_even_with_ownership() -> None:
-    assert _scan({6379}, target="http://8.8.8.8", i_own_this=True) == []
 
 
 # --- Banner grabbing -------------------------------------------------------

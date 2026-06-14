@@ -21,7 +21,7 @@ This probe does exactly that, self-contained and with no new dependencies:
 The listener only ever *reads* the inbound request line; it serves a fixed empty
 204 and stores nothing but the matched nonce. It is bound for the duration of the
 probe and torn down immediately after. Authorization is the same gate every other
-probe uses — localhost/private by default, public targets require ``i_own_this``.
+probe uses — localhost/private by default, public targets require a matching DNS TXT proof record.
 """
 
 from __future__ import annotations

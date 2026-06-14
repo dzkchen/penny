@@ -8,10 +8,11 @@ destructive engine. Three hard rules make it safe:
    delete existing data. It can only *create* records — and every record it
    creates is tagged with an obvious marker (:data:`PENNY_WRITE_MARKER`) so you
    can find and delete them afterwards.
-2. **Double opt-in.** It runs only when the target is owned/consented
-   (``i_own_this`` via :func:`penny.guardrails.host_allowed`) *and* the caller
-   passes ``i_accept`` (the ``--i-accept`` flag). An optional ``confirm`` hook
-   lets an interactive caller approve each individual write.
+2. **Double opt-in.** It runs only when the target is authorized (localhost/private,
+   or a public host with a matching DNS TXT proof record, via
+   :func:`penny.guardrails.host_authorization_error`) *and* the caller passes
+   ``i_accept`` (the ``--i-accept`` flag). An optional ``confirm`` hook lets an
+   interactive caller approve each individual write.
 3. **No privilege-escalation attempt.** To detect mass assignment it sends one
    *unexpected, non-privileged* marker field and checks whether the server echoes
    it back — it never tries to set ``is_admin``/``role`` to a privileged value.
@@ -114,7 +115,6 @@ def _same_host_url(base: str, path: str) -> str | None:
 def run_safe_write_probe(
     target: str,
     *,
-    i_own_this: bool,
     i_accept: bool,
     feed: EventFeed,
     endpoints: Iterable[str] | None = None,
@@ -125,7 +125,7 @@ def run_safe_write_probe(
 ) -> list[Finding]:
     """POST a marked, benign test record to candidate write endpoints (consented)."""
     host = urlparse(target).hostname or target
-    authorization_error = host_authorization_error(host, i_own_this)
+    authorization_error = host_authorization_error(host)
     if authorization_error:
         feed.emit("gate", f"Write-path probe blocked for {host}: {authorization_error}")
         return []

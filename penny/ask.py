@@ -26,12 +26,11 @@ def answer_question(
     *,
     findings_path: Path,
     target: str | None = None,
-    i_own_this: bool = False,
     use_llm: bool = False,
 ) -> str:
     payload = load_findings(findings_path)
     findings = payload.get("findings", [])
-    target_note = _target_note(target, i_own_this)
+    target_note = _target_note(target)
 
     if use_llm and llm_available():
         answer = _llm_answer(question, payload, findings)
@@ -41,11 +40,11 @@ def answer_question(
     return f"{_static_answer(question, payload, findings, findings_path)}{target_note}"
 
 
-def _target_note(target: str | None, i_own_this: bool) -> str:
+def _target_note(target: str | None) -> str:
     if not target:
         return ""
     try:
-        TargetGate(target, i_own_this=i_own_this, max_requests=5)
+        TargetGate(target, max_requests=5)
         return f"\n\nProbe gate: `{target}` is allowed for read-only checks."
     except GuardrailError as error:
         return f"\n\nProbe gate: blocked. {error}"

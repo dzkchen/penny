@@ -1,9 +1,7 @@
-"""Anthropic client + Penny's AI helpers (merged: feat's API client + RAG/fix layer).
+"""Anthropic client + Penny's AI helpers.
 
 Design rules (safety):
 - LLM helpers that summarize findings only receive ALREADY-REDACTED findings JSON.
-- The fix helper receives real local file contents (needed to patch), but only at the
-  user's explicit request and its output is shown as a diff for approval.
 - Every call degrades to deterministic output when no key / on any error.
 - Talks to the API over httpx (already a dependency); no SDK required.
 """
@@ -222,7 +220,7 @@ def _call(system: str, user: str, *, fast: bool = False, max_tokens: int = 1024)
 
 
 # ---------------------------------------------------------------------------
-# RAG-grounded helpers (ask answer, verdict) and the code-fix helper
+# RAG-grounded helpers (ask answer, verdict)
 # ---------------------------------------------------------------------------
 
 _ASK_SYSTEM = (
@@ -279,42 +277,3 @@ def llm_verdict(findings_json: str, *, deterministic: str, retrieved: list[dict]
     )
     result = _call(_VERDICT_SYSTEM, user, max_tokens=512)
     return result if result else deterministic
-
-
-_FIX_SYSTEM = (
-    "You are Penny's Blue-Team remediation agent. You are given the FULL CONTENTS of one source "
-    "file from a consented security audit, plus the finding(s) located in it. Produce a corrected "
-    "version of the WHOLE file that fixes the security issue while preserving all unrelated code, "
-    "formatting, and behavior. "
-    "Rules: never invent or hardcode real secrets; move credentials to environment variables; "
-    "for access-control issues add explicit ownership/auth checks; make the minimal change that fixes "
-    "the issue. "
-    "Output ONLY the complete corrected file contents between the markers <<<PENNY_FILE_START>>> and "
-    "<<<PENNY_FILE_END>>>, with no commentary, no markdown fences, and nothing outside the markers. "
-    "If you cannot safely fix it, output the two markers with the original contents unchanged between them."
-)
-
-
-def llm_fix_file(relative_path: str, file_contents: str, findings_for_file: str) -> str | None:
-    """Ask Claude for a corrected whole-file version. Returns new contents, or None."""
-    if api_key() is None:
-        return None
-    user = (
-        f"FILE PATH: {relative_path}\n\n"
-        f"FINDINGS IN THIS FILE:\n{findings_for_file}\n\n"
-        f"CURRENT FILE CONTENTS:\n<<<PENNY_FILE_START>>>\n{file_contents}\n<<<PENNY_FILE_END>>>\n\n"
-        "Return the corrected whole file between the markers."
-    )
-    text = complete(user, system=_FIX_SYSTEM, deep=True, max_tokens=8192)
-    if not text:
-        return None
-    start = text.find("<<<PENNY_FILE_START>>>")
-    end = text.find("<<<PENNY_FILE_END>>>")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    fixed = text[start + len("<<<PENNY_FILE_START>>>") : end]
-    if fixed.startswith("\n"):
-        fixed = fixed[1:]
-    if fixed.endswith("\n"):
-        fixed = fixed[:-1]
-    return fixed if fixed.strip() else None

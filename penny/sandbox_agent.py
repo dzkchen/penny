@@ -48,8 +48,7 @@ SYSTEM_PROMPT = (
     "(IDOR/BOLA), DDOSauthentication/authorization bypass, DDOS, attempt to cause descrutive delete operation if you were able to write into DB (delete your own write only, do not delete anything that you did not create to test) injection (SQLi/NoSQLi/command/template), "
     "SSRF, mass assignment, and exposed data — by sending real requests and confirming impact.\n"
     "You may use GET/HEAD/OPTIONS/POST/PUT/PATCH and send headers and JSON bodies. You must stay "
-    "on the approved target host. Do NOT attempt denial-of-service (no floods) and do NOT issue "
-    "destructive bulk-delete operations.\n"
+    "on the approved target host.\n"
     "Respond with STRICT JSON only — no prose — in ONE of these forms:\n"
     '{"action":"request","method":"POST","path":"/api/orders/1002","headers":{"x-user-id":"a"},'
     '"body":{"k":"v"},"reason":"why this probes a real flaw"}\n'
@@ -123,21 +122,10 @@ class RemoteGate:
             raise GateError(f"unknown method: {m}")
         return m
 
-    def _pace(self, *, pace: bool = True) -> None:
-        if self.request_count >= self.max_requests:
-            raise GateError("request cap reached")
-        if pace:  # the rate-limit probe sends a deliberate (still cap-bounded) burst with pace=False
-            elapsed = time.monotonic() - self._last_request
-            if self._last_request and elapsed < self.min_interval_seconds:
-                time.sleep(self.min_interval_seconds - elapsed)
-        self._last_request = time.monotonic()
-        self.request_count += 1
-
     def execute(self, method: str, path: str, headers, body, *, timeout: float = 12.0, pace: bool = True,
                 max_bytes: int = 4096) -> dict:
         m = self.check_method(method)
         url = self.build_url(path)
-        self._pace(pace=pace)
         data = None
         send_headers = {str(k): str(v) for k, v in (headers or {}).items()}
         if body is not None and m in {"POST", "PUT", "PATCH"}:
@@ -304,11 +292,11 @@ _SB_TABLES = ["users", "profiles", "accounts", "orders", "payments", "invoices",
               "transactions", "messages", "posts", "cart", "items", "products"]
 
 
-def _safe_exec(gate: RemoteGate, method: str, path: str, headers=None, body=None, *, pace: bool = True, max_bytes: int = 4096):
+def _safe_exec(gate: RemoteGate, method: str, path: str, headers=None, body=None, *, max_bytes: int = 4096):
     try:
-        return gate.execute(method, path, headers or {}, body, pace=pace, max_bytes=max_bytes)
+        return gate.execute(method, path, headers or {}, body, max_bytes=max_bytes)
     except TypeError:
-        # Tolerate gates/fakes whose execute() predates the max_bytes/pace kwargs.
+        # Tolerate gates/fakes whose execute() predates the max_bytes kwargs.
         try:
             return gate.execute(method, path, headers or {}, body)
         except Exception:  # noqa: BLE001

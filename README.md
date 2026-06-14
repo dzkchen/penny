@@ -4,7 +4,7 @@
 
 ### A local-first CLI pentesting assistant for AI-built apps
 
-Scan the code, prove the vulns, fix them, all from one prompt.
+Scan the code, prove the vulns, hand them to your coding agent.
 
 <br>
 
@@ -37,8 +37,8 @@ expensive and slow.
 
 Penny is the pentest. Point it at a repo and it reads the source for real
 vulnerabilities, points it at the running app and it proves them with safe, read-only
-probes, then writes a developer-focused remediation report, and will even apply the
-fixes for you. It runs entirely on your machine by default; every outbound call (Claude,
+probes, then writes a developer-focused remediation report and coding-agent handoff.
+It runs entirely on your machine by default; every outbound call (Claude,
 MongoDB, OSV.dev, Vultr) is **opt-in** and degrades gracefully when it's off.
 
 It is named Penny because good security shouldn't cost a fortune.
@@ -72,14 +72,14 @@ locally, costs pennies, and meets developers where they already are: a terminal.
 Penny scans a repository for real vulnerabilities, then confirms the exploitable ones
 against a running target with non-destructive, read-only probes. It layers an AI review
 pass on top to catch the bugs regex can't reason about, writes a ranked Markdown report,
-answers plain-language questions about the findings, and can apply the fixes directly to
-your code.
+answers plain-language questions about the findings, and creates a remediation handoff
+for Codex, Claude Code, or another MCP-aware coding agent.
 
 ### How we built it
 
 A Python CLI/REPL with a modular scan pipeline: source resolver → repo walker → static
-detectors → dynamic/active probes → AI review → redaction → findings store → report/fix.
-Claude powers the AI review, the assistant, and the fix engine; OSV.dev backs dependency
+detectors → dynamic/active probes → AI review → redaction → findings store → report/handoff.
+Claude powers the AI review and the assistant; OSV.dev backs dependency
 scanning; MongoDB Atlas + Voyage AI store a cross-scan knowledge base; and a Vultr GPU
 tier runs an uncensored local model for deep, autonomous breach testing. Everything else
 is standard-library Python so the core works with zero extra dependencies.
@@ -100,7 +100,7 @@ airtight end-to-end.
 
 Penny proves vulnerabilities instead of just listing them, and it does so without ever
 sending a destructive request. The safety model is real, not a disclaimer. The whole core
-loop (scan, triage, report, fix) works completely offline. And the optional cloud tier
+loop (scan, triage, report, handoff) works completely offline. And the optional cloud tier
 can spin up a GPU, run an autonomous red-team agent, and self-destruct, all behind a
 hard cost cap.
 
@@ -141,7 +141,7 @@ cp .env.example .env      # then fill in only what you want
 
 | Extra | Install | Unlocks |
 |-------|---------|---------|
-| AI | `pip install -e ".[llm]"` (or just `ANTHROPIC_API_KEY`) | AI review, the assistant, the fix engine |
+| AI | `pip install -e ".[llm]"` (or just `ANTHROPIC_API_KEY`) | AI review and the assistant |
 | Mongo | `pip install -e ".[mongo]"` + `MONGODB_URI` | Cross-scan knowledge base & trends |
 | Browser | `pip install playwright && playwright install` | `--browser` crawl/probe |
 | Cloud | `VULTR_API_KEY` | GPU sandbox tier |
@@ -162,7 +162,7 @@ local-only behaviour when a key or package is absent.
 | **Brute / browser / netscan** | Wordlist path & login discovery (`--brute`), a real Playwright crawl (`--browser`), and a read-only TCP-connect port scan (`--netscan`). |
 | **OSV dependency scan** | `--osv` checks every npm/PyPI dependency against the live [OSV.dev](https://osv.dev) feed for real CVEs and fixed versions. |
 | **VPS vLLM sandbox** | `sandbox-bake` / `sandbox-test` spin up a Vultr GPU box serving an **abliterated** model via **vLLM**, run an autonomous breach agent against a target you own, then self-destruct under a hard cost cap. |
-| **Report & fix** | `/report` writes a ranked Markdown report; `/fix` proposes and applies local code changes with approval. |
+| **Report & MCP handoff** | `/report` writes a ranked Markdown report; `/fix` prints a Codex/Claude Code MCP config; `handoff` writes a Markdown handoff directly. |
 | **AI assistant** | Ask plain-language questions about the loaded findings; answered by Claude when configured, by deterministic local logic otherwise. |
 | **Knowledge base** | Optional MongoDB Atlas + Voyage AI store generic patterns and trends across scans (`/knowledge`, `/trends`). |
 
@@ -223,14 +223,14 @@ See **[coverage.md](coverage.md)** for the complete detector catalogue.
            │           │          │
            ▼           ▼          ▼
    ┌──────────────┐ ┌────────┐ ┌──────────────────┐
-   │   Report     │ │  Ask   │ │  Fix / Patch     │
-   │ reporting.py │ │ ask.py │ │ agent_fix.py     │
+   │   Report     │ │  Ask   │ │ Handoff/Patch    │
+   │ reporting.py │ │ ask.py │ │ handoff.py       │
    │  report.md   │ │        │ │ patches.py       │
    └──────────────┘ └────────┘ └──────────────────┘
 
   Optional, opt-in services
   =========================
-   Claude    llm.py / ai_review.py / ask.py / agent_fix.py    (review, chat, fix)
+   Claude    llm.py / ai_review.py / ask.py                   (review, chat)
    OSV.dev   advisories.py                                     (dependency CVEs)
    Mongo     mongo.py + embeddings.py (Voyage AI)              (knowledge base)
    Vultr     vultr.py / cloud.py / sandbox.py (vLLM)           (GPU breach sandbox)
@@ -245,7 +245,7 @@ See **[coverage.md](coverage.md)** for the complete detector catalogue.
 
 Run `penny` with no arguments to launch the REPL. It auto-loads the most recent scan,
 shows whether AI is available, and keeps the current findings and target in session so
-you can move through scan → triage → report → fix without copying file paths around.
+you can move through scan → triage → report → handoff without copying file paths around.
 
 ```text
 penny › /target http://127.0.0.1:8787   # confirm issues against a running app
@@ -254,7 +254,7 @@ penny › /findings                       # ranked table
 penny › /show F-001                     # one finding in detail
 penny › what should I fix first?        # ask the assistant
 penny › /report                         # write report.md
-penny › /fix                            # propose & apply fixes with approval
+penny › /fix --agent codex              # print the remediation MCP config for Codex
 ```
 
 Natural language routes to the right command: "pentest ./my-app", "explain F-002",
@@ -268,7 +268,7 @@ disabled automatically when piped.
 /full  <path> [--target <url>]                alias for /audit
 /scan  <path> [flags]                          static or targeted scan (flags below)
 /report                                        write report.md to .penny/runs/
-/fix [--yes]                                    propose & apply fixes (approval unless --yes)
+/fix [--agent codex|claude-code]                set up the remediation MCP server
 /findings  (/ls)                               list current findings
 /show <F-001>                                  show one finding in detail
 /target <url|off>                              set or clear the live probe target
@@ -284,7 +284,7 @@ disabled automatically when piped.
 ```
 
 `/scan` flags: `--target <url>` `--osv` `--ai` `--active` `--agentic` `--brute`
-`--browser` `--netscan` `--load-test` `--i-accept` `--i-own-this` `--static-only`.
+`--browser` `--netscan` `--load-test` `--i-accept` `--static-only`.
 
 ---
 
@@ -297,7 +297,7 @@ mix interactive triage with scripted runs.
 # Scan: full flag surface
 python -m penny scan <path> [--target <url>] [--static-only] [--out <dir>] \
     [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] \
-    [--load-test] [--i-accept] [--i-own-this] [--fail-on <severity>] \
+    [--load-test] [--i-accept] [--fail-on <severity>] \
     [--diff <ref>] [--endpoint '<path?param>'] [--wordlist <file>] [--pages <n>] [-v] \
     [--sandbox-test] [--allow-destructive]
 
@@ -305,19 +305,50 @@ python -m penny run <path> --target <url> [...same flags as scan...]   # scan + 
 python -m penny report  [--findings <path>] [--out <dir>] [--ai]
 python -m penny ask "question" [--findings <path>] [--target <url>] [--no-ai]
 python -m penny ask-loop [--findings <path>] [--target <url>] [--no-ai]
-python -m penny fix     [--findings <path>] [--repo <path>] [--yes]
+python -m penny fix     [--findings <path>] [--repo <path>] [--out <path>] [--agent codex]
+python -m penny handoff [--findings <path>] [--repo <path>] [--out <path>] [--agent claude-code]
 python -m penny patch   [--findings <path>] --repo <path> [--out penny.patch] [--apply]
-python -m penny github-fix <owner/repo> [--branch <name>] [--yes] [--push]
+python -m penny github-fix <owner/repo> [--branch <name>]   # clone + scan + handoff
+penny mcp [--findings <path>] [--repo <path>] [--report <path>] [--agent codex]
 python -m penny model   [auto|haiku|sonnet]
 python -m penny knowledge "query" [--limit 5]
 python -m penny trends  [--days 7] [--limit 10]
 python -m penny sandbox-bake [--yes]
-python -m penny sandbox-test --target <url> [--i-own-this] [--keep-alive] [--allow-destructive] [--yes]
+python -m penny sandbox-test --target <url> [--keep-alive] [--allow-destructive] [--yes]
 python -m penny demo-replay [--recording <path>] [--out <dir>]
 ```
 
 The CLI uses Typer/Rich when installed and falls back to a stdlib parser when they aren't.
 Running `python -m penny` with no subcommand is still the recommended starting point.
+
+### MCP handoff tool
+
+`/fix` prints a ready-to-paste stdio MCP server config for Codex or Claude Code. The
+config starts `penny mcp` with the current repo, latest `findings.json`, and
+latest `report.md` when a report exists.
+
+The MCP server exposes:
+
+- `get_remediation_context` — returns the active `findings.json` plus `report.md`.
+- `create_handoff` — writes the same Markdown handoff as `python -m penny handoff`.
+
+```json
+{
+  "command": "penny",
+  "args": [
+    "mcp",
+    "--repo",
+    "/path/to/repo",
+    "--findings",
+    "/path/to/repo/.penny/runs/latest/findings.json",
+    "--report",
+    "/path/to/repo/.penny/runs/latest/report.md",
+    "--agent",
+    "codex"
+  ],
+  "cwd": "/path/to/repo"
+}
+```
 
 ### Gating CI / PRs
 
@@ -328,7 +359,7 @@ exits `1` when any finding is at or above that severity; usage/scan errors exit 
 
 ```bash
 python -m penny scan . --diff main --osv --fail-on high
-python -m penny scan ./app --active --i-own-this --target https://app.example.com \
+python -m penny scan ./app --active --target https://app.example.com \
     --endpoint '/api/users?id=1'
 ```
 
@@ -388,10 +419,11 @@ sent.
 - **Read-only by default.** Only `GET` / `HEAD` / `OPTIONS`. Unsafe methods, request
   overages, and redirects away from the approved target are blocked.
 - **Localhost / private targets** are allowed out of the box. **Public targets** require
-  `--i-own-this` **and** a matching DNS `TXT` proof record (`_penny.<host>` publishing
-  `penny-verify=authorized`, configurable). Without both, the probe is blocked, not sent.
+  a matching DNS `TXT` proof record (`_penny.<host>` publishing `penny-verify=authorized`,
+  configurable) — control of the target's DNS *is* the authorization. Without proof, the
+  probe is blocked, not sent.
 - **One gate for everything.** Active probes, the `--netscan` TCP-connect scan, the
-  `A011` TLS handshake, and the GPU sandbox all share the same `host_allowed` gate.
+  `A011` TLS handshake, and the GPU sandbox all share the same `host_authorization_error` gate.
 - **Detection-only payloads.** Penny never sends destructive input (`DROP TABLE`, writes,
   deletes). The `--i-accept` write probe is the one exception (POST-only, benign marked
   records, never PUT/PATCH/DELETE) and is strictly opt-in.
@@ -411,11 +443,11 @@ any of them.
 
 | Service | Used for | Turn on | Turn off | What leaves the machine |
 |---------|----------|---------|----------|-------------------------|
-| **Claude (Anthropic)** | AI review (`--ai`), the assistant, secret triage, the fix engine, agentic probes | `ANTHROPIC_API_KEY` | unset key, `PENNY_DISABLE_LLM=1`, `/ai off` | `--ai` sends bounded source (never gitignored); the assistant and report send only **redacted** findings |
+| **Claude (Anthropic)** | AI review (`--ai`), the assistant, secret triage, agentic probes | `ANTHROPIC_API_KEY` | unset key, `PENNY_DISABLE_LLM=1`, `/ai off` | `--ai` sends bounded source (never gitignored); the assistant and report send only **redacted** findings |
 | **MongoDB Atlas** | Cross-scan knowledge base (`vuln_patterns`) and history/trends (`scan_history`) | `MONGODB_URI` | unset URI, `PENNY_DISABLE_MONGO=1` | Only aggregate stats and generic patterns; never reports, app names, targets, snippets, secrets, or code |
 | **Voyage AI** | Real semantic embeddings for the Mongo vector index (falls back to deterministic hash embeddings) | `VOYAGE_API_KEY` | unset key, `PENNY_DISABLE_VOYAGE=1` | Only generic pattern text (title/impact/remediation); no secrets or scan details |
 | **OSV.dev** | Real dependency advisories: CVEs, severities, fixed versions (`--osv`) | `--osv` flag | omit `--osv` | Only package **names and versions** (public info) |
-| **Vultr (+ vLLM)** | GPU box serving an abliterated model for autonomous breach testing (`sandbox-*`) | `VULTR_API_KEY` + `--i-own-this` + DNS proof | unset key | Only the (owned, proofed) target URL is sent to the remote agent; code, `.env`, and keys never leave |
+| **Vultr (+ vLLM)** | GPU box serving an abliterated model for autonomous breach testing (`sandbox-*`) | `VULTR_API_KEY` + DNS `TXT` proof | unset key | Only the (owned, proofed) target URL is sent to the remote agent; code, `.env`, and keys never leave |
 
 ---
 

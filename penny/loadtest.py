@@ -11,8 +11,8 @@ deliberate and enforced:
   then halts rather than sustaining a flood.
 * It is **read-only**: GET requests to the target only, no payloads.
 * It obeys the same authorization gate as every other probe via
-  :func:`penny.guardrails.host_allowed` — localhost/private by default, public
-  hosts require ``i_own_this``.
+  :func:`penny.guardrails.host_authorization_error` — localhost/private by
+  default, public hosts require a matching DNS TXT proof record.
 
 A dumb flood would tell you less (just "it fell over") while being a reusable
 weapon; the ramp reports the *capacity knee*, which is the number you actually
@@ -118,7 +118,6 @@ def _run_stage(fetch: Fetch, url: str, concurrency: int, count: int, timeout: fl
 def run_load_test(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     max_concurrency: int = 50,
     max_total_requests: int = 5_000,
@@ -129,7 +128,7 @@ def run_load_test(
 ) -> list[Finding]:
     """Ramp load against ``target`` until the failure knee, then stop. Bounded."""
     host = urlparse(target).hostname or target
-    authorization_error = host_authorization_error(host, i_own_this)
+    authorization_error = host_authorization_error(host)
     if authorization_error:
         feed.emit("gate", f"Load test blocked for {host}: {authorization_error}")
         return []

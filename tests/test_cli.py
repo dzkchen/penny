@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import builtins
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 import penny.cli as cli
-from penny.cli import _ask_loop, _enforce_fail_on, _github_fix_command, _report_command, _resolve_findings_path, _run_scan_command
+from penny.cli import _ask_loop, _enforce_fail_on, _fix_command, _github_fix_command, _report_command, _resolve_findings_path, _run_scan_command
 from penny.feed import EventFeed
 from penny.live import LiveScanFeed
 from penny.scanner import run_scan
@@ -23,7 +24,7 @@ def test_ask_loop_exits_cleanly(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(builtins, "input", lambda _prompt: next(answers))
     feed = EventFeed(quiet=True)
 
-    _ask_loop(result.findings_path, None, False, feed)
+    _ask_loop(result.findings_path, None, feed)
 
     assert any("Interactive ask mode" in event.message for event in feed.events)
     assert any("Blue fix queue" in event.message for event in feed.events)
@@ -64,6 +65,44 @@ def test_resolve_findings_path_honours_explicit(tmp_path) -> None:
     assert _resolve_findings_path(explicit, tmp_path) == explicit
 
 
+def test_fix_command_creates_handoff_without_editing_repo(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    original = "SECRET = 'sk_live_penny_demo_51NnDemoSecretValueThatShouldNotShip'\n"
+    source.write_text(original, encoding="utf-8")
+    findings = tmp_path / "findings.json"
+    findings.write_text(
+        json.dumps(
+            {
+                "session_id": "demo",
+                "scan": {"source": str(repo)},
+                "findings": [
+                    {
+                        "id": "F-001",
+                        "detector_id": "D002",
+                        "severity": "High",
+                        "status": "confirmed",
+                        "title": "Committed secret",
+                        "remediation": "Rotate the key and move it server-side.",
+                        "location": {"file": "app.py", "line": 1},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    feed = EventFeed(quiet=True)
+
+    _fix_command(findings, repo, True, feed, agent="claude-code")
+
+    assert source.read_text(encoding="utf-8") == original
+    handoff = repo / ".penny" / "handoffs" / "demo-remediation.md"
+    assert handoff.exists()
+    assert "Intended agent: `claude-code`" in handoff.read_text(encoding="utf-8")
+    assert any("--yes is ignored" in event.message for event in feed.events)
+
+
 def test_run_scan_command_uses_live_feed_and_forwards_options(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 
@@ -89,7 +128,6 @@ def test_run_scan_command_uses_live_feed_and_forwards_options(monkeypatch, tmp_p
         target="http://localhost:3000",
         static_only=True,
         out=tmp_path,
-        i_own_this=True,
         osv=True,
         ai=True,
         active=True,

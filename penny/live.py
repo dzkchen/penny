@@ -19,6 +19,7 @@ always-available "expanded" view). ``--verbose`` additionally prints every
 from __future__ import annotations
 
 import re
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -134,9 +135,17 @@ class LiveScanFeed(EventFeed):
             )
             expanded = self._expanded
 
+        # Use the width Rich is actually rendering at, NOT ui._term_width()
+        # (shutil.get_terminal_size). In some terminals (e.g. Windsurf/VS Code)
+        # shutil falls back to its default while Rich detects the real, narrower
+        # width — drawing a rule to the shutil width then overflows Rich's
+        # console, the header line wraps, and Live's in-place redraw math breaks,
+        # spamming the terminal instead of animating a single panel.
+        width = self._live.console.width if self._live is not None else ui._term_width()
+
         header = Text()
         header.append("penny ", style="bold magenta")
-        header.append("─" * max(8, ui._term_width() - 8), style="magenta")
+        header.append("─" * max(8, width - 8), style="magenta")
         lines = []
         activity_row = Text()
         activity_row.append(f"{frame} ", style="bold cyan")
@@ -154,6 +163,14 @@ class LiveScanFeed(EventFeed):
             lines.append(Text(""))
             lines.append(Text(f"  findings {total}", style="bold white"))
             if expanded and finding_rows:
+                # Keep the live table within the viewport: roughly two terminal
+                # rows per finding (row + divider) plus ~10 rows of chrome
+                # (header, borders, log, tally). The full set always prints in
+                # the durable post-scan summary, so cropping here loses nothing.
+                height = self._live.console.height if self._live is not None else shutil.get_terminal_size((100, 24)).lines
+                rows_budget = max(1, (height - 10) // 2)
+                shown = finding_rows[:rows_budget]
+                hidden = len(finding_rows) - len(shown)
                 table = ui.table(
                     ["ID", "Severity", "Detector", "Location", "Title"],
                     [
@@ -164,16 +181,18 @@ class LiveScanFeed(EventFeed):
                             row["location"],
                             row["title"],
                         ]
-                        for row in finding_rows
+                        for row in shown
                     ],
                     min_widths=[5, 8, 8, 22, 26],
                     gap=2,
                     column_divider="│",
                     row_dividers=True,
-                    max_width=max(68, ui._term_width() - 12),
+                    max_width=max(68, width - 12),
                 )
                 for line in table.splitlines():
                     lines.append(Text.from_ansi(f"  {line}"))
+                if hidden:
+                    lines.append(Text(f"  … +{hidden} more (see summary)", style="dim italic"))
             else:
                 for detector in sorted(dets):
                     locations = dets[detector]
@@ -254,7 +273,18 @@ class LiveScanFeed(EventFeed):
             from rich.console import Console
             from rich.live import Live
 
-            self._live = Live(self, console=Console(), refresh_per_second=12, transient=True)
+            # vertical_overflow="crop": never render more rows than fit on screen.
+            # Without it, a tall panel (verbose audit + expanded findings table)
+            # exceeds the viewport, Rich's cursor-up/erase math overshoots, and
+            # each redraw leaves a trail of raw escape sequences (the "?[2K?[1A…"
+            # garbage seen when the scrollback is copied).
+            self._live = Live(
+                self,
+                console=Console(),
+                refresh_per_second=12,
+                transient=True,
+                vertical_overflow="crop",
+            )
             self._live.__enter__()
             self._start_keys()
         except Exception:  # noqa: BLE001 - fall back to plain mode on any rich/term failure

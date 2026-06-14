@@ -51,7 +51,6 @@ def run_scan(
     target: str | None = None,
     static_only: bool = False,
     out_dir: Path = Path("."),
-    i_own_this: bool = False,
     agentic: bool = False,
     brute: bool = False,
     browser: bool = False,
@@ -108,38 +107,38 @@ def run_scan(
     for finding in findings:
         feed.emit("red", f"{finding.detector_id} hit in {finding.location.file}:{finding.location.line}")
     if target and not static_only:
-        preflight_target(target, i_own_this=i_own_this, feed=feed)
-        confirm_service_key_read(findings, target, i_own_this=i_own_this, feed=feed)
-        confirm_bola_order_access(findings, target, i_own_this=i_own_this, feed=feed, endpoints=endpoints)
-        confirm_cors_policy(findings, target, i_own_this=i_own_this, feed=feed)
+        preflight_target(target, feed=feed)
+        confirm_service_key_read(findings, target, feed=feed)
+        confirm_bola_order_access(findings, target, feed=feed, endpoints=endpoints)
+        confirm_cors_policy(findings, target, feed=feed)
         if agentic:
             from .agentic import run_agentic_probe_from_files
 
-            findings.extend(run_agentic_probe_from_files(files, target, i_own_this=i_own_this, feed=feed))
+            findings.extend(run_agentic_probe_from_files(files, target, feed=feed))
     elif target and static_only:
         feed.emit("gate", "Static-only mode: skipped dynamic probes")
     if use_active:
-        findings.extend(run_active_probes(files, target, i_own_this=i_own_this, feed=feed, extra_endpoints=endpoints))
+        findings.extend(run_active_probes(files, target, feed=feed, extra_endpoints=endpoints))
     if target and not static_only and brute:
         from .bruteforce import run_brute_force
 
-        findings.extend(run_brute_force(target, i_own_this=i_own_this, wordlist=wordlist, feed=feed))
+        findings.extend(run_brute_force(target, wordlist=wordlist, feed=feed))
     if target and not static_only and browser:
         from .browser import run_browser_probe
 
-        findings.extend(run_browser_probe(target, i_own_this=i_own_this, max_pages=pages, feed=feed))
+        findings.extend(run_browser_probe(target, max_pages=pages, feed=feed))
     if target and not static_only and netscan:
         from .netscan import run_port_scan
 
-        findings.extend(run_port_scan(target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_port_scan(target, feed=feed))
     if target and not static_only and load_test:
         from .loadtest import run_load_test
 
-        findings.extend(run_load_test(target, i_own_this=i_own_this, feed=feed))
+        findings.extend(run_load_test(target, feed=feed))
     if target and not static_only and i_accept:
         from .writes import run_safe_write_probe
 
-        findings.extend(run_safe_write_probe(target, i_own_this=i_own_this, i_accept=i_accept, feed=feed, endpoints=endpoints))
+        findings.extend(run_safe_write_probe(target, i_accept=i_accept, feed=feed, endpoints=endpoints))
     findings = assign_finding_ids(findings)
     store = FindingsStore(out_dir)
     payload, findings_path = store.write_findings(

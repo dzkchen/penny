@@ -148,8 +148,13 @@ def txt_record_hint(hostname: str) -> str:
     return f'{names[0]} TXT "{value}" (or {names[1]} TXT "{value}")'
 
 
-def host_authorization_error(hostname: str | None, i_own_this: bool, *, strict_txt: bool = False) -> str | None:
+def host_authorization_error(hostname: str | None, *, strict_txt: bool = False) -> str | None:
     """Return an authorization error string, or None if the host may be probed.
+
+    Localhost/private hosts are always allowed. Any public host must publish a matching
+    DNS ``TXT`` proof record (``_penny.<host>`` -> ``penny-verify=authorized``): proving
+    DNS control over the target *is* the authorization. Public IP literals can't carry
+    that TXT subdomain, so they are always blocked — use a DNS hostname.
 
     ``strict_txt=True`` refuses to honor the ``PENNY_DISABLE_TXT_PROOF`` bypass: a real
     matching DNS TXT record is always required for public hosts. The sandbox-test tier
@@ -160,8 +165,6 @@ def host_authorization_error(hostname: str | None, i_own_this: bool, *, strict_t
         return "target must include a hostname"
     if _is_private_or_loopback_host(hostname):
         return None
-    if not i_own_this:
-        return "public targets require --i-own-this and a matching DNS TXT proof record"
     if _public_ip_literal(hostname):
         return "public IP literals are blocked; use a DNS hostname with a matching TXT proof record"
     # TXT ownership proof can be disabled with PENNY_DISABLE_TXT_PROOF=1 (kept in code,
@@ -174,27 +177,11 @@ def host_authorization_error(hostname: str | None, i_own_this: bool, *, strict_t
     return None
 
 
-def _hostname_allowed(hostname: str, i_own_this: bool) -> bool:
-    return host_authorization_error(hostname, i_own_this) is None
-
-
-def host_allowed(hostname: str | None, i_own_this: bool) -> bool:
-    """Public predicate sharing TargetGate's authorization rule.
-
-    Non-HTTP probes (the TCP port scan, the TLS handshake inspector) cannot go
-    through :class:`TargetGate` because they are not HTTP requests, but they must
-    obey the same gate: localhost/private hosts are allowed by default and any
-    public host requires ``i_own_this`` plus a matching DNS TXT proof record.
-    """
-    return host_authorization_error(hostname, i_own_this) is None
-
-
 class TargetGate:
     def __init__(
         self,
         base_url: str,
         *,
-        i_own_this: bool = False,
         max_requests: int = 25,
         min_interval_seconds: float = 0.25,
         timeout_seconds: float = 5.0,
@@ -206,12 +193,11 @@ class TargetGate:
             raise GuardrailError("target must use http or https")
         if not parsed.hostname:
             raise GuardrailError("target must include a hostname")
-        authorization_error = host_authorization_error(parsed.hostname, i_own_this)
+        authorization_error = host_authorization_error(parsed.hostname)
         if authorization_error:
             raise GuardrailError(authorization_error)
         self.base_url = base_url.rstrip("/")
         self.parsed = parsed
-        self.i_own_this = i_own_this
         self.max_requests = max_requests
         self.min_interval_seconds = min_interval_seconds
         self.timeout_seconds = timeout_seconds

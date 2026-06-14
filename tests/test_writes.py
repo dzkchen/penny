@@ -16,7 +16,7 @@ def test_write_probe_requires_i_accept() -> None:
         return WriteResponse(201, "{}", {})
 
     findings = run_safe_write_probe(
-        "http://127.0.0.1:8000", i_own_this=True, i_accept=False, feed=_feed(), client=client
+        "http://127.0.0.1:8000", i_accept=False, feed=_feed(), client=client
     )
     assert findings == []
     assert calls == []  # nothing was POSTed without consent
@@ -24,7 +24,7 @@ def test_write_probe_requires_i_accept() -> None:
 
 def test_write_probe_blocks_public_host() -> None:
     findings = run_safe_write_probe(
-        "http://8.8.8.8", i_own_this=False, i_accept=True, feed=_feed(),
+        "http://8.8.8.8", i_accept=True, feed=_feed(),
         client=lambda url, body, headers, timeout: WriteResponse(201, "{}", {}),
     )
     assert findings == []
@@ -38,7 +38,7 @@ def test_write_probe_flags_unauthenticated_create_and_mass_assignment() -> None:
         return WriteResponse(401, "unauthorized", {})
 
     findings = run_safe_write_probe(
-        "http://127.0.0.1:8000", i_own_this=True, i_accept=True, feed=_feed(),
+        "http://127.0.0.1:8000", i_accept=True, feed=_feed(),
         endpoints=["/api/items?ignored=1"], client=client,
     )
 
@@ -56,7 +56,7 @@ def test_write_probe_ignores_catch_all_acceptor() -> None:
         return WriteResponse(201, "OK", {})
 
     findings = run_safe_write_probe(
-        "http://127.0.0.1:8000", i_own_this=True, i_accept=True, feed=_feed(),
+        "http://127.0.0.1:8000", i_accept=True, feed=_feed(),
         client=client,
     )
     assert findings == []
@@ -70,7 +70,7 @@ def test_write_probe_confirm_hook_can_decline_every_write() -> None:
         return WriteResponse(201, "{}", {})
 
     findings = run_safe_write_probe(
-        "http://127.0.0.1:8000", i_own_this=True, i_accept=True, feed=_feed(),
+        "http://127.0.0.1:8000", i_accept=True, feed=_feed(),
         client=client, confirm=lambda url: False,
     )
     assert findings == []

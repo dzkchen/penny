@@ -86,15 +86,15 @@ def test_strict_txt_ignores_disable_bypass(monkeypatch) -> None:
     monkeypatch.setattr(guardrails, "_has_matching_txt_record", lambda h: False)
     monkeypatch.setenv("PENNY_DISABLE_TXT_PROOF", "1")
     # Non-strict path honors the bypass...
-    assert guardrails.host_authorization_error("app.example.com", True) is None
+    assert guardrails.host_authorization_error("app.example.com") is None
     # ...but the strict path still demands a real TXT record.
-    assert guardrails.host_authorization_error("app.example.com", True, strict_txt=True) is not None
+    assert guardrails.host_authorization_error("app.example.com", strict_txt=True) is not None
 
 
 def test_strict_txt_passes_with_record(monkeypatch) -> None:
     monkeypatch.setattr(guardrails, "_is_private_or_loopback_host", lambda h: False)
     monkeypatch.setattr(guardrails, "_has_matching_txt_record", lambda h: True)
-    assert guardrails.host_authorization_error("app.example.com", True, strict_txt=True) is None
+    assert guardrails.host_authorization_error("app.example.com", strict_txt=True) is None
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ def test_sandbox_test_blocks_before_provision(monkeypatch) -> None:
 
     monkeypatch.setattr(sandbox.vultr, "provision", _boom)
     monkeypatch.setattr(sandbox, "snapshot_id", lambda: "snap-x")
-    findings = sandbox.sandbox_test("http://8.8.8.8", i_own_this=False, feed=_feed())
+    findings = sandbox.sandbox_test("http://8.8.8.8", feed=_feed())
     assert findings == []
 
 
@@ -160,7 +160,7 @@ def test_sandbox_test_runs_and_destroys(monkeypatch) -> None:
              ' "path": "/admin", "snippet": "got in", "impact": "x", "remediation": "y", "evidence": {}}}\n'
              '{"event": "done", "findings": 1}')
     _wire_happy_path(monkeypatch, destroyed, output=jsonl)
-    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed())
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed())
     assert len(findings) == 1
     assert findings[0].detector_id == "H001"
     assert destroyed == ["box-1"]  # ephemeral: box destroyed after the run
@@ -169,7 +169,7 @@ def test_sandbox_test_runs_and_destroys(monkeypatch) -> None:
 def test_sandbox_test_destroys_on_error(monkeypatch) -> None:
     destroyed: list[str] = []
     _wire_happy_path(monkeypatch, destroyed, stream_raises=RuntimeError("ssh blew up mid-attack"))
-    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed())
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed())
     assert findings == []
     assert destroyed == ["box-1"]  # teardown still runs in finally
 
@@ -177,7 +177,7 @@ def test_sandbox_test_destroys_on_error(monkeypatch) -> None:
 def test_sandbox_test_keep_alive_skips_destroy(monkeypatch) -> None:
     destroyed: list[str] = []
     _wire_happy_path(monkeypatch, destroyed, output='{"event": "done", "findings": 0}')
-    sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
+    sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed(), keep_alive=True)
     assert destroyed == []
 
 
@@ -204,7 +204,7 @@ def test_sandbox_test_reuses_kept_box(monkeypatch) -> None:
         return 0, ""
 
     monkeypatch.setattr(sandbox.vultr, "ssh_stream", _ssh_stream)
-    sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
+    sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed(), keep_alive=True)
     assert destroyed == []  # kept alive for the next run
 
 
@@ -225,7 +225,7 @@ def test_sandbox_test_destroys_unhealable_reused_box(monkeypatch) -> None:
         raise AssertionError("attack launched despite a dead model")
 
     monkeypatch.setattr(sandbox.vultr, "ssh_stream", _no_stream)
-    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), keep_alive=True)
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed(), keep_alive=True)
     assert findings == []
     assert destroyed == ["box-1"]  # poisoned box torn down despite keep_alive
 
@@ -253,7 +253,7 @@ def test_sandbox_test_passes_instructions_to_agent(monkeypatch) -> None:
         return 0, ""
 
     _wire_for_breach(monkeypatch, _ssh_stream)
-    sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(),
+    sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed(),
                          instructions="focus on SQLi in /search")
     assert "--instructions-b64" in captured["cmd"]
     b64 = captured["cmd"].split("--instructions-b64", 1)[1].split()[0]
@@ -272,7 +272,7 @@ def test_sandbox_test_parallel_workers_dedup(monkeypatch) -> None:
         return 0, dup
 
     _wire_for_breach(monkeypatch, _ssh_stream)
-    findings = sandbox.sandbox_test("http://127.0.0.1:8787", i_own_this=False, feed=_feed(), workers=3)
+    findings = sandbox.sandbox_test("http://127.0.0.1:8787", feed=_feed(), workers=3)
     assert len(calls) == 3       # one stream per worker
     assert len(findings) == 1    # identical findings deduped across workers
 

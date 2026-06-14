@@ -1,14 +1,13 @@
-"""Clone -> scan -> fix -> push round trip for a GitHub repository.
+"""Clone -> scan -> handoff round trip for a GitHub repository.
 
 Unlike `scan <url>` (which clones to a temp dir, scans, and deletes), this clones to a
-working directory you keep, scans it, applies LLM fixes with approval, commits to a new
-branch, and optionally pushes so you can open a PR. This is the "change the repo itself"
-workflow.
+working directory you keep, scans it, and creates a remediation handoff for Codex,
+Claude Code, or another local coding agent.
 
 Safety:
-- Fixes go through the same approval-gated agent_fix loop.
-- Changes land on a NEW branch (penny/fixes), never directly on the default branch.
-- Push is explicit (--push) and never force-pushes.
+- Penny does not send source files to Claude for rewriting.
+- Penny does not modify source files or commit generated code in this workflow.
+- The handoff lands in the persistent clone so the user can review and apply fixes.
 """
 
 from __future__ import annotations
@@ -16,8 +15,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from .agent_fix import run_agent_fix
 from .feed import EventFeed
+from .handoff import create_fix_handoff
 from .reporting import load_findings
 from .scanner import run_scan
 from .sources import _split_ref
@@ -52,7 +51,7 @@ def github_fix_roundtrip(
     push: bool = False,
     feed: EventFeed,
 ) -> dict[str, object]:
-    """Clone source into workdir, scan, fix with approval, commit to a branch, optional push."""
+    """Clone source into workdir, scan, and create a coding-agent handoff."""
     url, ref = _normalize_clone_url(source)
     workdir = workdir.resolve()
     clone_dir = workdir / "repo"
@@ -78,37 +77,21 @@ def github_fix_roundtrip(
         _run_git(["checkout", branch], cwd=clone_dir)
     feed.emit("blue", f"Working on branch {branch}")
 
-    changed = run_agent_fix(payload, clone_dir, feed=feed, auto_yes=auto_yes)
-    if not changed:
-        feed.emit("blue", "No fixes applied; nothing to commit")
-        return {
-            "clone_dir": str(clone_dir),
-            "changed": [],
-            "committed": False,
-            "pushed": False,
-            "scan_payload": result.payload,
-        }
+    if auto_yes:
+        feed.emit("blue", "--yes is ignored: Penny now creates a handoff instead of editing files directly")
+    handoff = create_fix_handoff(payload, clone_dir, agent="codex")
+    feed.emit("blue", f"Wrote remediation handoff {handoff.path}")
+    feed.emit("blue", "No source files were changed; open the clone in Codex or Claude Code to apply fixes.")
 
-    # Stage and commit on the fix branch.
-    _run_git(["add", "-A"], cwd=clone_dir)
-    _run_git(["commit", "-m", "Apply Penny security fixes"], cwd=clone_dir)
-    feed.emit("blue", f"Committed {len(changed)} fix(es) on {branch}")
-
-    pushed = False
     if push:
-        try:
-            _run_git(["push", "-u", "origin", branch], cwd=clone_dir)
-            pushed = True
-            feed.emit("blue", f"Pushed {branch} to origin. Open a PR to review the fixes.")
-        except subprocess.CalledProcessError as error:
-            detail = (error.stderr or error.stdout or str(error)).strip()
-            feed.emit("blue", f"Push failed (commit is local on {branch}): {detail}")
+        feed.emit("blue", "--push is ignored because no fix commit was created")
 
     return {
         "clone_dir": str(clone_dir),
-        "changed": [str(path) for path in changed],
-        "committed": True,
-        "pushed": pushed,
+        "changed": [],
+        "committed": False,
+        "pushed": False,
         "branch": branch,
+        "handoff": str(handoff.path),
         "scan_payload": result.payload,
     }

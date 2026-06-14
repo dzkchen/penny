@@ -8,8 +8,8 @@ Two kinds of brute-force, both small and rate-limited through TargetGate:
 2. Login spray: try a tiny list of weak default credentials against a detected
    login endpoint via GET-style basic-auth checks only (no destructive POST).
 
-Safety: localhost/private targets by default; public targets require i_own_this.
-Hard caps on request count. Read-only methods only (GET/HEAD). This is intentionally
+Safety: localhost/private targets by default; public targets require a matching DNS
+TXT proof record. Hard caps on request count. Read-only methods only (GET/HEAD). This is intentionally
 small — enough to demonstrate the capability without becoming a real attack tool.
 """
 
@@ -190,7 +190,6 @@ def _load_wordlist(wordlist: str | None) -> list[str]:
 def run_brute_force(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     wordlist: str | None = None,
     max_requests: int = 40,
@@ -200,7 +199,7 @@ def run_brute_force(
     # (one wrong-credential baseline per login path), so a big list isn't truncated.
     needed = len(_RANDOM_PROBE_PATHS) + len(paths) + len(LOGIN_PATHS) * (len(WEAK_LOGINS) + 1) + 5
     try:
-        gate = TargetGate(target, i_own_this=i_own_this, max_requests=max(max_requests, needed))
+        gate = TargetGate(target, max_requests=max(max_requests, needed))
     except GuardrailError as error:
         feed.emit("gate", f"Brute-force target blocked: {error}")
         return []

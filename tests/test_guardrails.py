@@ -11,30 +11,30 @@ def test_guardrails_allow_local_targets() -> None:
     assert gate.build_url("/health") == "http://127.0.0.1:8787/health"
 
 
-def test_guardrails_block_public_targets_without_ownership() -> None:
-    with pytest.raises(GuardrailError, match="public targets require"):
+def test_guardrails_block_public_targets_without_txt_proof(monkeypatch) -> None:
+    # A public host is allowed only by a matching DNS TXT proof; with none, the gate blocks.
+    # Clear the local-testing bypass so .env (PENNY_DISABLE_TXT_PROOF=1) can't mask the gate.
+    monkeypatch.delenv("PENNY_DISABLE_TXT_PROOF", raising=False)
+    monkeypatch.setattr(guardrails, "_lookup_txt_records", lambda hostname: [])
+    with pytest.raises(GuardrailError, match="TXT proof"):
         TargetGate("https://example.com")
 
 
-def test_guardrails_block_public_targets_without_txt_proof(monkeypatch) -> None:
-    monkeypatch.setattr(guardrails, "_lookup_txt_records", lambda hostname: [])
-    with pytest.raises(GuardrailError, match="TXT proof"):
-        TargetGate("https://example.com", i_own_this=True)
-
-
 def test_guardrails_allow_public_targets_with_matching_txt_proof(monkeypatch) -> None:
+    monkeypatch.delenv("PENNY_DISABLE_TXT_PROOF", raising=False)
     monkeypatch.setattr(
         guardrails,
         "_lookup_txt_records",
         lambda hostname: ["penny-verify=authorized"] if hostname in {"_penny.example.com", "example.com"} else [],
     )
-    gate = TargetGate("https://example.com", i_own_this=True)
+    gate = TargetGate("https://example.com")
     assert gate.build_url("/health") == "https://example.com/health"
 
 
-def test_guardrails_block_public_ip_literals_even_with_ownership_flag() -> None:
+def test_guardrails_block_public_ip_literals() -> None:
+    # Public IP literals can't carry a _penny.<host> TXT subdomain, so they are always blocked.
     with pytest.raises(GuardrailError, match="public IP literals are blocked"):
-        TargetGate("https://8.8.8.8", i_own_this=True)
+        TargetGate("https://8.8.8.8")
 
 
 def test_guardrails_block_unsafe_methods_and_request_overage() -> None:

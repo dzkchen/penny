@@ -28,7 +28,6 @@ def cloud_attack(
     attack_type: str,
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     keep_alive: bool = True,
     auto_confirm: bool = False,
@@ -46,7 +45,7 @@ def cloud_attack(
 
     # Same ownership/guardrail gate as the local tier — before spending any money.
     try:
-        TargetGate(target, i_own_this=i_own_this)
+        TargetGate(target)
     except GuardrailError as error:
         feed.emit("gate", f"Cloud attack blocked: {error}")
         return []

@@ -31,11 +31,10 @@ HELP = """\
 /full  <path> [--target <url>]    alias for /audit
 /scan  <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--static-only] [--target <url>]
 /report                           write report.md to .penny/runs/
-/fix [--yes]                      fix flagged files with approval (Claude rewrites them)
+/fix [--agent codex|claude-code]  set up the remediation MCP server
 /findings                         list the current findings
 /show <F-001>                     show one finding in detail
 /target <url|off>                 set the live target to attack/probe
-/own <on|off>                     confirm you OWN the target (needed for public URLs)
 /ai <on|off>                      toggle AI answers/review
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
 /cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
@@ -47,17 +46,17 @@ HELP = """\
 /clear   /help   /exit
 
 scan/audit flags:  --target <url>  --active  --brute  --browser  --agentic
-                   --netscan  --load-test  --i-accept  --osv  --ai  --static-only  --i-own-this
+                   --netscan  --load-test  --i-accept  --osv  --ai  --static-only
   --load-test   bounded ramp-to-failure capacity test (owned targets; read-only, abortable)
   --i-accept    safe write-path probe — POST-only marked test records (owned targets; no PUT/PATCH/DELETE)
 
 Natural language works too: "pentest this app", "audit ./planted-app", "fix the issues",
-or just ask a question. For a live site you own:  /target <url>   /own on   /audit ."""
+or just ask a question. For a live site you own:  /target <url>   /audit ."""
 
 STARTER_EXAMPLE = """\
 1. Set a target (optional)     {target}
 2. Run a scan or full audit   {audit}
-3. Review, ask, and fix       {review}
+3. Review, ask, and hand off  {review}
 
 Example
 "Run a full audit on ./file_path --target https://your-app.example --active --osv --ai"
@@ -100,10 +99,7 @@ class Session:
         self.payload: dict[str, Any] | None = None
         self.findings_path: Path | None = None
         self.target: str | None = None
-        # Default ownership from .env (PENNY_I_OWN_THIS=1) so you never retype it.
-        # Still env-gated, not silently always-on, so it stays a conscious choice.
         llm._load_dotenv()
-        self.i_own_this = os.environ.get("PENNY_I_OWN_THIS", "").strip() in ("1", "true", "yes")
         self.use_ai = llm.available()
         self._autoload()
 
@@ -201,11 +197,6 @@ class Session:
             self._set_model([])
             return True
 
-        # --- ownership ---
-        if ("i own" in low or "own this" in low or "it's mine" in low or "its mine" in low):
-            self._set_own(["on"])
-            # fall through so "i own this, pentest X" also triggers the audit
-
         # --- set target from a sentence ---
         if url and ("target" in low or "set" in low or "use" in low) and not any(w in low for w in ("audit", "pentest", "scan", "attack", "test")):
             self._set_target([url])
@@ -229,7 +220,7 @@ class Session:
 
         # --- fix (imperative only) ---
         if not is_question and ("fix the" in low or "fix it" in low or "fix them" in low or low.strip() in ("fix", "apply fixes", "fix everything")):
-            self._fix(["--yes"] if ("just" in low or "all" in low or "auto" in low or "everything" in low) else [])
+            self._fix([])
             return True
 
         # --- report / export ---
@@ -332,8 +323,6 @@ class Session:
             self._toggle_ai(args)
         elif cmd == "model":
             self._set_model(args)
-        elif cmd == "own":
-            self._set_own(args)
         elif cmd == "target":
             self._set_target(args)
         elif cmd in ("cloud", "cloud-attack"):
@@ -359,7 +348,6 @@ class Session:
         use_osv = use_ai = use_active = static_only = False
         agentic = brute = browser = netscan = load_test = i_accept = False
         target = self.target
-        i_own_this = self.i_own_this
         tokens = iter(args)
         for token in tokens:
             if token == "--osv":
@@ -380,8 +368,6 @@ class Session:
                 load_test = True
             elif token == "--i-accept":
                 i_accept = True
-            elif token == "--i-own-this":
-                i_own_this = True
             elif token == "--static-only":
                 static_only = True
             elif token == "--target":
@@ -399,7 +385,7 @@ class Session:
             load_test = force.get("load_test", load_test)
             i_accept = force.get("i_accept", i_accept)
         if not path:
-            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--i-own-this] [--static-only] [--target <url>]")
+            self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--static-only] [--target <url>]")
             return
 
         feed, live_dashboard = self._make_scan_feed()
@@ -412,7 +398,6 @@ class Session:
                         target=target,
                         static_only=static_only,
                         out_dir=self.out_dir,
-                        i_own_this=i_own_this,
                         agentic=agentic,
                         brute=brute,
                         browser=browser,
@@ -464,17 +449,44 @@ class Session:
         if not self.findings_path or not self.payload:
             self._warn("No findings loaded. Run /scan or /audit first.")
             return
-        from .agent_fix import run_agent_fix
+        from .mcp import build_context, mcp_command_args, render_client_config
 
         repo = (self.payload or {}).get("scan", {}).get("resolved_path") or "."
-        auto_yes = "--yes" in args
-        feed = PrettyFeed(self.printer)
-        self.out(ui.style(f"🔧 Fixing flagged files in {repo} (approval required unless --yes)…", "bold", "cyan"))
-        changed = run_agent_fix(self.payload, Path(repo), feed=feed, auto_yes=auto_yes)
-        if changed:
-            self.out(ui.style(f"Applied {len(changed)} fix(es).", "bright_green"))
+        agent = "codex"
+        if "--agent" in args:
+            index = args.index("--agent")
+            if index + 1 >= len(args):
+                self._warn("Usage: /fix [--agent <codex|claude-code>]")
+                return
+            agent = args[index + 1]
+        elif args and args[0] in {"codex", "cc", "claude", "claude-code"}:
+            agent = args[0]
+        if agent in {"cc", "claude"}:
+            agent = "claude-code"
+        if agent not in {"codex", "claude-code"}:
+            self._warn("Usage: /fix [--agent <codex|claude-code>]")
+            return
+        if "--yes" in args:
+            self.out(ui.dim("--yes is ignored: /fix now sets up an MCP server for your coding agent."))
+
+        report_path = self.findings_path.parent / "report.md"
+        context = build_context(
+            repo=Path(repo),
+            findings_path=self.findings_path,
+            report_path=report_path if report_path.exists() else None,
+            agent=agent,
+        )
+        command = "penny " + " ".join(mcp_command_args(context))
+        self.out(ui.style("🔧 Penny remediation MCP server", "bold", "cyan"))
+        self.out(ui.dim(f"Findings: {context.findings_path}"))
+        if context.report_path:
+            self.out(ui.dim(f"Report:   {context.report_path}"))
         else:
-            self.out(ui.dim("No fixes applied."))
+            self.out(ui.dim("Report:   not found yet; run /report to include report.md context."))
+        self.out()
+        self.out(render_client_config(context, client=agent))
+        self.out()
+        self.out(ui.dim(f"Smoke test command: {command}"))
 
     def _summary(self) -> None:
         summary = (self.payload or {}).get("summary", {})
@@ -566,7 +578,7 @@ class Session:
         if not args:
             self.out(ui.dim(llm.describe_model_mode()))
             self.out(ui.dim("Usage: /model <auto|haiku|sonnet>"))
-            self.out(ui.dim("  auto   — Haiku for quick chat, Sonnet for audits/fixes (recommended)"))
+            self.out(ui.dim("  auto   — Haiku for quick chat, Sonnet for AI review/agentic probes (recommended)"))
             self.out(ui.dim("  haiku  — fast + cheap for everything"))
             self.out(ui.dim("  sonnet — deep + accurate for everything"))
             return
@@ -576,15 +588,6 @@ class Session:
             self._warn(str(error))
             return
         self.out(ui.style(f"✓ {llm.describe_model_mode()}", "green"))
-
-    def _set_own(self, args: list[str]) -> None:
-        want = args[0].lower() if args else ("off" if self.i_own_this else "on")
-        if want == "on":
-            self.i_own_this = True
-            self.out(ui.style("✓ Ownership confirmed — public targets can now be probed (only test what you own).", "yellow"))
-        else:
-            self.i_own_this = False
-            self.out(ui.dim("Ownership off — only localhost/private targets allowed."))
 
     def _set_target(self, args: list[str]) -> None:
         if not args or args[0].lower() == "off":
@@ -637,7 +640,7 @@ class Session:
         feed = PrettyFeed(self.printer)
         findings = cloud_attack(
             attack_type, target,
-            i_own_this=self.i_own_this, feed=feed,
+            feed=feed,
             keep_alive="--destroy" not in args,
             **kwargs,
         )
@@ -705,7 +708,7 @@ class Session:
         feed = PrettyFeed(self.printer)
         findings = sandbox_test(
             target,
-            i_own_this=self.i_own_this, feed=feed,
+            feed=feed,
             keep_alive=keep_alive,
             allow_destructive=allow_destructive,
             instructions=instructions, workers=max(1, int(workers)), timing_minutes=timing_minutes,
@@ -764,7 +767,6 @@ class Session:
             question,
             findings_path=self.findings_path,
             target=self.target,
-            i_own_this=self.i_own_this,
             use_llm=self.use_ai,
         )
         self.out(ui.style("🤖 penny", "bold", "bright_blue"))

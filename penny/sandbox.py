@@ -462,7 +462,6 @@ def _finding_from_jsonl(obj: dict, target: str) -> Finding:
 def sandbox_test(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     keep_alive: bool = False,
     auto_confirm: bool = False,
@@ -490,11 +489,11 @@ def sandbox_test(
 
     # Ownership gate. By default the sandbox tier requires a real DNS TXT proof (strict),
     # but for local testing it honors PENNY_DISABLE_TXT_PROOF like the rest of Penny — with
-    # a loud warning, since this is the active-exploitation tier. (--i-own-this is still
-    # required for public hosts even when the TXT check is bypassed.)
+    # a loud warning, since this is the active-exploitation tier. (Public IP literals stay
+    # blocked even when the TXT check is bypassed; only localhost/private hosts pass freely.)
     host = urlparse(target).hostname
     bypass = os.environ.get("PENNY_DISABLE_TXT_PROOF", "").strip() in ("1", "true", "yes")
-    error = host_authorization_error(host, i_own_this, strict_txt=not bypass)
+    error = host_authorization_error(host, strict_txt=not bypass)
     if error:
         feed.emit("gate", f"Sandbox-test blocked: {error}")
         return []

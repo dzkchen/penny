@@ -64,6 +64,24 @@ def test_plain_text_is_a_deterministic_question(tmp_path, monkeypatch) -> None:
     assert "Blue fix queue" in "\n".join(captured)
 
 
+def test_fix_prints_mcp_config_for_claude_code(tmp_path, monkeypatch) -> None:
+    session, captured = _session(tmp_path, monkeypatch)
+    assert session.findings_path is not None
+    report_path = session.findings_path.parent / "report.md"
+    report_path.write_text("# Report\n\nFix the issue.\n", encoding="utf-8")
+
+    session.handle("/fix --agent cc")
+
+    text = "\n".join(captured)
+    assert "Penny remediation MCP server" in text
+    assert '"command": "penny"' in text
+    assert '"mcp"' in text
+    assert "Smoke test command: penny mcp" in text
+    assert str(session.findings_path) in text
+    assert str(report_path) in text
+    assert "claude-code" in text
+
+
 def test_exit_command_ends_session(tmp_path, monkeypatch) -> None:
     session, _ = _session(tmp_path, monkeypatch)
     assert session.handle("/exit") is False

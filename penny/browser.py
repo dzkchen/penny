@@ -8,7 +8,8 @@ Degrades gracefully: if Playwright isn't installed or the browser binary is miss
 it emits a hint and returns no findings, so the rest of the scan is unaffected.
 
 Safety: same host-allowlist rule as TargetGate — localhost/private by default, public
-needs i_own_this. Read-only navigation only; it does not submit forms or mutate state.
+needs a matching DNS TXT proof record. Read-only navigation only; it does not submit
+forms or mutate state.
 """
 
 from __future__ import annotations
@@ -40,14 +41,13 @@ def _scan_text_for_secrets(text: str) -> list[str]:
 def run_browser_probe(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     max_pages: int = 8,
 ) -> list[Finding]:
     findings: list[Finding] = []
     # Reuse TargetGate purely for the host-allow decision.
     try:
-        TargetGate(target, i_own_this=i_own_this)
+        TargetGate(target)
     except GuardrailError as error:
         feed.emit("gate", f"Browser probe target blocked: {error}")
         return findings

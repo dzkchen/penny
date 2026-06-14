@@ -18,8 +18,8 @@ Active mode includes:
   directory listings, verbose errors, CORS preflight, and cache controls.
 
 Every probe takes its HTTP gate by injection so the logic is unit-testable
-offline. Active mode is opt-in, and reaching any public host still requires
-``--i-own-this`` (enforced by :class:`TargetGate`).
+offline. Active mode is opt-in, and reaching any public host still requires a
+matching DNS TXT proof record (enforced by :class:`TargetGate`).
 """
 
 from __future__ import annotations
@@ -1121,9 +1121,9 @@ def run_firebase_open_rules_probe(gate, database_url: str, *, feed: EventFeed | 
     ]
 
 
-def probe_firebase_open_rules(database_url: str, *, i_own_this: bool, feed: EventFeed | None = None) -> list[Finding]:
+def probe_firebase_open_rules(database_url: str, *, feed: EventFeed | None = None) -> list[Finding]:
     try:
-        gate = TargetGate(database_url, i_own_this=i_own_this, max_requests=4)
+        gate = TargetGate(database_url, max_requests=4)
     except GuardrailError as error:
         if feed:
             feed.emit("gate", f"Firebase probe blocked for {database_url}: {error}")
@@ -1135,7 +1135,6 @@ def run_active_probes(
     files: list[SourceFile],
     target: str | None,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     extra_endpoints: list[str] | None = None,
 ) -> list[Finding]:
@@ -1146,7 +1145,7 @@ def run_active_probes(
     databases = discover_firebase_databases(files)
     for database_url in databases:
         feed.emit("attack", f"Probing Firebase rules at {database_url}")
-        findings.extend(probe_firebase_open_rules(database_url, i_own_this=i_own_this, feed=feed))
+        findings.extend(probe_firebase_open_rules(database_url, feed=feed))
 
     if target:
         discovered = discover_query_endpoints(files)
@@ -1179,7 +1178,7 @@ def run_active_probes(
             100 + discovery_cost + (len(endpoints) + max_discovered) * (per_endpoint + extra_per_endpoint),
         )
         try:
-            gate = TargetGate(target, i_own_this=i_own_this, max_requests=request_budget)
+            gate = TargetGate(target, max_requests=request_budget)
         except GuardrailError as error:
             feed.emit("gate", f"Active target blocked: {error}")
         else:
@@ -1187,7 +1186,7 @@ def run_active_probes(
             findings.extend(probe_checklist_baseline(gate, target, endpoints, feed=feed))
             from .transport import run_transport_probes
 
-            findings.extend(run_transport_probes(target, i_own_this=i_own_this, feed=feed))
+            findings.extend(run_transport_probes(target, feed=feed))
             # nuclei-style templated checks (tech/CVE fingerprints, exposed surfaces).
             from .templates import run_template_checks
 
@@ -1222,7 +1221,6 @@ def run_active_probes(
                 try:
                     redirect_gate = TargetGate(
                         target,
-                        i_own_this=i_own_this,
                         max_requests=max(50, len(endpoints) * 8),
                         inspect_offhost_redirects=True,
                     )

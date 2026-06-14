@@ -17,7 +17,7 @@ _OWNER_KEYS = ("user_id", "userId", "owner", "owner_id", "ownerId", "uid", "acco
 _DEFAULT_BOLA_PATHS = ("/api/orders/1001",)
 
 
-def preflight_target(target: str, *, i_own_this: bool, feed: EventFeed) -> None:
+def preflight_target(target: str, *, feed: EventFeed) -> None:
     """Emit a one-line reachability note so the report reflects what was actually probed.
 
     Without this, a target whose endpoints don't match Penny's probe recipes looks
@@ -25,7 +25,7 @@ def preflight_target(target: str, *, i_own_this: bool, feed: EventFeed) -> None:
     the root status up front makes the dynamic phase honest.
     """
     try:
-        gate = TargetGate(target, i_own_this=i_own_this)
+        gate = TargetGate(target)
         root = gate.request("GET", "/")
     except GuardrailError as error:
         feed.emit("gate", f"Target blocked: {error}")
@@ -83,12 +83,12 @@ def _row_count(response_text: str) -> int:
     return 0
 
 
-def confirm_service_key_read(findings: list[Finding], target: str, *, i_own_this: bool, feed: EventFeed) -> None:
+def confirm_service_key_read(findings: list[Finding], target: str, *, feed: EventFeed) -> None:
     service_findings = [finding for finding in findings if finding.detector_id == "D001" and finding.secret_value]
     if not service_findings:
         return
     try:
-        gate = TargetGate(target, i_own_this=i_own_this)
+        gate = TargetGate(target)
     except GuardrailError as error:
         feed.emit("gate", f"Target blocked: {error}")
         for finding in service_findings:
@@ -148,7 +148,6 @@ def confirm_bola_order_access(
     findings: list[Finding],
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     endpoints: list[str] | None = None,
 ) -> None:
@@ -160,7 +159,7 @@ def confirm_bola_order_access(
     on the target (404/unreachable) instead of silently doing nothing.
     """
     try:
-        gate = TargetGate(target, i_own_this=i_own_this)
+        gate = TargetGate(target)
     except GuardrailError as error:
         feed.emit("gate", f"BOLA probe blocked: {error}")
         return
@@ -234,9 +233,9 @@ def confirm_bola_order_access(
         feed.emit("red", "BOLA probe did not confirm cross-user object access")
 
 
-def confirm_cors_policy(findings: list[Finding], target: str, *, i_own_this: bool, feed: EventFeed) -> None:
+def confirm_cors_policy(findings: list[Finding], target: str, *, feed: EventFeed) -> None:
     try:
-        gate = TargetGate(target, i_own_this=i_own_this)
+        gate = TargetGate(target)
         response = gate.request("GET", "/health", headers={"origin": "https://attacker.example"})
         # Not every target has /health; fall back to the root so CORS reflection
         # can still be checked on a reachable path instead of giving up silently.

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from .feed import EventFeed
-from .guardrails import GuardrailError, TargetGate, host_authorization_error, host_allowed
+from .guardrails import GuardrailError, TargetGate, host_authorization_error
 from .models import Finding, Location
 
 # Below this the cert is "about to expire"; below TLS 1.2 the protocol is obsolete.
@@ -272,10 +272,10 @@ def _days_to_expiry(not_after: str | None) -> int | None:
     return (expires - datetime.now(UTC)).days
 
 
-def _plaintext_http_served(host: str, *, i_own_this: bool) -> bool | None:
+def _plaintext_http_served(host: str) -> bool | None:
     """True if http:// serves content without redirecting to HTTPS; None if undetermined."""
     try:
-        gate = TargetGate(f"http://{host}", i_own_this=i_own_this, max_requests=3)
+        gate = TargetGate(f"http://{host}", max_requests=3)
         response = gate.request("GET", "/")
     except GuardrailError:
         return None
@@ -293,14 +293,13 @@ def _plaintext_http_served(host: str, *, i_own_this: bool) -> bool | None:
 def run_transport_probes(
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
     gate=None,
 ) -> list[Finding]:
     """Gather transport facts about ``target`` and analyze them. Never raises into a scan."""
     parsed = urlparse(target)
     host = parsed.hostname or target
-    authorization_error = host_authorization_error(host, i_own_this)
+    authorization_error = host_authorization_error(host)
     if authorization_error:
         feed.emit("gate", f"Transport probe blocked for {host}: {authorization_error}")
         return []
@@ -309,7 +308,7 @@ def run_transport_probes(
 
     hsts_header = ""
     try:
-        active_gate = gate or TargetGate(target, i_own_this=i_own_this, max_requests=3)
+        active_gate = gate or TargetGate(target, max_requests=3)
         response = active_gate.request("GET", "/")
         headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
         hsts_header = headers.get("strict-transport-security", "")
@@ -320,6 +319,6 @@ def run_transport_probes(
     plaintext: bool | None = None
     if scheme == "https":
         tls = _inspect_tls(host, parsed.port or 443)
-        plaintext = _plaintext_http_served(host, i_own_this=i_own_this)
+        plaintext = _plaintext_http_served(host)
 
     return analyze_transport(target, tls=tls, hsts_header=hsts_header, plaintext_http_served=plaintext)

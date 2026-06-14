@@ -23,7 +23,7 @@ SLASH_COMPLETIONS: tuple[SlashCompletion, ...] = (
     SlashCompletion("audit", "/audit <path> [--target <url>]", "FULL audit: scan + AI + all probes + report", ("full",)),
     SlashCompletion("scan", "/scan <path> [--osv] [--ai] [--active] [--static-only] [--target <url>]", "scan only (add flags as needed)"),
     SlashCompletion("report", "/report", "write report.md to .penny/runs/"),
-    SlashCompletion("fix", "/fix [--yes]", "fix flagged files with approval"),
+    SlashCompletion("fix", "/fix [--agent codex|claude-code]", "set up remediation MCP"),
     SlashCompletion("findings", "/findings", "list the current findings", ("ls",)),
     SlashCompletion("show", "/show <F-001>", "show one finding in detail"),
     SlashCompletion("target", "/target <url|off>", "set or clear the live probe target"),

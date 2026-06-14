@@ -7,7 +7,7 @@ the next step. Bounded by request caps and a max number of agent turns.
 
 Safety: every probe goes through TargetGate (read-only methods only, request cap, no host
 escape, no redirects off-host). Claude can only PROPOSE; Python decides. Public targets
-still require i_own_this.
+still require a matching DNS TXT proof record.
 """
 
 from __future__ import annotations
@@ -81,7 +81,6 @@ def run_agentic_probe(
     target: str,
     *,
     hints: dict[str, Any] | None = None,
-    i_own_this: bool = False,
     feed: EventFeed,
     max_turns: int = 6,
     max_requests: int = 20,
@@ -98,7 +97,7 @@ def run_agentic_probe(
         return findings
 
     try:
-        gate = TargetGate(target, i_own_this=i_own_this, max_requests=max_requests)
+        gate = TargetGate(target, max_requests=max_requests)
     except GuardrailError as error:
         feed.emit("gate", f"Agentic probe target blocked: {error}")
         return findings
@@ -168,11 +167,10 @@ def run_agentic_probe_from_files(
     files: list[SourceFile],
     target: str,
     *,
-    i_own_this: bool,
     feed: EventFeed,
 ) -> list[Finding]:
     """Convenience wrapper: auto-detect Supabase hints from source, then run the loop."""
     hints = detect_supabase(files)
     if hints["urls"] or hints["tables"]:
         feed.emit("red", f"Auto-detected Supabase hints: {len(hints['urls'])} url(s), {len(hints['tables'])} table(s)")
-    return run_agentic_probe(target, hints=hints, i_own_this=i_own_this, feed=feed)
+    return run_agentic_probe(target, hints=hints, feed=feed)
