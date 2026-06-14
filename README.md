@@ -20,6 +20,14 @@ Scan the code, prove the vulns, fix them, all from one prompt.
 
 ---
 
+> **⚠️ Work in progress.** Penny is under active development. Expect rough edges, bugs, and
+> the occasional broken feature. It will not catch everything either: real vulnerabilities
+> can slip through as edge cases its detectors and probes don't yet cover, so treat a clean
+> run as "nothing found," not "nothing there." Always pair it with human review before
+> trusting an app in production.
+
+---
+
 ## What is Penny?
 
 **Penny** is a security tool for the era of vibe-coded apps. Someone ships a Supabase +
