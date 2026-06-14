@@ -148,7 +148,14 @@ def txt_record_hint(hostname: str) -> str:
     return f'{names[0]} TXT "{value}" (or {names[1]} TXT "{value}")'
 
 
-def host_authorization_error(hostname: str | None, i_own_this: bool) -> str | None:
+def host_authorization_error(hostname: str | None, i_own_this: bool, *, strict_txt: bool = False) -> str | None:
+    """Return an authorization error string, or None if the host may be probed.
+
+    ``strict_txt=True`` refuses to honor the ``PENNY_DISABLE_TXT_PROOF`` bypass: a real
+    matching DNS TXT record is always required for public hosts. The sandbox-test tier
+    (the most aggressive, active-exploitation path) uses this so it can never run against
+    a host the user has not proven they control via DNS.
+    """
     if not hostname:
         return "target must include a hostname"
     if _is_private_or_loopback_host(hostname):
@@ -158,8 +165,9 @@ def host_authorization_error(hostname: str | None, i_own_this: bool) -> str | No
     if _public_ip_literal(hostname):
         return "public IP literals are blocked; use a DNS hostname with a matching TXT proof record"
     # TXT ownership proof can be disabled with PENNY_DISABLE_TXT_PROOF=1 (kept in code,
-    # bypassed for trusted local testing). Re-enable for production / shared use.
-    if os.environ.get("PENNY_DISABLE_TXT_PROOF", "").strip() in ("1", "true", "yes"):
+    # bypassed for trusted local testing). Re-enable for production / shared use. The
+    # strict path (sandbox-test) never honors the bypass.
+    if not strict_txt and os.environ.get("PENNY_DISABLE_TXT_PROOF", "").strip() in ("1", "true", "yes"):
         return None
     if not _has_matching_txt_record(hostname):
         return f"missing TXT proof record; expected {txt_record_hint(hostname)}"

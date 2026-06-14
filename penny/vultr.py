@@ -34,6 +34,20 @@ DEFAULT_OS_ID = 2284            # Ubuntu 24.04 LTS x64
 MAX_BOXES = 3                   # never let Penny run away spinning up boxes
 DEFAULT_AUTODESTROY_MIN = 30    # box self-deletes after this many minutes
 
+# GPU tier (sandbox-test): heretic abliteration + gemma-3 serving need a GPU.
+# A16 1-GPU = 16 GB VRAM @ ~$0.471/hr — fits gemma-3-4b for both bake and serve.
+# Override via VULTR_GPU_PLAN / VULTR_GPU_REGION in .env.
+DEFAULT_GPU_PLAN = "vcg-a16-6c-64g-16vram"
+DEFAULT_GPU_REGION = "ord"      # GPU-capable region (Chicago); not all regions have GPUs
+
+
+def gpu_plan() -> str:
+    return os.environ.get("VULTR_GPU_PLAN", "").strip() or DEFAULT_GPU_PLAN
+
+
+def gpu_region() -> str:
+    return os.environ.get("VULTR_GPU_REGION", "").strip() or DEFAULT_GPU_REGION
+
 SSH_KEY_DIR = Path.home() / ".penny"
 SSH_PRIVATE_KEY = SSH_KEY_DIR / "id_ed25519"
 SSH_PUBLIC_KEY = SSH_KEY_DIR / "id_ed25519.pub"
@@ -142,6 +156,14 @@ def ensure_ssh_key_uploaded() -> str:
 # ---------------------------------------------------------------------------
 
 def _estimate_hourly(plan: str) -> float:
+    # GPU plans are billed hourly directly (Vultr Cloud GPU pricing); CPU plans are
+    # monthly/730. Keep the confirm-before-spinup prompt honest about real cost.
+    gpu_hourly = {
+        "vcg-a16-6c-64g-16vram": 0.471,    # A16 1-GPU, 16 GB VRAM
+        "vcg-a16-12c-128g-32vram": 0.942,  # A16 2-GPU, 32 GB VRAM
+    }
+    if plan in gpu_hourly:
+        return gpu_hourly[plan]
     # vc2-1c-1gb ~ $5/mo; Vultr bills hourly at monthly/730.
     monthly = {"vc2-1c-1gb": 5.0, "vc2-1c-2gb": 10.0, "vc2-2c-4gb": 20.0}.get(plan, 6.0)
     return round(monthly / 730, 4)
@@ -152,12 +174,17 @@ def provision(
     region: str = DEFAULT_REGION,
     plan: str = DEFAULT_PLAN,
     os_id: int = DEFAULT_OS_ID,
+    snapshot_id: str | None = None,
     autodestroy_min: int = DEFAULT_AUTODESTROY_MIN,
     label: str = "penny-box",
     confirm=None,
     now: float | None = None,
 ) -> Box:
-    """Spin up one box. `confirm` is a callable(prompt)->bool gate (cost safety)."""
+    """Spin up one box. `confirm` is a callable(prompt)->bool gate (cost safety).
+
+    Pass ``snapshot_id`` to boot from a pre-baked snapshot (e.g. the heretic/gemma-3
+    sandbox image) instead of a fresh OS install.
+    """
     boxes = _load_state()
     if len(boxes) >= MAX_BOXES:
         raise VultrError(f"refusing to provision: already {len(boxes)} Penny boxes (max {MAX_BOXES}). Destroy some first.")
@@ -173,11 +200,14 @@ def provision(
     body = {
         "region": region,
         "plan": plan,
-        "os_id": os_id,
         "label": label,
         "sshkey_id": [key_id],
         "tag": "penny",
     }
+    if snapshot_id:
+        body["snapshot_id"] = snapshot_id
+    else:
+        body["os_id"] = os_id
     instance = _request("POST", "/instances", body)["instance"]
     created = now or time.time()
     box = Box(
@@ -210,6 +240,27 @@ def wait_for_ip(box: Box, *, timeout: float = 180.0, poll: float = 6.0) -> str:
     raise VultrError(f"box {box.id} did not become ready within {timeout:.0f}s")
 
 
+# ---------------------------------------------------------------------------
+# Snapshots (bake-once for the sandbox-test GPU image)
+# ---------------------------------------------------------------------------
+
+def create_snapshot(box_id: str, *, description: str = "penny-sandbox") -> str:
+    """Snapshot a running box; returns the new snapshot id."""
+    snap = _request("POST", "/snapshots", {"instance_id": box_id, "description": description})["snapshot"]
+    return snap["id"]
+
+
+def wait_for_snapshot(snapshot_id: str, *, timeout: float = 1800.0, poll: float = 15.0) -> None:
+    """Poll until a snapshot finishes (status == 'complete')."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        info = _request("GET", f"/snapshots/{snapshot_id}").get("snapshot", {})
+        if info.get("status") == "complete":
+            return
+        time.sleep(poll)
+    raise VultrError(f"snapshot {snapshot_id} did not complete within {timeout:.0f}s")
+
+
 def _load_state_replacing(box: Box) -> list[Box]:
     boxes = _load_state()
     for i, b in enumerate(boxes):
@@ -218,12 +269,21 @@ def _load_state_replacing(box: Box) -> list[Box]:
     return boxes
 
 
-def destroy(box_id: str) -> None:
+def destroy(box_id: str) -> bool:
+    """Delete an instance and drop it from local state. Returns True on success.
+
+    A 404 means it's already gone (fine). Any other API failure (e.g. a 401 IP-allowlist
+    block, or a network blip) is NOT swallowed into "forget it" — the box stays tracked so
+    `/boxes`, `/destroy`, and `reap()` can retry once API access is restored, rather than
+    silently orphaning a still-billing instance.
+    """
     try:
         _request("DELETE", f"/instances/{box_id}")
-    except VultrError:
-        pass  # already gone is fine
+    except VultrError as error:
+        if "404" not in str(error):
+            return False  # keep it in local state for a later retry
     _save_state([b for b in _load_state() if b.id != box_id])
+    return True
 
 
 def destroy_all() -> int:

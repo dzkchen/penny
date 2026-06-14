@@ -38,6 +38,8 @@ HELP = """\
 /ai <on|off>                      toggle AI answers/review
 /model <auto|haiku|sonnet>        pick the Claude model (auto = Haiku chat + Sonnet work)
 /cloud-attack <type> [target]     heavy tier on a Vultr box (e.g. load) — auto-destroys
+/sandbox-bake                     one-time: build the heretic/gemma-3 GPU snapshot (~$0.70)
+/sandbox-test [target]            ephemeral GPU box runs heretic/gemma-3 active breach, then self-destructs (TXT proof required)
 /boxes                            list active cloud boxes + auto-destroy timers
 /kill                             stop running cloud attacks (keep boxes)
 /destroy                          destroy all cloud boxes now
@@ -311,6 +313,10 @@ class Session:
             self._set_target(args)
         elif cmd in ("cloud", "cloud-attack"):
             self._cloud_attack(args)
+        elif cmd == "sandbox-bake":
+            self._sandbox_bake(args)
+        elif cmd == "sandbox-test":
+            self._sandbox_test(args)
         elif cmd in ("boxes", "attack-status"):
             self._cloud_status()
         elif cmd == "kill":
@@ -613,6 +619,47 @@ class Session:
         )
         if findings:
             self.out(ui.style(f"Cloud attack produced {len(findings)} finding(s).", "bright_green"))
+
+    # ---- sandbox-test (heretic/gemma-3 GPU breach) -----------------------
+    def _sandbox_bake(self, args: list[str]) -> None:
+        from .sandbox import sandbox_bake
+
+        feed = PrettyFeed(self.printer)
+        self.out(ui.dim("Building the one-time heretic/gemma-3 GPU snapshot (~$0.70, ~1h)."))
+        snap = sandbox_bake(feed=feed, auto_confirm="--yes" in args)
+        if snap:
+            self.out(ui.style(f"Sandbox snapshot ready: {snap}", "bright_green"))
+
+    def _sandbox_test(self, args: list[str]) -> None:
+        from .sandbox import sandbox_test
+
+        target = next((a for a in args if not a.startswith("-")), None) or self.target
+        if not target:
+            self._warn("No target set. Use /target <url> first, or /sandbox-test <url>.")
+            return
+        feed = PrettyFeed(self.printer)
+        findings = sandbox_test(
+            target,
+            i_own_this=self.i_own_this, feed=feed,
+            keep_alive="--keep-alive" in args,
+            allow_destructive="--allow-destructive" in args,
+        )
+        if findings:
+            self._persist_findings(findings, target, source="sandbox-test")
+            self.out(ui.style(f"Sandbox breach produced {len(findings)} finding(s). /findings to view, /report to write.", "bright_green"))
+        else:
+            self.out(ui.dim("No findings from the sandbox breach."))
+
+    def _persist_findings(self, findings: list, target: str, *, source: str) -> None:
+        """Write attack-tier findings into the run store so /findings, /show, /report work."""
+        from .models import assign_finding_ids, now_session_id
+
+        ordered = assign_finding_ids(list(findings))
+        store = FindingsStore(self.out_dir)
+        session_id = now_session_id()
+        payload, run_path = store.write_findings(session_id, ordered, scan={"source": source, "target": target})
+        self.payload = payload
+        self.findings_path = run_path
 
     def _cloud_status(self) -> None:
         from .cloud import status
