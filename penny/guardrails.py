@@ -199,6 +199,7 @@ class TargetGate:
         min_interval_seconds: float = 0.25,
         timeout_seconds: float = 5.0,
         max_response_bytes: int = 4096,
+        inspect_offhost_redirects: bool = False,
     ) -> None:
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"}:
@@ -215,6 +216,11 @@ class TargetGate:
         self.min_interval_seconds = min_interval_seconds
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
+        # When set, an off-host redirect is *reported* (the SafeResponse keeps its
+        # Location header) instead of raising. The gate still never *follows* the
+        # redirect — this only lets the open-redirect probe see where the server
+        # tried to send the client. Off by default so all other probes stay strict.
+        self.inspect_offhost_redirects = inspect_offhost_redirects
         self.request_count = 0
         self._last_request = 0.0
 
@@ -256,7 +262,7 @@ class TargetGate:
             if 300 <= response.status_code < 400 and response.headers.get("location"):
                 location = response.headers["location"]
                 redirected = urlparse(urljoin(url, location))
-                if redirected.netloc != self.parsed.netloc:
+                if redirected.netloc != self.parsed.netloc and not self.inspect_offhost_redirects:
                     raise GuardrailError("redirect to unapproved host blocked")
             body = response.content[: self.max_response_bytes].decode("utf-8", errors="replace")
             return SafeResponse(status_code=response.status_code, text=body, headers=dict(response.headers))

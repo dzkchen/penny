@@ -1156,11 +1156,28 @@ def run_active_probes(
         # Deduplicate while preserving order (user-supplied first).
         endpoints = list(dict.fromkeys(user_supplied + discovered))
         # Budget covers the checklist baseline, parameter discovery, and the
-        # error/boolean/time injection passes (each endpoint costs several GETs).
+        # error/boolean/time injection passes plus the new injection/traversal/SSTI/
+        # redirect/SSRF passes (each endpoint costs several GETs across them all).
         param_paths = _candidate_paths(endpoints)
         per_endpoint = len(SQLI_PAYLOADS) + 2 * len(SQLI_BOOLEAN_PAIRS) + len(SQLI_TIME_PAYLOADS) + 4
-        discovery_cost = min(len(param_paths), 6) * (len(PARAM_WORDLIST) + 1)
-        request_budget = max(200, 100 + discovery_cost + (len(endpoints) + discovery_cost) * per_endpoint)
+        # NoSQL, SSTI, traversal, command-injection, open-redirect, and SSRF each fan a
+        # handful of payloads across every endpoint; reserve headroom so the request cap
+        # is not hit mid-pass (which would silently truncate coverage).
+        extra_per_endpoint = 24
+        # `discovery_cost` is the request count for the parameter-discovery sweep.
+        # `max_discovered` bounds how many (path, param) pairs that sweep can feed back
+        # into the injection passes — one per (path, wordlist-entry). Each discovered
+        # pair is then injection-probed at `per_endpoint + extra_per_endpoint` cost,
+        # same as a known endpoint, so the cap must cover both. The estimate is an
+        # upper bound (it assumes every probe discovers a live param), so it can only
+        # over-budget, never truncate coverage.
+        discovery_paths = min(len(param_paths), 6)
+        discovery_cost = discovery_paths * (len(PARAM_WORDLIST) + 1)
+        max_discovered = discovery_paths * len(PARAM_WORDLIST)
+        request_budget = max(
+            300,
+            100 + discovery_cost + (len(endpoints) + max_discovered) * (per_endpoint + extra_per_endpoint),
+        )
         try:
             gate = TargetGate(target, i_own_this=i_own_this, max_requests=request_budget)
         except GuardrailError as error:
@@ -1183,8 +1200,51 @@ def run_active_probes(
                 feed.emit("attack", f"Probing {len(endpoints)} endpoint(s) for SQL injection and reflected XSS")
                 findings.extend(probe_sql_injection(gate, endpoints, feed=feed))
                 findings.extend(probe_reflected_xss(gate, endpoints, feed=feed))
+
+                # Extended injection surface: NoSQL operator injection, SSTI, path
+                # traversal, time-based command injection, and out-of-band SSRF.
+                from .injection import (
+                    probe_command_injection,
+                    probe_nosql_injection,
+                    probe_open_redirect,
+                    probe_path_traversal,
+                    probe_ssti,
+                )
+
+                feed.emit("attack", f"Probing {len(endpoints)} endpoint(s) for NoSQL injection, SSTI, traversal, and command injection")
+                findings.extend(probe_nosql_injection(gate, endpoints, feed=feed))
+                findings.extend(probe_ssti(gate, endpoints, feed=feed))
+                findings.extend(probe_path_traversal(gate, endpoints, feed=feed))
+                findings.extend(probe_command_injection(gate, endpoints, feed=feed))
+
+                # Open redirect needs a gate that *reports* (does not block) off-host
+                # redirects so the probe can read the Location header.
+                try:
+                    redirect_gate = TargetGate(
+                        target,
+                        i_own_this=i_own_this,
+                        max_requests=max(50, len(endpoints) * 8),
+                        inspect_offhost_redirects=True,
+                    )
+                except GuardrailError:
+                    redirect_gate = None
+                if redirect_gate is not None:
+                    findings.extend(probe_open_redirect(redirect_gate, endpoints, target=target, feed=feed))
+
+                from .ssrf import probe_ssrf
+
+                feed.emit("attack", "Probing URL-style parameters for SSRF via a self-hosted callback listener")
+                findings.extend(probe_ssrf(gate, endpoints, target=target, feed=feed))
             else:
                 feed.emit("attack", "No query-string endpoints found or discovered to test for injection")
+
+            # JWT tampering and GraphQL introspection use their own curated path lists,
+            # so they run whether or not query-string endpoints were discovered.
+            from .api_probes import probe_graphql_introspection, probe_jwt_tampering
+
+            feed.emit("attack", "Probing for JWT signature bypass and GraphQL introspection")
+            findings.extend(probe_jwt_tampering(gate, feed=feed))
+            findings.extend(probe_graphql_introspection(gate, feed=feed))
     elif not databases:
         feed.emit("attack", "Active mode found nothing to probe (no target and no Firebase config)")
 
