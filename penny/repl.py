@@ -778,10 +778,25 @@ def run_repl(out_dir: Path | str = Path(".")) -> None:
     session = Session(out_dir=out_dir)
     session.greet()
 
+    # patch_stdout() must wrap ONLY the prompt read — never session.handle().
+    # Its proxy renders cursor-control escapes literally, so running a scan's
+    # Rich Live animation inside it spams the terminal with raw "?[2K?[1A" frames
+    # instead of redrawing in place (the same proxy quirk clear_screen works
+    # around). Command handling therefore runs against the real stdout.
+    use_patch = autocomplete_enabled()
+    if use_patch:
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+    def _read() -> str:
+        if use_patch:
+            with patch_stdout():
+                return read_line(ui.prompt())
+        return read_line(ui.prompt())
+
     def _loop() -> None:
         while True:
             try:
-                line = read_line(ui.prompt())
+                line = _read()
             except EOFError:
                 session.out()
                 break
@@ -791,11 +806,5 @@ def run_repl(out_dir: Path | str = Path(".")) -> None:
             if not session.handle(line):
                 break
 
-    if autocomplete_enabled():
-        from prompt_toolkit.patch_stdout import patch_stdout
-
-        with patch_stdout():
-            _loop()
-    else:
-        _loop()
+    _loop()
     session.out(ui.dim("bye"))
