@@ -35,12 +35,15 @@ from . import vultr
 SANDBOX_STATE = Path(".penny") / "sandbox.json"
 # Default to a PRE-DECENSORED model (heretic/abliteration already applied and published).
 # Serving an existing one is far more robust than running heretic unattended on the box —
-# heretic is interactive (it prompts to save) and needs ~30-45 min of GPU. The default is
-# the official heretic-org Qwen3-4B-Thinking build (a reasoning model, good at multi-step
-# attack planning). Must be a transformers/safetensors repo (NOT a *-GGUF).
-DEFAULT_HERETIC_MODEL = "heretic-org/Qwen3-4B-Thinking-2507-heretic"
+# heretic is interactive (it prompts to save) and needs ~30-45 min of GPU. We use the
+# heretic-org Qwen3-4B-*Instruct* build: ~8 GB bf16 (fits the 16 GB A16), and Instruct beats
+# the Thinking variant here — the agent only needs short STRICT-JSON actions, so we skip the
+# slow <think> blocks (30-90s/turn) and get more reliable formatting + lower latency.
+# Must be a transformers/safetensors repo (NOT a *-GGUF). Override with PENNY_HERETIC_MODEL.
+DEFAULT_HERETIC_MODEL = "heretic-org/Qwen3-4B-Instruct-2507-heretic"
 MODEL_PORT = 8000
 MODEL_ALIAS = "heretic"  # vLLM --served-model-name; must match sandbox_agent.py --model default
+MODEL_DIR = "/opt/penny/model"  # flat, real-file model dir vLLM serves from (no HF symlink/blob cache)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +141,23 @@ def _serve_script(model: str) -> str:
         f"/opt/penny/venv/bin/pip install {_vllm_spec()} huggingface_hub",
         # Bump transformers past vLLM's old pin so newer model tokenizers load.
         (f"/opt/penny/venv/bin/pip install {_transformers_spec()}" if _transformers_spec() else "true"),
-        # Fully download + integrity-check the model BEFORE serving, so an incomplete download
-        # (e.g. a 0-byte model.safetensors.index.json) can never be frozen into the snapshot.
-        # `set -e` makes a failed/partial download abort the bake rather than serve a broken model.
-        f"HF_TOKEN={shlex.quote(hf)} /opt/penny/venv/bin/huggingface-cli download {shlex.quote(model)}",
+        # Download the model into a flat, real-file dir (NOT the HF symlink/blob cache, where a
+        # 0-byte model.safetensors.index.json kept winning over re-fetches). Then VERIFY the
+        # weights index before serving so an incomplete download can never be frozen into the
+        # snapshot. `set -e` aborts the bake on any failure here.
+        f"mkdir -p {MODEL_DIR}",
+        f"HF_TOKEN={shlex.quote(hf)} /opt/penny/venv/bin/huggingface-cli download {shlex.quote(model)} --local-dir {MODEL_DIR}",
+        # Must have either a non-empty sharded index or a single non-empty safetensors file...
+        f"test -s {MODEL_DIR}/model.safetensors.index.json || test -s {MODEL_DIR}/model.safetensors",
+        # ...and if there's an index, it must parse AND every shard it names must exist on disk.
+        f"if [ -f {MODEL_DIR}/model.safetensors.index.json ]; then /opt/penny/venv/bin/python - <<'PY'\n"
+        "import json, os, sys\n"
+        f"d = {MODEL_DIR!r}\n"
+        "m = json.load(open(os.path.join(d, 'model.safetensors.index.json')))['weight_map']\n"
+        "missing = sorted({f for f in m.values() if not os.path.getsize(os.path.join(d, f))})\n"
+        "sys.exit('incomplete shards: ' + ', '.join(missing)) if missing else print('index ok:', len(set(m.values())), 'shards')\n"
+        "PY\n"
+        "fi",
         "cat >/etc/systemd/system/penny-vllm.service <<EOF",
         "[Unit]",
         "Description=Penny sandbox vLLM (heretic gemma-3)",
@@ -154,7 +170,7 @@ def _serve_script(model: str) -> str:
         "[Service]",
         f"Environment=HF_TOKEN={hf}",
         f"ExecStart=/opt/penny/venv/bin/python -m vllm.entrypoints.openai.api_server "
-        f"--model {shlex.quote(model)} --host 127.0.0.1 --port {MODEL_PORT} "
+        f"--model {MODEL_DIR} --host 127.0.0.1 --port {MODEL_PORT} "
         f"--served-model-name {MODEL_ALIAS} --max-model-len 8192 --gpu-memory-utilization 0.90 "
         f"--enforce-eager --trust-remote-code",
         "Restart=always",
@@ -340,13 +356,15 @@ def _ensure_model_up(ip: str, feed: EventFeed) -> bool:
         # zero-byte/truncated file a snapshot captured mid-download (typically
         # model.safetensors.index.json). Delete the empty file(s) — weights are .safetensors,
         # so this only drops the tiny re-fetchable index/configs — then the volatile caches.
-        "find /root/.cache /tmp -type f -name '*.json' -size 0 -delete 2>/dev/null || true",
+        f"find {MODEL_DIR} /root/.cache /tmp -type f -name '*.json' -size 0 -delete 2>/dev/null || true",
         "rm -rf /root/.cache/vllm /root/.cache/torch /tmp/torchinductor_* 2>/dev/null || true",
-        # REPAIR the model: re-fetch only the missing/changed files (cheap when just the small
-        # index was bad). Deleting + lazy vLLM load alone does NOT re-fetch it, so this explicit
-        # download is the actual fix. Pull HF_TOKEN from the baked unit so gated repos still work.
+        # REPAIR the model: re-fetch missing/changed files into the SAME flat --local-dir vLLM
+        # serves from (no HF symlink/blob cache to fight). Cheap when only the small index was bad.
+        # Pull HF_TOKEN from the baked unit so gated repos still work. (Snapshots baked before
+        # MODEL_DIR existed serve by HF-id and need a re-bake — this heal can't fix those.)
+        f"mkdir -p {MODEL_DIR}",
         "export $(systemctl show penny-vllm -p Environment --value 2>/dev/null | tr ' ' '\\n' | grep -E '^HF_TOKEN=' || true)",
-        f"/opt/penny/venv/bin/huggingface-cli download {shlex.quote(model)} >/tmp/penny_hf_repair.log 2>&1 || true",
+        f"/opt/penny/venv/bin/huggingface-cli download {shlex.quote(model)} --local-dir {MODEL_DIR} >/tmp/penny_hf_repair.log 2>&1 || true",
         # An older snapshot's unit may lack StartLimitIntervalSec=0, so it can be jammed in
         # 'failed' from a prior crash-loop. Drop an override + reset-failed so restart actually runs.
         "mkdir -p /etc/systemd/system/penny-vllm.service.d",
