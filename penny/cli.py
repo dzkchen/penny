@@ -85,16 +85,25 @@ def _run_scan_command(
     return result, feed
 
 
-def _report_command(findings: Path, out_dir: Path, feed: EventFeed, *, use_llm: bool = False) -> Path:
+def _report_command(
+    findings: Path,
+    out_dir: Path,
+    feed: EventFeed,
+    *,
+    use_llm: bool = False,
+    announce: bool = True,
+) -> Path:
     payload = load_findings(findings)
     session_id = payload.get("session_id", "manual-report")
-    feed.emit("blue", "Writing report with concrete fixes")
+    if announce:
+        feed.emit("blue", "Writing report with concrete fixes")
     report = generate_report(payload, use_llm=use_llm)
     report_path = FindingsStore(out_dir).write_report(session_id, report)
     copy_report_to_findings_dir(report_path, findings)
-    verdict = report.split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip()
-    feed.emit("purple", f"Verdict: {verdict}")
-    feed.emit("report", f"Wrote {report_path}")
+    if announce:
+        verdict = report.split("## 2. Executive Summary", 1)[0].split("## 1. Purple-Team Verdict", 1)[1].strip()
+        feed.emit("purple", f"Verdict: {verdict}")
+        feed.emit("report", f"Wrote {report_path}")
     return report_path
 
 
@@ -405,7 +414,8 @@ def _build_typer_app():
             )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        _report_command(result.findings_path, out, feed, use_llm=ai)
+        _report_command(result.findings_path, out, feed, use_llm=ai, announce=False)
+        print("Full audit complete — findings + report.md written.")
 
     @app.command("demo-replay")
     def demo_replay(
@@ -615,7 +625,8 @@ def _fallback_main(argv: list[str] | None = None) -> None:
             )
         except (FileNotFoundError, ValueError, RuntimeError) as error:
             _fail(str(error))
-        _report_command(result.findings_path, args.out, feed, use_llm=args.ai)
+        _report_command(result.findings_path, args.out, feed, use_llm=args.ai, announce=False)
+        print("Full audit complete — findings + report.md written.")
     elif args.command == "demo-replay":
         run_demo_replay(recording=args.recording, out_dir=args.out, feed=feed)
 

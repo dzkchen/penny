@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from typing import Any
 from dataclasses import dataclass
 
 
@@ -46,3 +47,7 @@ class EventFeed:
             self._console.print(text)
         else:
             print(text)
+
+    def record_finding(self, finding: dict[str, Any]) -> None:
+        """Optional structured finding hook for richer live UIs."""
+        return

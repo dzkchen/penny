@@ -17,7 +17,7 @@ from typing import Any
 from . import __version__, llm, ui
 from .ask import answer_question
 from .feed import Event, EventFeed
-from .live import LiveScanFeed, print_scan_summary
+from .live import LiveScanFeed, print_scan_summary, render_scan_summary
 from .reporting import generate_report, load_findings
 from .scanner import run_scan
 from .sources import resolved_scan_source
@@ -73,6 +73,8 @@ class PrettyFeed(EventFeed):
 
     def emit(self, channel: str, message: str) -> None:
         self.events.append(Event(channel=channel, message=message))
+        if channel == "scan" and message.startswith("Walking "):
+            return
         if channel == "red":  # one event per finding — summarised in the table instead
             return
         self._printer(ui.channel_line(channel, message))
@@ -371,7 +373,6 @@ class Session:
             self._warn("Usage: /scan <path> [--osv] [--ai] [--active] [--agentic] [--brute] [--browser] [--netscan] [--load-test] [--i-accept] [--i-own-this] [--static-only] [--target <url>]")
             return
 
-        self.out(ui.dim(f"Scanning {path}…"))
         feed, live_dashboard = self._make_scan_feed()
         feed_scope = feed if live_dashboard else nullcontext(feed)
         try:
@@ -402,11 +403,10 @@ class Session:
         self.findings_path = result.findings_path
         if live_dashboard:
             print_scan_summary(result.payload, self.out_dir)
-            self.out(ui.dim("Use /show <id> for details, or ask a question."))
         else:
             self.out()
-            self._summary()
-            self._findings()
+            for line in render_scan_summary(result.payload, self.out_dir).splitlines():
+                self.out(line)
 
     def _audit(self, args: list[str]) -> None:
         """Full pipeline: scan + AI + every probe + report, in one command."""
@@ -419,8 +419,6 @@ class Session:
         # honor an inline --target, else the session target
         if "--target" in args:
             self.target = args[args.index("--target") + 1] if args.index("--target") + 1 < len(args) else self.target
-        if not self.target:
-            self.out(ui.dim("No target set — running static + code analysis only. Use --target <url> for live probes."))
         self.out(ui.style(f"🔎 Running FULL audit on {path}…", "bold", "magenta"))
         # Read-only/bounded probes run automatically; write-path testing (--i-accept)
         # creates records, so it stays opt-in even inside a full audit.
@@ -430,7 +428,7 @@ class Session:
             self.out(ui.dim("--i-accept: including safe write-path probe (POST-only marked test records)."))
         self._scan([path], force=forced)
         if self.payload:
-            self._report([])
+            self._report([], announce_path=False)
         self.out(ui.style("✅ Full audit complete — findings + report.md written.", "bright_green"))
 
     def _fix(self, args: list[str]) -> None:
@@ -474,15 +472,20 @@ class Session:
             [
                 f["id"],
                 ui.severity_badge(f["severity"]),
-                f["detector_id"],
                 f"{f['location']['file']}:{f['location']['line']}",
-                f["title"][:48],
+                f["title"],
                 f["status"],
             ]
             for f in ordered
         ]
-        self.out(ui.table(["ID", "Severity", "Det", "Location", "Title", "Status"], rows))
-        self.out(ui.dim("Use /show <id> for details, or ask a question."))
+        self.out(
+            ui.table(
+                ["ID", "Severity", "Location", "Title", "Status"],
+                rows,
+                min_widths=[5, 8, 28, 36, 9],
+                gap=4,
+            )
+        )
 
     def _show(self, args: list[str]) -> None:
         if not args:
@@ -509,7 +512,7 @@ class Session:
         )
         self.out(ui.panel(body, title=f"{finding['id']} — {finding['title']}", color="magenta"))
 
-    def _report(self, args: list[str]) -> None:
+    def _report(self, args: list[str], *, announce_path: bool = True) -> None:
         if not self.findings_path or not self.payload:
             self._warn("No findings loaded. Run /scan <path> first.")
             return
@@ -518,7 +521,8 @@ class Session:
         store = FindingsStore(self.out_dir)
         report_path = store.write_report(payload.get("session_id", "manual-report"), report)
         copy_report_to_findings_dir(report_path, self.findings_path)
-        self.out(ui.style(f"📄 report.md → {report_path}", "green"))
+        if announce_path:
+            self.out(ui.style(f"📄 report.md → {report_path}", "green"))
 
     def _toggle_ai(self, args: list[str]) -> None:
         want = args[0].lower() if args else ("off" if self.use_ai else "on")

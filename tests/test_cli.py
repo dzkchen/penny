@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import penny.cli as cli
-from penny.cli import _ask_loop, _enforce_fail_on, _github_fix_command, _resolve_findings_path, _run_scan_command
+from penny.cli import _ask_loop, _enforce_fail_on, _github_fix_command, _report_command, _resolve_findings_path, _run_scan_command
 from penny.feed import EventFeed
 from penny.live import LiveScanFeed
 from penny.scanner import run_scan
@@ -148,3 +148,15 @@ def test_github_fix_command_uses_live_feed(monkeypatch, tmp_path) -> None:
     assert captured["auto_yes"] is True
     assert captured["push"] is False
     assert isinstance(captured["feed"], LiveScanFeed)
+
+
+def test_report_command_can_suppress_extra_output(monkeypatch, tmp_path) -> None:
+    findings = tmp_path / "findings.json"
+    findings.write_text('{"session_id":"demo","summary":{"total":0},"findings":[]}', encoding="utf-8")
+    feed = EventFeed(quiet=True)
+
+    monkeypatch.setattr(cli, "generate_report", lambda payload, use_llm=False: "# Penny Security Report\n\n## 1. Purple-Team Verdict\n\nClean.\n\n## 2. Executive Summary\n")
+
+    _report_command(findings, tmp_path, feed, announce=False)
+
+    assert not feed.events

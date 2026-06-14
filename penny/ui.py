@@ -180,10 +180,20 @@ def panel(body: str, *, title: str | None = None, color: str = "cyan") -> str:
     return "\n".join(rows)
 
 
-def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = None, *, max_width: int | None = None) -> str:
+def table(
+    headers: list[str],
+    rows: list[list[str]],
+    aligns: list[str] | None = None,
+    *,
+    max_width: int | None = None,
+    min_widths: list[int] | None = None,
+    gap: int = 2,
+    column_divider: str | None = None,
+    row_dividers: bool = False,
+) -> str:
     cols = len(headers)
     aligns = aligns or ["left"] * cols
-    gap = 2
+    min_widths = min_widths or [6] * cols
     widths = [visible_len(headers[i]) for i in range(cols)]
     for row in rows:
         for i in range(cols):
@@ -193,11 +203,15 @@ def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = 
     # paths, titles) run past the right edge and the terminal soft-wraps them
     # mid-cell, mangling every column. Instead, shave the widest column(s) down
     # until the row fits, then wrap the overflowing cells onto continuation lines.
+    divider_width = visible_len(column_divider) if column_divider else 0
     budget = (max_width if max_width is not None else _term_width()) - gap
-    available = budget - gap * (cols - 1)
-    min_col = 6
+    available = budget - gap * (cols - 1) - (divider_width * (cols - 1) if column_divider else 0)
+    min_col = min(min_widths) if min_widths else 6
     while sum(widths) > available and max(widths) > min_col:
-        widest = widths.index(max(widths))
+        shrinkable = [i for i in range(cols) if widths[i] > min_widths[i]]
+        if not shrinkable:
+            break
+        widest = max(shrinkable, key=lambda i: widths[i])
         widths[widest] -= 1
 
     def render_row(cells: list[str]) -> list[str]:
@@ -209,13 +223,26 @@ def table(headers: list[str], rows: list[list[str]], aligns: list[str] | None = 
                 _pad(wrapped[i][line_index] if line_index < len(wrapped[i]) else "", widths[i], aligns[i])
                 for i in range(cols)
             ]
-            lines.append((" " * gap).join(pieces))
+            if column_divider:
+                joiner = (" " * gap) + column_divider + (" " * gap)
+            else:
+                joiner = " " * gap
+            lines.append(joiner.join(pieces))
         return lines
 
+    if column_divider:
+        divider_joiner = (" " * gap) + style(column_divider, "bright_black") + (" " * gap)
+        rule_cells = [style("─" * widths[i], "bright_black") for i in range(cols)]
+        header_rule = divider_joiner.join(rule_cells)
+    else:
+        header_rule = dim((" " * gap).join("─" * widths[i] for i in range(cols)))
+
     out = render_row([style(headers[i], "bold") for i in range(cols)])
-    out.append(dim((" " * gap).join("─" * widths[i] for i in range(cols))))
-    for row in rows:
+    out.append(header_rule)
+    for index, row in enumerate(rows):
         out.extend(render_row(list(row)))
+        if row_dividers and index != len(rows) - 1:
+            out.append(header_rule)
     return "\n".join(out)
 
 

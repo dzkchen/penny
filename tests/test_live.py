@@ -33,12 +33,22 @@ def test_rich_render_does_not_raise() -> None:
 
     feed = LiveScanFeed()
     feed.emit("scan", "Walking /repo")
+    feed.emit("scan", "Loaded 13 source file(s)")
+    feed.emit("osv", "OSV review: 1 vulnerable dependency package(s)")
+    feed.emit("ai", "AI review sending 10 source file(s) to claude-sonnet-4-6")
     feed.emit("red", "D012 hit in src/a.ts:1")
     feed._expanded = True
+    feed._ctrlo = True
     buffer = io.StringIO()
     Console(file=buffer, force_terminal=True, width=80).print(feed)  # invokes __rich__
     output = buffer.getvalue()
     assert "penny" in output and "D012" in output
+    assert "Walking /repo" not in output
+    assert "────" in output
+    assert "OSV review" in output
+    assert "AI review sending" in output
+    assert "ctrl-o collapse" in output
+    assert "ctrl-c cancel" in output
 
 
 def test_print_scan_summary_renders(capsys) -> None:
@@ -60,6 +70,31 @@ def test_print_scan_summary_renders(capsys) -> None:
     assert "Scan complete" in out
     assert "D001" in out
     assert "a.ts:5" in out  # verbose expansion lists the location
+    assert "Detector" in out
+    assert "Hits" in out
+
+
+def test_print_scan_summary_keeps_long_titles_visible(capsys) -> None:
+    payload = {
+        "findings": [
+            {
+                "id": "F-001",
+                "severity": "Critical",
+                "detector_id": "AI001",
+                "title": "Broken Access Control: Admin Privilege Escalation via Client-Controlled Header",
+                "location": {"file": "app/api/admin/promote/route.ts", "line": 6},
+                "status": "suspected",
+            }
+        ],
+        "summary": {"total": 1, "by_severity": {"Critical": 1}, "confirmed_count": 0},
+    }
+    print_scan_summary(payload, Path("."))
+    out = capsys.readouterr().out
+    assert "Client-Controlled Header" in out
+    assert "Next:" not in out
+    assert "Tip:" not in out
+    assert "Use /show" not in out
+    assert "Detector" in out
 
 
 def test_print_scan_summary_clean_scan(capsys) -> None:
