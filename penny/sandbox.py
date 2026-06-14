@@ -136,7 +136,8 @@ def _serve_script(model: str) -> str:
         f"Environment=HF_TOKEN={hf}",
         f"ExecStart=/opt/penny/venv/bin/python -m vllm.entrypoints.openai.api_server "
         f"--model {shlex.quote(model)} --host 127.0.0.1 --port {MODEL_PORT} "
-        f"--served-model-name {MODEL_ALIAS} --max-model-len 8192 --gpu-memory-utilization 0.90 --trust-remote-code",
+        f"--served-model-name {MODEL_ALIAS} --max-model-len 8192 --gpu-memory-utilization 0.90 "
+        f"--enforce-eager --trust-remote-code",
         "Restart=always",
         "[Install]",
         "WantedBy=multi-user.target",
@@ -281,10 +282,18 @@ def _wait_for_model(ip: str, feed: EventFeed, *, timeout: float = 1200.0, poll: 
 
 
 def _dump_vllm_logs(ip: str, feed: EventFeed) -> None:
-    """Pull the vLLM service log so a startup crash is visible instead of a silent timeout."""
+    """Surface the real vLLM startup error (crash-loop restarts otherwise bury the traceback)."""
     try:
-        _, logs, err = vultr.ssh_run(ip, "journalctl -u penny-vllm.service --no-pager -n 80 2>&1 || true", timeout=60)
-        feed.emit("attack", f"[bake] vLLM service log (tail):\n{redact_text((logs or err).strip()[-1800:]) or '(no logs)'}")
+        # Stop the service so its auto-restarts stop pushing the traceback out of the journal.
+        vultr.ssh_run(ip, "systemctl stop penny-vllm.service >/dev/null 2>&1 || true", timeout=30)
+        grep = ("journalctl -u penny-vllm.service --no-pager -n 800 2>&1 | "
+                "grep -iE 'error|traceback|exception|raise|not .*support|unrecogni|no module|"
+                "out of memory|oom|killed|assert|cuda' | tail -n 40 || true")
+        _, hits, _ = vultr.ssh_run(ip, grep, timeout=60)
+        if hits.strip():
+            feed.emit("attack", f"[bake] vLLM errors:\n{redact_text(hits.strip()[-2200:])}")
+        _, tail, terr = vultr.ssh_run(ip, "journalctl -u penny-vllm.service --no-pager -n 30 2>&1 || true", timeout=60)
+        feed.emit("attack", f"[bake] vLLM log tail:\n{redact_text((tail or terr).strip()[-1400:]) or '(no logs)'}")
     except Exception as error:  # noqa: BLE001
         feed.emit("attack", f"[bake] could not fetch vLLM logs: {error}")
 
