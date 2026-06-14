@@ -371,7 +371,7 @@ def sandbox_test(
     try:
         box = vultr.provision(
             region=vultr.gpu_region(), plan=vultr.gpu_plan(), snapshot_id=snap,
-            label="penny-sandbox", confirm=confirm,
+            label="penny-sandbox", autodestroy_min=90, confirm=confirm,
         )
     except vultr.VultrError as exc:
         feed.emit("attack", f"Provision failed: {exc}")
@@ -380,9 +380,9 @@ def sandbox_test(
     feed.emit("attack", f"[sandbox] box {box.id} provisioning from snapshot (auto-destroys in 30m)...")
     findings: list[Finding] = []
     try:
-        # Restoring a snapshot (tens of GB) is much slower than a fresh OS install, so allow
-        # well past the 180s default before giving up, and stream the boot status.
-        ip = vultr.wait_for_ip(box, timeout=900, feed=feed)
+        # Restoring a large snapshot (OS + driver + vLLM + baked model, tens of GB) can take
+        # 15-25 min on Vultr, so allow up to 30 min and stream the boot status.
+        ip = vultr.wait_for_ip(box, timeout=1800, feed=feed)
         feed.emit("attack", f"[sandbox] box up at {ip}; waiting for SSH...")
         if not vultr.wait_for_ssh(ip):
             feed.emit("attack", "[sandbox] SSH never came up; destroying box")

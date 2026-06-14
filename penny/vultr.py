@@ -224,14 +224,24 @@ def provision(
     return box
 
 
+def start(box_id: str) -> None:
+    """Power on an instance (no-op-safe)."""
+    try:
+        _request("POST", f"/instances/{box_id}/start")
+    except VultrError:
+        pass
+
+
 def wait_for_ip(box: Box, *, timeout: float = 180.0, poll: float = 6.0, feed=None) -> str:
     """Poll until the box has an IP and is active. Returns the IP.
 
     Pass ``feed`` to stream the live status/power/server state — useful for diagnosing slow
-    or stuck snapshot restores instead of a blind timeout.
+    or stuck snapshot restores instead of a blind timeout. If a snapshot restore finishes with
+    the box powered off (unlocked but stopped), it is powered on automatically.
     """
     deadline = time.monotonic() + timeout
     last = ""
+    started = False
     while time.monotonic() < deadline:
         info = _request("GET", f"/instances/{box.id}").get("instance", {})
         ip = info.get("main_ip", "")
@@ -242,6 +252,12 @@ def wait_for_ip(box: Box, *, timeout: float = 180.0, poll: float = 6.0, feed=Non
             box.ip = ip
             _save_state(_load_state_replacing(box))
             return ip
+        # Restore finished (no longer locked) but the box is off → power it on, once.
+        if status == "active" and power == "stopped" and server not in ("locked", "") and not started:
+            if feed is not None:
+                feed.emit("attack", "[sandbox] restore done but box is stopped; powering on...")
+            start(box.id)
+            started = True
         snap = f"status={status or '-'} power={power or '-'} server={server or '-'} ip={ip or '-'}"
         if feed is not None and snap != last:
             feed.emit("attack", f"[sandbox] booting: {snap}")
